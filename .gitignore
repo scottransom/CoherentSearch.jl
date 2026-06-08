@@ -1,0 +1,19 @@
+# Julia
+*.jl.cov
+*.jl.*.cov
+*.jl.mem
+/docs/build/
+
+# Resolved manifests for the package itself are committed; sub-env manifests
+# (test, crossval) are regenerated and not tracked.
+/test/Manifest.toml
+/crossval/Manifest.toml
+
+# Cross-validation scratch
+/crossval/__pycache__/
+*.bin
+oracle.json
+
+# Editors / OS
+.DS_Store
+*.swp

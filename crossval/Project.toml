@@ -1,0 +1,4 @@
+[deps]
+BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
+CoherentSearch = "b7e4a1c2-3d6f-4e8a-9c1b-2a5d8f3e6c40"
+JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
