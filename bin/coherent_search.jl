@@ -60,13 +60,16 @@ function parse_cmdline(argv)
             arg_type = Float64
             default = 0.5
         "--numbetween"
-            help = "Number of points to interpolate between Fourier bins"
+            help = "Minimum points to interpolate between Fourier bins"
             arg_type = Int
             default = 16
         "--blocksize"
-            help = "Trial frequencies per parallel work block"
+            help = "Trial fundamentals per parallel chunk (Nprof)"
             arg_type = Int
-            default = 1024
+            default = 2048
+        "--noalign"
+            help = "Use a fixed numbetween for all harmonics (disable per-harmonic tuning)"
+            action = :store_true
         "--noremove"
             help = "Do not filter duplicate or harmonically-related candidates"
             action = :store_true
@@ -82,6 +85,7 @@ function main(argv)
         nharms = a["nharms"],
         numbetween = a["numbetween"],
         threshold = a["threshold"],
+        align = !a["noalign"],
     )
 
     @info "Searching" file=a["fftfile"] T=ft.T nharms=params.nharms threads=nthreads()

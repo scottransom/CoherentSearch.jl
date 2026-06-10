@@ -1,16 +1,19 @@
 # CoherentSearch.jl — Summary and Future Work
 
 This document summarizes the current state of the Julia port of the Python
-`coherent_search` package and lays out the plan for Phase 2, which focuses on
-performance: thread-local buffers for better parallel scaling and aggressive
-reuse of FFTW plans.
+`coherent_search` package. Phase 1 delivered a correct, oracle-validated,
+multi-threaded search; Phase 2 (now implemented) reorganized the search around
+independent fundamental-frequency *chunks* and made the hot loop
+allocation-free with cached FFTW plans and interpolation kernels.
 
 ---
 
-## 1. What exists today (Phase 1)
+## 1. What exists today
 
 A working, well-tested, multi-threaded coherent harmonic-summing search that is
-numerically validated against the original Python code.
+numerically validated against the original Python code, and an optimised search
+path built on cached plans, per-harmonic interpolation tuning, and chunk-level
+parallelism.
 
 ### Components
 
@@ -18,27 +21,24 @@ numerically validated against the original Python code.
 |------|------|
 | `src/fourierinterp.jl` | Fourier interpolation kernels (Eqn. 30 of [astro-ph/0204349](https://arxiv.org/pdf/astro-ph/0204349)) |
 | `src/fileio.jl` | `mmap`'d PRESTO `.fft` reader + `.inf` metadata parser |
-| `src/search.jl` | Block-parallel coherent harmonic-summing search |
+| `src/search.jl` | Reference `block_metrics` + optimised chunk-parallel `search` |
 | `bin/coherent_search.jl` | ArgParse command-line front-end |
-| `test/` | 29 unit tests (golden values, analytic signals, indexing, irfft convention) |
+| `test/` | 40 unit tests (kernel golden values, indexing, irfft convention, optimised-vs-reference equivalence, detection) |
 | `crossval/` | Python-as-oracle accuracy + speed cross-validation |
 
-### Key design decisions made in Phase 1
+### Key design decisions
 
 - **Indexing is isolated and audited.** The 0-based (Python, half-open slices)
   → 1-based (Julia, inclusive ranges) translation lives in one documented
   helper, `nearby_fourier_bin_range`, with the original Python slice arithmetic
   written out in comments.
 
-- **The stateful `FourierInterpolator` was replaced with independent frequency
-  blocks.** The Python version walks forward through the FFT with mutable
-  `lobin`/`nextbin` state — hostile to parallelism. The Julia version exposes
-  `block_metrics(ft, rfund, params)`, a self-contained function that takes a
-  contiguous range of trial fundamental frequencies and returns the
-  peak/|trough| metric for each, sharing no mutable state. `search()` partitions
-  the frequency range into blocks and runs them under `Threads.@threads`;
-  `search_block` thresholds a block's metrics into candidates. This structure
-  also extends naturally to `Distributed.jl` for multi-node runs.
+- **A simple reference path is kept alongside the optimised one.**
+  `block_metrics(ft, rfund, params)` is a self-contained, allocating
+  implementation that mirrors the Python algorithm one-to-one. It is left
+  unoptimised on purpose so it stays easy to audit, and it is what the Python
+  oracle is pinned to at machine precision. The optimised `search` is then
+  pinned to *it*.
 
 - **FFT conventions verified, not assumed.** `np.fft.fft`/`ifft` and Julia's
   `fft`/`ifft` share the same normalization, so the FFT-correlation interpolator
@@ -48,16 +48,18 @@ numerically validated against the original Python code.
 
 ### Verification status
 
-- **All 29 unit tests pass.**
+- **All 40 unit tests pass** (the original kernel/indexing/IO tests plus a new
+  `test_search.jl` covering the optimised path).
 - **Accuracy cross-validation** (`crossval/crossval_accuracy.jl`) runs the
   original Python `coherent_search` as an oracle and agrees to **~3e-16 relative
   on the `finterp_FFT` kernel** and **~8e-16 relative end-to-end** (the full
   coherent-fold metric) on the bundled 10.0123 Hz test pulsar. This is the
   primary guard that the indexing and FFT conventions are correct.
-- **Speed cross-validation** (`crossval/crossval_speed.jl`): the Julia kernel is
-  currently **~2.1× faster single-threaded** than the Python kernel. This gap is
-  almost entirely reduced call overhead and in-place operations on top of the
-  same FFTW library — it is *not* yet the result of any of the Phase 2 work.
+- **The optimised search path is pinned to that oracle.** With per-harmonic
+  tuning disabled (`align=false`) the new chunk/plan-caching path reproduces the
+  reference `block_metrics` to **~6e-16 relative** — i.e. it is numerically
+  identical to the oracle-validated reference, so the performance work provably
+  did not change results.
 
 ### How to run things
 
@@ -75,177 +77,151 @@ julia --project=crossval -t auto crossval/crossval_speed.jl   FILE.fft
 
 ---
 
-## 2. Where the time currently goes
+## 2. The optimised search (implemented)
 
-The hot path, per harmonic per block, is `finterp_fft`:
+Following `coherent_search_design.md`, the production search is structured as
+three nested loops, with parallelism at the *outermost* one:
 
-1. zero a length-`fftlen` complex buffer,
-2. scatter the relevant raw FFT bins into it (zero-stuffing),
-3. forward FFT,
-4. multiply by the cached, pre-FFT'd interpolation kernel,
-5. inverse FFT,
-6. slice out the valid region,
+- **Loop #1 — chunks (parallel).** The fundamental-frequency range is cut into
+  chunks of `Nprof` trial fundamentals (`blocksize`, default 2048). Chunks are
+  independent and are distributed round-robin across `nthreads()` tasks with
+  `Threads.@spawn`; each task owns one private `Workspace`, so there is no shared
+  mutable state and no `threadid()` indexing (robust under task migration).
+- **Loop #2 — harmonics.** For each harmonic `h`, one Fourier interpolation fills
+  row `h+1` of an `(nharms+1) × Nprof` complex amplitude array `ftprofs`.
+- **Loop #3 — profiles.** A single *batched* complex→real transform inverts all
+  `Nprof` profiles at once (`plan_brfft(ftprofs, 2*nharms, 1)`), then a
+  peak/|trough| metric is read off each profile column.
 
-followed by a linear interp onto the exact harmonic frequencies and, once per
-block, an `irfft` of the stacked harmonics.
+### What makes it fast
 
-Two things make this slower than it needs to be in the current code:
+- **Plans built once, executed many times.** FFTW *planning* is not thread-safe,
+  so every plan (`plan_fft`, `plan_bfft`, `plan_brfft`) is built single-threaded
+  while the workspaces are constructed, before the parallel region. The hot loop
+  only *executes* prebuilt plans on a workspace's private buffers via `mul!`.
+- **Cached interpolation kernels.** The FFT'd sinc/phase kernel
+  (`finterp_fft_coeffs`) depends only on `(numbetween, m, fftlen)`, so it is
+  precomputed once per harmonic and shared read-only across threads. The old
+  per-call recomputation (an extra FFT plus transcendentals on *every* harmonic
+  of *every* block) is gone. The `1/fftlen` inverse-FFT normalization is folded
+  into the cached kernel, so the loop can use an unnormalized `bfft`.
+- **Allocation-free hot loop.** `fill_chunk_profiles!` on a warm workspace
+  allocates ~2 KB total (just the per-harmonic `@view` headers), independent of
+  `Nprof` — versus the old path that allocated several arrays per harmonic per
+  call. No per-chunk garbage means no GC pauses serializing the threads.
+- **Batched inverse FFT.** The `Nprof` profiles are short (`2*nharms` points);
+  one batched `brfft` amortizes FFTW overhead far better than `Nprof` tiny calls.
+  (The `1/Nbins` irfft normalization cancels in the peak/|trough| *ratio*, so the
+  unnormalized transform is used directly.)
 
-- **Every call allocates.** `finterp_fft` allocates `ftarr`, the two FFT
-  outputs, and the returned slice on each of `nharms` calls per block, for every
-  block. With `nharms = 32` and thousands of blocks this is a large amount of
-  short-lived garbage, which both costs allocation time and pressures the GC —
-  and GC pauses serialize threads, hurting parallel scaling specifically.
+### Per-harmonic `numbetween` (the `align` option)
 
-- **Every call re-plans (or uses generic transforms).** `finterp_fft` calls
-  `fft`/`ifft`, which look up or build a plan each time rather than reusing a
-  single measured plan bound to fixed-size buffers.
+The trial fundamentals are stepped by `deltar = hidr/nharms` bins, so harmonic
+`h` is sampled every `deltar_h = hidr·h/nharms` bins — finer at low harmonics.
+`harmonic_numbetween` sizes each harmonic's interpolation oversampling to its
+own `deltar_h` (`= nharms/(hidr·h)`, e.g. 64 at `h=1` down to the floor at high
+`h`), never going below `numbetween` (the accuracy floor). The result is that
+the low harmonics — which carry most of a pulsar's power — get a much finer,
+more accurate interpolation grid: harmonic-1 amplitudes match a `numbetween=256`
+reference to **~1e-15 at the aligned `nb=64`** vs **~1e-2 at the fixed `nb=16`**.
+Each harmonic also gets its own `fftlen`, sized to span a full chunk in a single
+transform (no tiling at the default chunk size). `align=false` (`--noalign`)
+falls back to a single fixed `numbetween`, which is the configuration used to
+prove bit-level equivalence with the reference.
 
-These are exactly the two axes Phase 2 targets.
+> **Caveat worth keeping in mind.** Aligning `numbetween` to `deltar_h` is an
+> *accuracy* lever at low harmonics, not a throughput lever at high ones: linear
+> interpolation between finterp grid points needs the grid finer than the ~1-bin
+> response curvature regardless of how coarse `deltar_h` is, which is why the
+> floor exists and why high harmonics stay at `numbetween`. On the *nonlinear*
+> peak/|trough| metric the end-to-end difference from a fixed grid is ~1% and not
+> strictly monotonic (per-harmonic errors partially cancel); the win is real and
+> large at the *amplitude* level, where it physically belongs.
 
----
+### Measured behavior
 
-## 3. Phase 2 plan — thread-local buffers + FFT-plan reuse
-
-The goal is to make a block's inner loop **allocation-free** and **plan-stable**,
-and to give each thread its own private working set so there is no contention or
-false sharing between threads.
-
-### 3.1 A per-thread `Workspace`
-
-Introduce a `Workspace` struct that owns every mutable buffer and every FFT plan
-needed to process one block, sized once from the search parameters:
-
-```julia
-struct Workspace
-    fftlen::Int
-    ftarr::Vector{ComplexF64}        # zero-stuffed input (reused, re-zeroed)
-    spec::Vector{ComplexF64}         # forward-FFT output
-    corr::Vector{ComplexF64}         # inverse-FFT output
-    coeffs::Vector{ComplexF64}       # cached, pre-FFT'd interpolation kernel
-    ftprofs::Matrix{ComplexF64}      # (nharms+1, L) stacked harmonics
-    profs::Matrix{Float64}           # (2*nharms, L) real profiles
-    fwd::FFTW.cFFTWPlan              # plan_fft!(ftarr)   — in-place
-    inv::FFTW.cFFTWPlan              # plan_ifft!(spec)   — in-place
-    irfftp::FFTW.rFFTWPlan          # plan_irfft(ftprofs, 2*nharms, 1)
-end
-```
-
-Notes on the design:
-
-- **Fixed `fftlen`.** Today `finterp_fft` derives `fftlen` per call from
-  `(numbins + m) * numbetween`. To reuse one plan/buffer set we fix a single
-  `fftlen` for the whole run (the largest a block needs, given `blocksize`,
-  `numbetween`, `m`, and the top harmonic). The `numbins` actually used per
-  harmonic varies, but a fixed-size transform with the unused tail left zeroed is
-  both correct and plan-stable. This trades a little wasted FFT length for plan
-  reuse — a good trade, since FFTW is fast on power-of-two lengths and planning
-  is the expensive part.
-
-- **In-place transforms.** `plan_fft!`/`plan_ifft!` operate in place on `ftarr`,
-  removing two allocations per call. The forward transform overwrites `ftarr`,
-  so we keep the zero-stuffed source pattern and re-scatter each call (cheap), or
-  keep a separate `spec` buffer if we want to preserve the input.
-
-- **Re-zeroing, not reallocating.** Between harmonics we only need to clear the
-  positions that were written (the zero-stuffed bins), not the whole array — a
-  targeted `fill!` over the scattered indices, or track-and-clear, avoids an
-  O(fftlen) wipe per harmonic.
-
-### 3.2 Refactor the kernel to write into a workspace
-
-Add an in-place variant alongside the existing allocating one (which stays for
-tests/clarity):
-
-```julia
-finterp_fft!(out, ws::Workspace, lobin, numbins, numbetween, ft, m)
-```
-
-It scatters into `ws.ftarr`, applies `ws.fwd`, multiplies by `ws.coeffs`,
-applies `ws.inv`, and copies the valid slice into `out` (a view into
-`ws.ftprofs`). No allocation. `block_metrics` then takes a `Workspace` argument
-and threads it through all `nharms` harmonics and the final `irfft` (via
-`mul!(ws.profs, ws.irfftp, ws.ftprofs)`).
-
-### 3.3 Wire workspaces into the threaded driver
-
-Allocate one `Workspace` per thread up front and index it inside the parallel
-loop:
-
-```julia
-workspaces = [Workspace(params, blocksize) for _ in 1:nthreads()]
-@threads for b in 1:nblocks
-    ws = workspaces[threadid()]
-    ...
-    partials[b] = search_block!(ws, ft, rfund, params; threshold)
-end
-```
-
-**Caveat to handle carefully:** `threadid()` is not a stable index under Julia's
-task-migration scheduler (`:dynamic`). The robust patterns are (a) use
-`@threads :static`, which pins iterations to threads and makes `threadid()`
-stable, or (b) switch to a channel/task model where each task takes a workspace
-from a pool. I'll prototype with `:static` (simplest, correct here since blocks
-are uniform) and benchmark against a pool-based version. This is the single most
-important correctness detail in Phase 2 — getting it wrong gives data races, not
-just slowdowns.
-
-### 3.4 Plan creation and thread safety
-
-- **Plan once, before the threaded region.** FFTW *planning* is not thread-safe;
-  *execution* of an already-built plan on distinct buffers is. So each
-  `Workspace` builds its plans at construction time (single-threaded), and the
-  parallel loop only executes them.
-- **`FFTW.set_num_threads(1)`.** Keep FFTW itself single-threaded and parallelize
-  at the Julia-task level. With many small independent transforms, nested FFTW
-  threading contends and loses; one transform per Julia thread is the right
-  granularity.
-- Consider `FFTW.MEASURE` (or `PATIENT`) when building plans, and optionally
-  persisting **FFTW wisdom** so repeated runs skip planning cost.
-
-### 3.5 Expected payoff and how we'll measure it
-
-- **Single-thread:** removing per-call allocation and re-planning should give a
-  further speedup on top of the current 2.1×; the exact factor depends on how
-  FFT-bound the kernel is at the chosen `fftlen`.
-- **Multi-thread:** the bigger win. Eliminating GC pressure should take parallel
-  scaling from "good but GC-throttled" toward near-linear in cores for the
-  embarrassingly parallel block loop.
-
-Measurement plan:
-
-- Extend `crossval/crossval_speed.jl` with a **thread-scaling sweep** (1, 2, 4,
-  8, … threads on the same band) reporting throughput (trials/s) and speedup vs
-  one thread.
-- Track **allocations per block** (`@allocated` / `BenchmarkTools` memory
-  estimates) and assert they drop to ~0 in the hot loop.
-- Keep the accuracy cross-validation green throughout — every refactor must
-  still match the Python oracle to ~1e-15, so performance work cannot silently
-  change results.
+- **Thread scaling** on a 1–50 Hz search of the test file: 7.5 s → 4.1 s → 2.3 s
+  at 1 / 2 / 4 threads (**~3.3× on 4 cores**), with an identical candidate count
+  at every thread count (deterministic and correct).
+- **Detection** of the bundled 10.0123 Hz pulsar is recovered at
+  `10.0123125 Hz`, independent of chunk size.
 
 ---
 
-## 4. Other Phase 2+ items (lower priority)
+## 3. Next steps
 
+- **Throughput tuning script.** Port `examples/speed_test.py` to Julia and sweep
+  the `finterp_fft` rate over both `fftlen` *and* `numbetween` to pick the
+  per-harmonic sweet spots (the design's 1024 < `fftlen` < 65536 expectation),
+  then feed the result back into `build_harmonic_plans`. Persisting **FFTW
+  wisdom** so repeated runs skip planning is a cheap add-on here.
+- **Tiling for very large chunks.** At the default `blocksize` each harmonic fits
+  one transform; large `Nprof` (or small capped `fftlen`) will need the harmonic
+  span split into overlapping tiles. The `fill_harmonic_row!` structure leaves
+  room for this — add the tile loop when the benchmark wants a capped `fftlen`.
 - **Candidate de-duplication / harmonic filtering** (`--noremove` is parsed but
   not yet acting): collapse the cluster of trials around a true signal to a
   single candidate, and remove harmonically-related duplicates.
-- **`Distributed.jl` backend** reusing the same block abstraction, for
-  cluster-scale searches across nodes.
 - **Statistically meaningful detection metric.** The current peak/|trough| ratio
-  is a shape statistic, not a calibrated significance; revisit once performance
-  is settled (this also differs from the documented "equivalent gaussian sigma"
-  in the Python CLI help).
+  is a first-cut shape statistic, not a calibrated significance, and is
+  ill-behaved on a zero-mean profile (the CLI help still advertises an
+  equivalent-gaussian-σ that this does not yet deliver). The plan (Scott's note):
+  move to something closer to a true S/N but tuned for *narrow* pulses, built
+  from two numbers:
+  1. an **amplitude** term, something like `max / (max - |median|)` — a
+     peak-over-baseline that, unlike `max/median`, stays well-behaved on a
+     zero-mean profile;
+  2. a **pseudo-width** term: take all profile bins above e.g. 30% of that
+     amplitude level, and compute the standard deviation of their *fractional
+     pulse phase* distance from the peak bin, using **modular arithmetic** for
+     the distance (the profile is periodic, so wrap-around bins near phase 0/1
+     are close to a peak near the opposite edge).
+
+  The detection metric is then roughly **amplitude / pseudo-width**, rewarding
+  tall, narrow pulses. Both terms are cheap per profile and slot straight into
+  `_profile_metric`; the only care needed is the modular distance and an
+  empty-set guard when nothing clears the 30% level. Worth validating the new
+  metric against injected fake pulsars of varying width before adopting as the
+  default.
+
+- **Cheap multi-frequency search by harmonic decimation.** Note (Scott): instead
+  of one `Nbins = 2·nharms`, start from a large, highly-factorable `Nbins` (e.g.
+  120). Once the full set of harmonic amplitudes for a fundamental is in hand, we
+  can search candidates at 2×, 3×, 4×, 5×, 6× that frequency *almost for free* by
+  inverse-FFT-ing only every 2nd / 3rd / 4th / … harmonic (a stride/decimation in
+  the harmonic array → a shorter irfft) — i.e. reuse the expensive interpolation
+  work to fold at integer multiples of the base frequency. This targets faster
+  pulsars, which also tend to have wider profiles (so the shorter folds are
+  appropriate). The catch: the step in fundamental frequency (`deltar`,
+  `numbetween`, and how far each chunk must read into the long FFT) is tuned for
+  the base `Nbins`; serving the higher multiples well will likely mean rethinking
+  how we stride through the input FFT and how many harmonics each chunk
+  generates. Sketch the bookkeeping (which decimations share which interpolated
+  amplitudes, and the per-multiple range/Nyquist limits) before implementing.
+
+- **Profile plots for the best candidates.** For the top-`ncands` survivors,
+  reconstruct and plot the actual pulse profile. This can be done with
+  brute-force, high-accuracy Fourier interpolation (`fourier_interp` /
+  `finterp_multi`) of each harmonic at the candidate's exact frequencies followed
+  by a plain inverse FFT — no need for the throughput-tuned approximations of the
+  search hot loop, since it runs on a handful of candidates. A good visual sanity
+  check and a natural companion to the new metric (overlay the measured width /
+  baseline). Likely a small `Plots.jl`/`Makie.jl` helper in `bin/` or a
+  `plots.jl`, kept out of the core search dependencies.
+
+- **`Distributed.jl` backend** reusing the same chunk abstraction, for
+  cluster-scale searches across nodes.
 - **Broader real-data validation** beyond the single artificial test pulsar.
 
 ---
 
-## 5. Summary
+## 4. Summary
 
 Phase 1 delivered a correct, parallel, well-tested foundation whose numerical
 results are pinned to the Python implementation at machine precision. Phase 2
-turns the parallel structure that's already in place into real performance:
-per-thread workspaces to make the hot loop allocation-free, and reused,
-pre-measured FFTW plans bound to fixed-size buffers — measured by a thread
-scaling sweep and guarded the whole way by the existing Python-as-oracle
-cross-validation.
+turned that foundation into performance: a chunk-parallel driver with one
+private workspace per task, FFTW plans and interpolation kernels built once and
+reused, a batched inverse FFT for the profiles, and per-harmonic interpolation
+tuning that sharpens the low harmonics. The hot loop is allocation-free, the
+search scales ~3.3× on 4 cores, and — guarded the whole way by the Python oracle
+and an `align=false` equivalence test — the results are provably unchanged.

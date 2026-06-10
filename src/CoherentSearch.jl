@@ -22,7 +22,8 @@ export FFTFile, SimpleInf, freqs
 include("fileio.jl")
 
 # --- Search ---
-export SearchParams, Candidate, search, search_block, block_metrics, coherent_profiles
+export SearchParams, Candidate, search, search_block, block_metrics, coherent_profiles,
+       chunk_metrics, build_harmonic_plans, harmonic_numbetween
 include("search.jl")
 
 end # module

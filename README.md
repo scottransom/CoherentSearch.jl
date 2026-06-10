@@ -22,7 +22,7 @@ src/
   CoherentSearch.jl   module + public API
   fourierinterp.jl    interpolation kernels (the indexing-critical code)
   fileio.jl           PRESTO .fft / .inf readers (mmap)
-  search.jl           block-parallel coherent harmonic-summing search
+  search.jl           chunk-parallel coherent harmonic-summing search
 bin/
   coherent_search.jl  ArgParse command-line front-end
 test/                 unit tests (golden values, analytic signals, indexing)
@@ -87,7 +87,10 @@ conventions are correct.
 
 ## Status
 
-Phase 1: kernels, file I/O, block-parallel search, CLI, tests, and
-cross-validation are in place and passing. Next: thread-local buffer/plan reuse
-for the hot loop, candidate de-duplication (`--noremove`), and broader
-benchmarking.
+Kernels, file I/O, CLI, tests, and Python-oracle cross-validation are in place
+and passing. The search is chunk-parallel with cached FFTW plans and
+interpolation kernels, an allocation-free hot loop, a batched inverse FFT, and
+per-harmonic interpolation tuning (`--noalign` to disable). Next: a throughput
+sweep to tune per-harmonic `fftlen`/`numbetween`, candidate de-duplication
+(`--noremove`), and a calibrated detection metric. See
+`Summary_and_Future_Work.md` for details.
