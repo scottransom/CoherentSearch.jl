@@ -202,6 +202,18 @@ prove bit-level equivalence with the reference.
   metric's discontinuous on-pulse threshold). *Still worth doing:* validate
   against injected fake pulsars of varying width, and sweep `pexp` on real data.
 
+- **Threshold calibration across metric / `pexp` (to investigate).** The metric's
+  numeric scale is *not* comparable across `--metric` or `--pexp`, so a fixed
+  `--threshold` means different things in each configuration. On the test pulsar,
+  the same signal reads ~28 at `:non`/`pexp=0.5`, ~20 at `:non`/`pexp=1.0`, and
+  ~39 at `:sd2`/`pexp=0.5`; only `:non`/`pexp=1/2` is a calibrated equivalent-σ,
+  and even that is single-trial (no trials factor). We need to work out how the
+  detection threshold should be set for each metric/`pexp` — ideally derive (or
+  empirically fit, from pure-noise runs) the false-alarm rate vs. threshold for
+  each configuration so a single "sigma"-like knob has a consistent meaning, and
+  fold in the number of independent trials searched. Until then, `--threshold`
+  must be re-tuned by hand whenever `--metric` or `--pexp` changes.
+
 - **Cheap multi-frequency search by harmonic decimation.** Note (Scott): instead
   of one `Nbins = 2·nharms`, start from a large, highly-factorable `Nbins` (e.g.
   120). Once the full set of harmonic amplitudes for a fundamental is in hand, we
