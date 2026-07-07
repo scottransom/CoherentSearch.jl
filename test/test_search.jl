@@ -18,6 +18,78 @@ const EXAMPLE_FFT = joinpath(@__DIR__, "..", "..", "coherent_search",
     @test all(harmonic_numbetween(h, nh, hidr, minnb) >= minnb for h in 1:nh)
 end
 
+@testset "snr_metrics: N_on^p and Σd²^p detection metrics" begin
+    nbins = 64
+    ngood = 32.0
+    invrms = sqrt(2 * ngood + 1)
+
+    # A lone spike: the on-pulse set is just the peak, so N_on=1 and Σd²=0 -> both
+    # penalties floor to 1 and the metric is peak*invrms for any metric/exponent.
+    spike = zeros(nbins); spike[10] = 5.0
+    for met in (:non, :sd2), p in (0.5, 1.0)
+        @test snr_metrics(reshape(spike, nbins, 1), ngood; metric=met, pexp=p)[1] ≈
+              5.0 * invrms rtol=1e-12
+    end
+
+    # Equal-area, different width: the narrower pulse scores higher (width penalty).
+    narrow = zeros(nbins); narrow[20] = 8.0                 # N_on=1
+    wide   = zeros(nbins); wide[20:27] .= 1.0               # N_on=8, same area
+    @test snr_metrics(reshape(wide,   nbins, 1), ngood)[1] <
+          snr_metrics(reshape(narrow, nbins, 1), ngood)[1]
+
+    # The design distinction: Σd² penalizes phase SEPARATION; N_on does not.
+    close = zeros(nbins); close[20] = 4.0; close[21] = 4.0   # two adjacent bins
+    far   = zeros(nbins); far[20]   = 4.0; far[50]   = 4.0   # two well-separated bins
+    non_close = snr_metrics(reshape(close, nbins, 1), ngood; metric=:non)[1]
+    non_far   = snr_metrics(reshape(far,   nbins, 1), ngood; metric=:non)[1]
+    sd2_close = snr_metrics(reshape(close, nbins, 1), ngood; metric=:sd2)[1]
+    sd2_far   = snr_metrics(reshape(far,   nbins, 1), ngood; metric=:sd2)[1]
+    @test non_close ≈ non_far rtol=1e-12    # N_on only counts lit bins, ignores where
+    @test sd2_far < sd2_close               # Σd² down-weights the separated pair
+
+    # The exponent p sets the width-penalty strength (and does nothing at N_on=1).
+    wlo = snr_metrics(reshape(wide, nbins, 1), ngood; metric=:non, pexp=0.5)[1]
+    whi = snr_metrics(reshape(wide, nbins, 1), ngood; metric=:non, pexp=1.0)[1]
+    @test whi < wlo
+    @test snr_metrics(reshape(narrow, nbins, 1), ngood; metric=:non, pexp=1.0)[1] ≈
+          snr_metrics(reshape(narrow, nbins, 1), ngood; metric=:non, pexp=0.5)[1] rtol=1e-12
+
+    # Modular wrap: a pulse straddling phase 0/1 is contiguous, not edge-split.
+    wrap = zeros(nbins); wrap[nbins] = 4.0; wrap[1] = 4.0
+    adj  = zeros(nbins); adj[30] = 4.0; adj[31] = 4.0
+    @test snr_metrics(reshape(wrap, nbins, 1), ngood; metric=:sd2)[1] ≈
+          snr_metrics(reshape(adj,  nbins, 1), ngood; metric=:sd2)[1] rtol=1e-12
+
+    # brfft (unnormalised, nbins×) vs irfft-scaled: the 1/nbins `scale` recovers
+    # the same value from an unnormalised profile.
+    got = snr_metrics(reshape(spike, nbins, 1), ngood)[1]
+    medbuf = Vector{Float64}(undef, nbins)
+    scaled = reshape(spike .* nbins, nbins, 1)
+    fast = CoherentSearch._profile_snr(scaled, 1, medbuf, nbins, invrms, 1.0 / nbins, 0.2, :non, 0.5)
+    @test fast ≈ got rtol=1e-12
+
+    # An unknown metric is rejected.
+    @test_throws ArgumentError snr_metrics(reshape(spike, nbins, 1), ngood; metric=:bogus)
+end
+
+@testset "remove_duplicates collapses clusters" begin
+    # Two tight clusters (near-identical r) plus one isolated candidate; each
+    # cluster should collapse to its single strongest member.
+    mk(r, s) = Candidate(r / 1000.0, s, r)   # T=1000 so freq=r/1000
+    cands = [mk(10000.0, 8.5), mk(10000.02, 12.0), mk(10000.05, 9.0),  # cluster A
+             mk(20000.0, 7.0),                                          # isolated
+             mk(30000.1, 15.0), mk(30000.2, 11.0)]                      # cluster B
+    kept = remove_duplicates(cands; dr_tol=1.0)
+    @test length(kept) == 3
+    @test issorted(kept; by=c -> c.freq)
+    metrics = sort([c.metric for c in kept])
+    @test metrics ≈ [7.0, 12.0, 15.0]
+
+    # A larger tolerance merges everything within range; empty input is empty.
+    @test length(remove_duplicates(cands; dr_tol=1e9)) == 1
+    @test isempty(remove_duplicates(Candidate[]))
+end
+
 if isfile(EXAMPLE_FFT)
     ft = FFTFile(EXAMPLE_FFT)
 
@@ -35,7 +107,9 @@ if isfile(EXAMPLE_FFT)
 
         relerr = maximum(abs.(opt .- ref)) / maximum(abs.(ref))
         @info "align=false reference agreement" relerr
-        @test relerr < 1e-10
+        # Both paths compute identical profiles to ~1e-10; the snr metric is a
+        # continuous function of them except at the (rare) half-max threshold tie.
+        @test relerr < 1e-8
     end
 
     @testset "per-harmonic alignment is more accurate at low harmonics" begin
@@ -71,6 +145,17 @@ if isfile(EXAMPLE_FFT)
         best = cands[argmax(c.metric for c in cands)]
         @info "strongest candidate" best.freq best.metric
         @test isapprox(best.freq, 10.0123; atol=1e-2)
+
+        # De-duplication collapses the cluster of above-threshold trials around
+        # the pulsar: far fewer candidates out.
+        raw = search(ft, params; lofreq=9.5, hifreq=10.5, threshold=8.0, remove=false)
+        @test length(cands) < length(raw)
+        # Dedup is a pure function of the list: it must return the exact strongest
+        # candidate untouched (checked on the same list to avoid FFTW-plan jitter
+        # between two separate search calls).
+        rbest = raw[argmax(c.metric for c in raw)]
+        dbest = remove_duplicates(raw)[argmax(c.metric for c in remove_duplicates(raw))]
+        @test dbest.freq == rbest.freq && dbest.metric == rbest.metric
     end
 
     @testset "chunk size does not change the detection" begin

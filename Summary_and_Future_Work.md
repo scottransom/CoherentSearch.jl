@@ -159,30 +159,48 @@ prove bit-level equivalence with the reference.
   one transform; large `Nprof` (or small capped `fftlen`) will need the harmonic
   span split into overlapping tiles. The `fill_harmonic_row!` structure leaves
   room for this — add the tile loop when the benchmark wants a capped `fftlen`.
-- **Candidate de-duplication / harmonic filtering** (`--noremove` is parsed but
-  not yet acting): collapse the cluster of trials around a true signal to a
-  single candidate, and remove harmonically-related duplicates.
-- **Statistically meaningful detection metric.** The current peak/|trough| ratio
-  is a first-cut shape statistic, not a calibrated significance, and is
-  ill-behaved on a zero-mean profile (the CLI help still advertises an
-  equivalent-gaussian-σ that this does not yet deliver). The plan (Scott's note):
-  move to something closer to a true S/N but tuned for *narrow* pulses, built
-  from two numbers:
-  1. an **amplitude** term, something like `max / (max - |median|)` — a
-     peak-over-baseline that, unlike `max/median`, stays well-behaved on a
-     zero-mean profile;
-  2. a **pseudo-width** term: take all profile bins above e.g. 30% of that
-     amplitude level, and compute the standard deviation of their *fractional
-     pulse phase* distance from the peak bin, using **modular arithmetic** for
-     the distance (the profile is periodic, so wrap-around bins near phase 0/1
-     are close to a peak near the opposite edge).
+- **Candidate de-duplication (implemented).** `remove_duplicates` (wired to the
+  default; `--noremove` now disables it) collapses the run of adjacent trial
+  fundamentals a single signal lights up down to its strongest member: sort by
+  Fourier frequency `r`, group where consecutive `r` fall within `dr_tol` bins
+  (`--drtol`, default 1.0 — one bin is `1/T` Hz, far finer than the spacing of
+  distinct sources yet comfortably wider than the sub-bin coherent cluster),
+  keep the max-metric candidate per group. On the test band this turns ~32k
+  above-threshold trials into the single 10.0123 Hz candidate. *Still open:*
+  removing **harmonically-related** duplicates (a candidate at `2f`, `3f`, … of a
+  real signal) — a distinct problem from the near-identical collapse done here.
+- **Statistically meaningful detection metric (implemented).** The old
+  peak/|trough| ratio is replaced by a width-sensitive metric ported from the
+  Python `snr_metric` (`_profile_snr` / the public `snr_metrics`):
 
-  The detection metric is then roughly **amplitude / pseudo-width**, rewarding
-  tall, narrow pulses. Both terms are cheap per profile and slot straight into
-  `_profile_metric`; the only care needed is the modular distance and an
-  empty-set guard when nothing clears the 30% level. Worth validating the new
-  metric against injected fake pulsars of varying width before adopting as the
-  default.
+      metric = sum_on(prof - median) / rms / width^pexp
+
+  The **signal** sums the excess over the median across the *on-pulse* set — the
+  bins above `xsignal·(peak - median)` (`--xsignal`, default 0.2) — so it is a
+  stable measure of pulsed flux that does not grow with `nbins` and adds up
+  multi-component pulses (two peaks with a valley) that a boxcar would miss.
+  `rms = 1/sqrt(2*ngoodbins+1)` with `ngoodbins = min(Nyquist/r̄, nharms)` per
+  chunk. The **width** penalty is selectable (`--metric`, `--pexp`):
+    - `:non` — `width = N_on`, the count of on-pulse bins (a duty-cycle penalty).
+      `pexp=1/2` is the calibrated matched filter (equivalent-σ); larger `pexp`
+      suppresses high-duty-cycle signals (broad or many-toothed RFI) while
+      leaving narrow pulses — even widely separated multi-component/interpulse —
+      alone, since it keys on *how many* bins are lit, not *where*. **Default.**
+    - `:sd2` — `width = Σd²`, the summed squared modular phase distance of the
+      on-pulse bins from the peak. Penalises phase *spread*; larger `pexp`
+      down-weights scattered profiles harder, but also genuine wide doubles.
+
+  Empirically (equal matched-filter S/N templates), `:non` cleanly separates
+  narrow pulsars from sawtooth/broad RFI and is stable across `nharms`, whereas
+  `:sd2` mis-ranks interpulse pulsars below many-toothed RFI — hence `:non` is
+  the default. The hot loop keeps its unnormalised batched `brfft`: median,
+  argmax, on-pulse set and width are scale-invariant, so only the linear
+  `signal` term needs the `1/Nbins` factor (folded into the `scale` argument).
+  Oracle-pinned two ways — the reconstructed **profiles** match numpy to ~2e-16
+  (FFT conventions), and *both* width penalties run on *identical* profiles match
+  the shipped Python `snr_metric` to ~2e-16 (the port itself, isolated from the
+  metric's discontinuous on-pulse threshold). *Still worth doing:* validate
+  against injected fake pulsars of varying width, and sweep `pexp` on real data.
 
 - **Cheap multi-frequency search by harmonic decimation.** Note (Scott): instead
   of one `Nbins = 2·nharms`, start from a large, highly-factorable `Nbins` (e.g.

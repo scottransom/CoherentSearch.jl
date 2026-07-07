@@ -19,6 +19,7 @@ import json
 import numpy as np
 import coherent_search.utils as utils
 import coherent_search.fourierinterp as fi
+from coherent_search.coherent_search import snr_metric
 
 
 def main():
@@ -58,11 +59,24 @@ def main():
             re = np.interp(rs, trs, amps.real)
             im = np.interp(rs, trs, amps.imag)
             ftprofs[:, h] = re + 1j * im
-    profs = np.fft.irfft(ftprofs, axis=1)
-    metric = np.max(profs, axis=1) / np.abs(np.min(profs, axis=1))
+    profs = np.fft.irfft(ftprofs, axis=1)   # (L, nbins), normalised
+
+    # Dump the raw profiles BEFORE the metric mutates them (snr_metric subtracts
+    # the per-profile median in place).  The Julia side reads these back and runs
+    # its own snr on identical inputs, isolating the metric port from any FFT /
+    # indexing convention differences (which the profiles + kernel checks guard).
+    profs.astype(np.float64).tofile(f"{outdir}/profs_ref.bin")
+
+    # Width-sensitive detection metric, exactly as coherent_search.py computes it.
+    # Dump both width penalties (non / sd2) so the Julia port is pinned for each.
+    ngoodbins = min(ft.N / 2 / rfund.mean(), nharms)
+    xsignal, pexp = 0.2, 0.5
+    snr_metric(profs.copy(), ngoodbins, xsignal, "non", pexp).astype(np.float64).tofile(
+        f"{outdir}/metric_non_ref.bin")
+    snr_metric(profs.copy(), ngoodbins, xsignal, "sd2", pexp).astype(np.float64).tofile(
+        f"{outdir}/metric_sd2_ref.bin")
 
     rfund.astype(np.float64).tofile(f"{outdir}/rfund.bin")
-    metric.astype(np.float64).tofile(f"{outdir}/metric_ref.bin")
 
     meta = {
         "fftfile": fftfile,
@@ -71,6 +85,10 @@ def main():
         "m": m,
         "numbetween": numbetween,
         "nharms": nharms,
+        "nbins": 2 * nharms,
+        "ngoodbins": float(ngoodbins),
+        "xsignal": xsignal,
+        "pexp": pexp,
         "kernel": {"lobin": k_lobin, "numbins": k_numbins, "len": int(kernel_ref.size)},
         "e2e": {"r0": r0, "lodr": lodr, "L": L},
     }

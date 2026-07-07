@@ -17,10 +17,17 @@ function parse_cmdline(argv)
     s = ArgParseSettings(
         description = "Search a PRESTO-style FFT file for pulsations using coherent harmonic folding.",
         epilog = """
-        In general, the FFT file should probably be barycentered, have known RFI
-        zapped, and have rednoise removed.  The threshold is a single-trial
-        peak/|trough| profile metric.  If no output filename is given, results
-        are written to stdout.  Pass `-t auto` to Julia for multi-threaded runs.
+        The input FFT file MUST be normalized (Fourier powers with mean ~ 1); the
+        width-sensitive S/N metric assumes unit-variance noise, so an un-normalized
+        FFT produces meaningless (hugely inflated) S/N values.  Normalize an
+        un-normalized FFT with PRESTO's `rednoise` routine, which also removes red
+        noise.  The FFT should also be barycentered and have known RFI zapped.  The
+        detection metric sums the on-pulse flux and divides by a width penalty
+        (--metric): 'non' = N_on^p (duty cycle; p=1/2 is a calibrated equivalent-σ,
+        larger p suppresses broad/RFI-like signals) or 'sd2' = Σd²^p (phase spread).
+        Near-identical candidates are collapsed by default (--noremove disables it).
+        If no output filename is given, results are written to stdout.  Pass
+        `-t auto` to Julia for multi-threaded runs.
         """,
     )
     @add_arg_table! s begin
@@ -63,15 +70,32 @@ function parse_cmdline(argv)
             help = "Minimum points to interpolate between Fourier bins"
             arg_type = Int
             default = 16
+        "--xsignal"
+            help = "Peak fraction bounding the on-pulse signal sum in the S/N metric"
+            arg_type = Float64
+            default = 0.2
+        "--metric"
+            help = "Width penalty: 'non' (N_on^p, duty cycle) or 'sd2' (Σd²^p, phase spread)"
+            arg_type = String
+            default = "non"
+            range_tester = x -> x in ("non", "sd2")
+        "--pexp"
+            help = "Width-penalty exponent p (1/2 = calibrated matched filter for 'non')"
+            arg_type = Float64
+            default = 0.5
         "--blocksize"
             help = "Trial fundamentals per parallel chunk (Nprof)"
             arg_type = Int
             default = 2048
+        "--drtol"
+            help = "Fourier-bin tolerance for collapsing near-identical candidates"
+            arg_type = Float64
+            default = 1.0
         "--noalign"
             help = "Use a fixed numbetween for all harmonics (disable per-harmonic tuning)"
             action = :store_true
         "--noremove"
-            help = "Do not filter duplicate or harmonically-related candidates"
+            help = "Do not collapse near-identical (duplicate) candidates"
             action = :store_true
     end
     return parse_args(argv, s)
@@ -86,20 +110,23 @@ function main(argv)
         numbetween = a["numbetween"],
         threshold = a["threshold"],
         align = !a["noalign"],
+        xsignal = a["xsignal"],
+        metric = Symbol(a["metric"]),
+        pexp = a["pexp"],
     )
 
     @info "Searching" file=a["fftfile"] T=ft.T nharms=params.nharms threads=nthreads()
 
     cands = search(ft, params;
                    lofreq = a["lofreq"], hifreq = a["hifreq"], lobin = a["lobin"],
-                   blocksize = a["blocksize"], threshold = a["threshold"])
+                   blocksize = a["blocksize"], threshold = a["threshold"],
+                   remove = !a["noremove"], dr_tol = a["drtol"])
 
-    # Keep the strongest `ncands` candidates, but report them in frequency order.
+    # Report the strongest `ncands` candidates, sorted best metric first.
     sort!(cands; by = c -> c.metric, rev = true)
     if length(cands) > a["ncands"]
         cands = cands[1:a["ncands"]]
     end
-    sort!(cands; by = c -> c.freq)
 
     lines = [@sprintf("Candidate at %.6f Hz with S/N %.2f", c.freq, c.metric) for c in cands]
     if isempty(a["outputfilenm"])

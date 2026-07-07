@@ -17,7 +17,7 @@
 #         amplitude array via cached-plan, cached-coefficient Fourier
 #         interpolation at a per-harmonic `numbetween` matched to `deltar_h`;
 #       - loop #3 a single *batched* complex→real inverse FFT of all `Nprof`
-#         profiles at once, then a peak/|trough| metric per profile.
+#         profiles at once, then a width-sensitive S/N metric per profile.
 #
 # All FFTW plans and interpolation kernels are built once (single-threaded,
 # since FFTW *planning* is not thread-safe) and only *executed* inside the
@@ -43,13 +43,17 @@ Base.@kwdef struct SearchParams
     hidr::Float64 = 0.5     # Fourier-bin step at the highest harmonic
     threshold::Float64 = 8.0
     align::Bool = true      # per-harmonic numbetween matched to deltar_h
+    xsignal::Float64 = 0.2  # peak fraction bounding the on-pulse signal region
+    metric::Symbol = :non   # width penalty: :non (N_on^pexp) or :sd2 (Σd²^pexp)
+    pexp::Float64 = 0.5     # width-penalty exponent (1/2 = calibrated for :non)
 end
 
 """
     Candidate
 
-A detected candidate: barycentric spin frequency (Hz), the peak/|trough|
-profile metric, and the fundamental Fourier frequency (bins).
+A detected candidate: barycentric spin frequency (Hz), the width-sensitive S/N
+detection metric (see [`snr_metrics`](@ref)), and the fundamental Fourier
+frequency (bins).
 """
 struct Candidate
     freq::Float64
@@ -79,6 +83,116 @@ to `np.interp(r, trs, amps)`, including its clamp-to-endpoints edge behaviour.
 end
 
 # ---------------------------------------------------------------------------
+# Detection metric (port of `snr_metric` from coherent_search.py)
+# ---------------------------------------------------------------------------
+
+"""
+    chunk_ngoodbins(ft, nharms, rmean) -> Float64
+
+The number of harmonics that carry real Fourier data for a chunk of trial
+fundamentals whose mean Fourier frequency is `rmean`: `min(Nyquist/rmean,
+nharms)`.  This sets the expected profile-noise RMS in [`_profile_snr`](@ref).
+Matches `min(ft.N/2/rstosearch.mean(), args.nharms)` in the Python code.
+"""
+@inline chunk_ngoodbins(ft::FFTFile, nharms::Integer, rmean::Real) =
+    min(ft.N / 2 / rmean, float(nharms))
+
+"""
+    _profile_snr(profs, j, medbuf, nbins, invrms, scale, xsignal, metric, pexp) -> Float64
+
+Width-sensitive detection metric for profile column `j` of the `(nbins × *)`
+real profile matrix.  Ports `snr_metric` from `coherent_search.py`:
+
+    metric = sum_on(prof - median) / rms / width^pexp
+
+The **signal** `sum_on(prof - median)` is the summed excess over the median of
+every *on-pulse* bin — the bins that rise above a fraction `xsignal` of the
+peak-over-median height (`prof - median > xsignal*(max - median)`).  Summing
+over this set (rather than the whole, zero-mean profile) keeps the signal a
+stable measure of pulsed flux that does not grow with `nbins`, and it naturally
+captures multi-component pulses (two narrow peaks with a valley between them
+each contribute), which a single boxcar would miss.
+
+The **width** penalty is taken over that same on-pulse set and selected by
+`metric`:
+
+  * `:non` — `width = N_on`, the *count* of on-pulse bins (a duty-cycle penalty).
+    `pexp = 1/2` is the calibrated matched-filter normalisation (a true
+    equivalent-σ); larger `pexp` more aggressively penalises high-duty-cycle
+    signals (e.g. broad or many-toothed RFI) while leaving narrow pulses — even
+    widely separated multi-component or interpulse pulsars — untouched, since it
+    keys on how *many* bins are lit, not *where* they sit.
+  * `:sd2` — `width = Σ d²`, the summed squared *modular* phase distance of the
+    on-pulse bins from the peak (distances wrap, the profile being periodic).
+    This penalises phase *spread*: larger `pexp` down-weights scattered/broad
+    profiles harder, but also down-weights genuinely separated components.
+
+`rms = 1/sqrt(2*ngoodbins+1)` is supplied as `invrms = 1/rms`, and `medbuf` is a
+length-`nbins` scratch buffer (reused, not read on entry).  `scale` carries the
+profile normalisation: `1` for a true (normalised) irfft, `1/nbins` for the
+unnormalised `brfft` used in the hot loop.  The median, argmax, on-pulse set,
+and width are all scale-invariant, so only the linear `signal` term needs
+`scale` — which is why the fast path can skip the irfft normalisation entirely.
+"""
+@inline function _profile_snr(profs::AbstractMatrix{Float64}, j::Integer,
+                              medbuf::Vector{Float64}, nbins::Int, invrms::Float64,
+                              scale::Float64, xsignal::Float64, metric::Symbol, pexp::Float64)
+    col = @view profs[:, j]
+    copyto!(medbuf, col)
+    sort!(medbuf; alg=QuickSort)                 # in-place; nbins is small
+    half = nbins >>> 1                           # nbins is even (= 2*nharms)
+    med = 0.5 * (medbuf[half] + medbuf[half + 1])
+
+    mx = -Inf; mxind = 1
+    @inbounds for k in 1:nbins
+        v = col[k]
+        if v > mx                                # first-max tie-break, as np.argmax
+            mx = v; mxind = k
+        end
+    end
+    peak = mx - med                              # peak height over the baseline
+    sig_thr = med + xsignal * peak               # on-pulse level
+
+    signal = 0.0
+    non = 0
+    sumsq = 0.0
+    @inbounds for k in 1:nbins
+        col[k] > sig_thr || continue             # restrict to the on-pulse set
+        signal += col[k] - med
+        non += 1
+        d = mxind - k
+        d >  half && (d -= nbins)                # wrap to the nearest periodic image
+        d < -half && (d += nbins)
+        sumsq += d * d
+    end
+    w = metric === :sd2 ? sumsq : Float64(non)   # phase-spread vs duty-cycle penalty
+    w < 1.0 && (w = 1.0)                          # floor (lone peak -> width 1)
+    return scale * signal * invrms / w^pexp
+end
+
+"""
+    snr_metrics(profs, ngoodbins; xsignal=0.2, metric=:non, pexp=0.5) -> Vector{Float64}
+
+Width-sensitive detection metric for every profile (column) of the `(nbins × L)`
+real profile matrix `profs`, which must be a true (normalised) irfft.  Public
+port of `snr_metric` from the Python `coherent_search` (note the profiles are
+columns here, rows in Python).  `ngoodbins` sets the noise RMS
+`1/sqrt(2*ngoodbins+1)` (see [`chunk_ngoodbins`](@ref)); `xsignal` is the peak
+fraction bounding the on-pulse region; `metric` (`:non` or `:sd2`) and `pexp`
+select and tune the width penalty (see [`_profile_snr`](@ref)).
+"""
+function snr_metrics(profs::AbstractMatrix{<:Real}, ngoodbins::Real;
+                     xsignal::Real=0.2, metric::Symbol=:non, pexp::Real=0.5)
+    metric in (:non, :sd2) || throw(ArgumentError("metric must be :non or :sd2, got :$metric"))
+    nbins, L = size(profs)
+    invrms = sqrt(2 * ngoodbins + 1)
+    medbuf = Vector{Float64}(undef, nbins)
+    P = profs isa Matrix{Float64} ? profs : convert(Matrix{Float64}, profs)
+    return [_profile_snr(P, j, medbuf, nbins, invrms, 1.0, Float64(xsignal), metric, Float64(pexp))
+            for j in 1:L]
+end
+
+# ---------------------------------------------------------------------------
 # Reference path (mirrors the Python algorithm; pinned by the cross-validation)
 # ---------------------------------------------------------------------------
 
@@ -93,14 +207,16 @@ coherent_profiles(ftprofs::AbstractMatrix{<:Complex}, nbins::Integer) =
     irfft(ftprofs, nbins, 1)
 
 """
-    block_metrics(ft, rfund, params) -> Vector{Float64}
+    reference_profiles(ft, rfund, params) -> Matrix{Float64}
 
-Compute the coherent-fold peak/|trough| metric for every trial fundamental
-Fourier frequency in `rfund`.  Self-contained reference implementation (own
-buffers, no shared mutable state); this is the exact computation the Python
-oracle reproduces in cross-validation.
+Build the `(2*nharms, L)` real coherent-fold pulse profiles (one column per
+trial fundamental in `rfund`) via the simple, allocating reference path: one
+`finterp_fft` per harmonic, linear interpolation onto the trial frequencies, and
+a single (normalised) `irfft`.  This is the exact profile computation the Python
+oracle reproduces, kept separate from the detection metric so each can be
+cross-validated on its own.
 """
-function block_metrics(ft::FFTFile, rfund::AbstractVector{<:Real}, params::SearchParams)
+function reference_profiles(ft::FFTFile, rfund::AbstractVector{<:Real}, params::SearchParams)
     nh = params.nharms
     m = params.m
     nb = params.numbetween
@@ -128,18 +244,29 @@ function block_metrics(ft::FFTFile, rfund::AbstractVector{<:Real}, params::Searc
         end
     end
 
-    profs = coherent_profiles(ftprofs, 2nh)
+    return coherent_profiles(ftprofs, 2nh)
+end
 
+"""
+    block_metrics(ft, rfund, params) -> Vector{Float64}
+
+Compute the coherent-fold detection S/N (see [`snr_metrics`](@ref)) for every
+trial fundamental Fourier frequency in `rfund`.  Self-contained reference
+implementation built on [`reference_profiles`](@ref); this is the exact
+computation the Python oracle reproduces in cross-validation.
+"""
+function block_metrics(ft::FFTFile, rfund::AbstractVector{<:Real}, params::SearchParams)
+    nh = params.nharms
+    nbins = 2nh
+    L = length(rfund)
+    profs = reference_profiles(ft, rfund, params)
+
+    rmean = sum(rfund) / L
+    invrms = sqrt(2 * chunk_ngoodbins(ft, nh, rmean) + 1)
+    medbuf = Vector{Float64}(undef, nbins)
     metrics = Vector{Float64}(undef, L)
-    @inbounds for j in 1:L
-        mx = -Inf
-        mn = Inf
-        for k in 1:2nh
-            v = profs[k, j]
-            mx = ifelse(v > mx, v, mx)
-            mn = ifelse(v < mn, v, mn)
-        end
-        metrics[j] = mx / abs(mn)
+    for j in 1:L
+        metrics[j] = _profile_snr(profs, j, medbuf, nbins, invrms, 1.0, params.xsignal, params.metric, params.pexp)
     end
     return metrics
 end
@@ -263,6 +390,7 @@ struct Workspace{B}
     scratch::Dict{Int,FFTScratch}
     ftprofs::Matrix{ComplexF64}   # (nharms+1, Nprof)
     profs::Matrix{Float64}        # (2*nharms, Nprof)
+    medbuf::Vector{Float64}       # (2*nharms,) scratch for the per-profile median
     brfftplan::B                   # plan_brfft(ftprofs, 2*nharms, 1)
 end
 
@@ -274,9 +402,10 @@ function Workspace(params::SearchParams, hplans::Vector{HarmonicPlan}, Nprof::In
     end
     ftprofs = zeros(ComplexF64, nh + 1, Nprof)
     profs   = Matrix{Float64}(undef, 2nh, Nprof)
+    medbuf  = Vector{Float64}(undef, 2nh)
     brfftplan = plan_brfft(ftprofs, 2nh, 1; flags=FFTW.MEASURE)
     fill!(ftprofs, 0)   # MEASURE planning may have dirtied the buffer
-    return Workspace(scratch, ftprofs, profs, brfftplan)
+    return Workspace(scratch, ftprofs, profs, medbuf, brfftplan)
 end
 
 """
@@ -353,40 +482,33 @@ function fill_chunk_profiles!(ws::Workspace, hplans::Vector{HarmonicPlan}, ft::F
     for hp in hplans
         fill_harmonic_row!(ws, hp, ft, params, hp.h * rstart, n)
     end
-    # One batched complex→real transform for all Nprof profiles at once.  The
-    # 1/Nbins normalisation of a true irfft cancels in the peak/|trough| ratio,
-    # so the unnormalised brfft is used directly.
+    # One batched complex→real transform for all Nprof profiles at once.  This
+    # is an unnormalised `brfft` (= Nbins × a true irfft); the S/N metric folds
+    # the missing 1/Nbins into its `scale` argument (see `_profile_snr`), so the
+    # profiles here are left unnormalised.
     mul!(ws.profs, ws.brfftplan, ws.ftprofs)
     return
-end
-
-# peak/|trough| of column `j` of the (Nbins × *) real profile matrix.
-@inline function _profile_metric(profs::Matrix{Float64}, j::Integer)
-    mx = -Inf
-    mn = Inf
-    @inbounds for k in 1:size(profs, 1)
-        v = profs[k, j]
-        mx = ifelse(v > mx, v, mx)
-        mn = ifelse(v < mn, v, mn)
-    end
-    return mx / abs(mn)
 end
 
 """
     chunk_metrics(ft, params, rstart, n; lodr) -> Vector{Float64}
 
 Single-threaded convenience that runs the optimised path over one chunk of `n`
-trial fundamentals starting at `rstart` and returns the metric for each.  With
-`params.align = false` this reproduces [`block_metrics`](@ref) to machine
+trial fundamentals starting at `rstart` and returns the S/N metric for each.
+With `params.align = false` this reproduces [`block_metrics`](@ref) to machine
 precision; it is the bridge the test suite uses to pin the optimised path to the
 oracle-validated reference.
 """
 function chunk_metrics(ft::FFTFile, params::SearchParams, rstart::Real, n::Integer;
                        lodr::Real = params.hidr / params.nharms)
+    nh = params.nharms
+    nbins = 2nh
     hplans = build_harmonic_plans(params, n)
     ws = Workspace(params, hplans, n)
     fill_chunk_profiles!(ws, hplans, ft, params, rstart, lodr, n)
-    return [_profile_metric(ws.profs, j) for j in 1:n]
+    rmean = rstart + (n - 1) * lodr / 2
+    invrms = sqrt(2 * chunk_ngoodbins(ft, nh, rmean) + 1)
+    return [_profile_snr(ws.profs, j, ws.medbuf, nbins, invrms, 1.0 / nbins, params.xsignal, params.metric, params.pexp) for j in 1:n]
 end
 
 """
@@ -402,9 +524,11 @@ The `lofreq`/`lobin` precedence matches the Python CLI: `lofreq` is used unless
 """
 function search(ft::FFTFile, params::SearchParams=SearchParams();
                 lofreq::Real=0.1, hifreq::Real=100.0, lobin::Integer=100,
-                blocksize::Integer=2048, threshold::Real=params.threshold)
+                blocksize::Integer=2048, threshold::Real=params.threshold,
+                remove::Bool=true, dr_tol::Real=1.0)
     FFTW.set_num_threads(1)   # parallelise at the Julia-task level, not inside FFTW
     lodr = params.hidr / params.nharms
+    nbins = 2 * params.nharms
     # Faithful (if brittle) port of the Python precedence rule.
     r_lo = lofreq * ft.T
     if lobin != 100
@@ -433,8 +557,10 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
                 n = min(Nprof, total - i0)
                 rstart = r_lo + i0 * lodr
                 fill_chunk_profiles!(ws, hplans, ft, params, rstart, lodr, n)
-                @inbounds for j in 1:n
-                    metric = _profile_metric(ws.profs, j)
+                rmean = rstart + (n - 1) * lodr / 2
+                invrms = sqrt(2 * chunk_ngoodbins(ft, params.nharms, rmean) + 1)
+                for j in 1:n
+                    metric = _profile_snr(ws.profs, j, ws.medbuf, nbins, invrms, 1.0 / nbins, params.xsignal, params.metric, params.pexp)
                     if metric > threshold
                         rf = rstart + (j - 1) * lodr
                         push!(out, Candidate(rf / ft.T, metric, rf))
@@ -447,6 +573,43 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
     end
 
     cands = reduce(vcat, results; init=Candidate[])
-    sort!(cands; by=c -> c.freq)
+    if remove
+        cands = remove_duplicates(cands; dr_tol=dr_tol)
+    else
+        sort!(cands; by=c -> c.freq)
+    end
     return cands
+end
+
+"""
+    remove_duplicates(cands; dr_tol=1.0) -> Vector{Candidate}
+
+Collapse clusters of near-identical candidates — the run of adjacent trial
+fundamentals that a single signal lights up — down to their strongest member.
+Candidates are grouped whenever consecutive Fourier frequencies `r` (in bins,
+sorted) lie within `dr_tol` of one another, and the maximum-metric candidate of
+each group is kept.  One Fourier bin is `1/T` Hz, so a `dr_tol` of order a bin
+is still far finer than the spacing of astrophysically distinct sources, while
+comfortably spanning the sub-bin-wide coherent-response cluster.  Returns the
+kept candidates sorted by frequency.
+"""
+function remove_duplicates(cands::AbstractVector{Candidate}; dr_tol::Real=1.0)
+    isempty(cands) && return Candidate[]
+    order = sortperm(cands; by=c -> c.r)
+    kept = Candidate[]
+    best = cands[order[1]]
+    prev_r = best.r
+    @inbounds for idx in @view order[2:end]
+        c = cands[idx]
+        if c.r - prev_r <= dr_tol
+            c.metric > best.metric && (best = c)
+        else
+            push!(kept, best)
+            best = c
+        end
+        prev_r = c.r
+    end
+    push!(kept, best)
+    sort!(kept; by=c -> c.freq)
+    return kept
 end

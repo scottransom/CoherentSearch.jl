@@ -90,7 +90,12 @@ conventions are correct.
 Kernels, file I/O, CLI, tests, and Python-oracle cross-validation are in place
 and passing. The search is chunk-parallel with cached FFTW plans and
 interpolation kernels, an allocation-free hot loop, a batched inverse FFT, and
-per-harmonic interpolation tuning (`--noalign` to disable). Next: a throughput
-sweep to tune per-harmonic `fftlen`/`numbetween`, candidate de-duplication
-(`--noremove`), and a calibrated detection metric. See
-`Summary_and_Future_Work.md` for details.
+per-harmonic interpolation tuning (`--noalign` to disable). The detection metric
+sums the on-pulse flux and divides by a selectable width penalty (`--metric`):
+`non` = `N_on^p` (duty cycle; `p=1/2` is a calibrated matched filter, larger `p`
+suppresses broad/RFI-like signals) or `sd2` = `Σd²^p` (phase spread). It is a
+port of the Python `snr_metric`, oracle-pinned to machine precision for both
+penalties. Near-identical candidates are collapsed by default (`--noremove`
+disables it, `--drtol` sets the tolerance). Next: a throughput sweep to tune
+per-harmonic `fftlen`/`numbetween`, and harmonically-related candidate
+filtering. See `Summary_and_Future_Work.md` for details.
