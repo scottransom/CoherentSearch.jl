@@ -24,7 +24,7 @@
 # parallel region (executing a prebuilt plan on distinct buffers is safe).
 
 using FFTW
-using Base.Threads: @spawn, nthreads
+using Base.Threads: @spawn, nthreads, Atomic, atomic_add!
 using LinearAlgebra: mul!
 
 """
@@ -610,11 +610,21 @@ interpolation kernels are built once before the parallel region.
 
 The `lofreq`/`lobin` precedence matches the Python CLI: `lofreq` is used unless
 `lobin` is set to something other than its default of 100.
+
+Candidate post-processing: near-identical clusters are collapsed by
+[`remove_duplicates`](@ref) (`remove`, `dr_tol`), then harmonically-related
+candidates by [`remove_harmonics`](@ref) (`harm_remove`, `numharm`, `harm_tol`).
+`progress` (`:none`, `:text`, or `:bar`) prints a chunk-completion meter to
+`stderr`.
 """
 function search(ft::FFTFile, params::SearchParams=SearchParams();
                 lofreq::Real=0.1, hifreq::Real=100.0, lobin::Integer=100,
                 blocksize::Integer=2048, threshold::Real=params.threshold,
-                remove::Bool=true, dr_tol::Real=1.0)
+                remove::Bool=true, dr_tol::Real=1.0,
+                harm_remove::Bool=true, numharm::Integer=16, harm_tol::Real=1.0,
+                progress::Symbol=:none)
+    progress in (:none, :text, :bar) ||
+        throw(ArgumentError("progress must be :none, :text or :bar, got :$progress"))
     FFTW.set_num_threads(1)   # parallelise at the Julia-task level, not inside FFTW
     lodr = params.hidr / params.nharms
     nbins = 2 * params.nharms
@@ -636,6 +646,7 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
     workspaces = [Workspace(params, hplans, Nprof) for _ in 1:nt]
 
     results = Vector{Vector{Candidate}}(undef, nt)
+    done = Atomic{Int}(0)     # chunks completed across all tasks (for the progress meter)
     @sync for t in 1:nt
         @spawn begin
             ws = workspaces[t]
@@ -660,10 +671,18 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
                 for db in ws.decims
                     decim_pass!(out, ws, db, ft, params, rstart, lodr, n; threshold=threshold)
                 end
+                atomic_add!(done, 1)
+                # One task owns the display (avoids interleaved \r writes); it reads
+                # the shared counter so the meter reflects every task's progress.
+                t == 1 && _render_progress(progress, done[], nchunks)
                 c += nt
             end
             results[t] = out
         end
+    end
+    if progress !== :none                    # clean 100% line after the parallel region
+        _render_progress(progress, nchunks, nchunks)
+        println(stderr)
     end
 
     cands = reduce(vcat, results; init=Candidate[])
@@ -672,7 +691,33 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
     else
         sort!(cands; by=c -> c.freq)
     end
+    if harm_remove
+        cands = remove_harmonics(cands; numharm=numharm, tol=harm_tol)
+    end
     return cands
+end
+
+"""
+    _render_progress(mode, done, total)
+
+Overwrite a single-line chunk-completion meter on `stderr` (`\\r`, no newline).
+`mode` is `:none` (does nothing), `:text` (a percentage) or `:bar` (a bar).  The
+caller prints the closing newline once, after the parallel region.
+"""
+function _render_progress(mode::Symbol, done::Integer, total::Integer)
+    mode === :none && return
+    frac = total == 0 ? 1.0 : done / total
+    pct = round(Int, 100 * frac)
+    if mode === :bar
+        width = 40
+        filled = clamp(round(Int, width * frac), 0, width)
+        print(stderr, "\r  Searching [", '#'^filled, ' '^(width - filled),
+              "] ", lpad(pct, 3), "%  (", done, "/", total, " chunks)")
+    else
+        print(stderr, "\r  Searching: ", lpad(pct, 3), "%  (", done, "/", total, " chunks)")
+    end
+    flush(stderr)
+    return
 end
 
 """
@@ -704,6 +749,53 @@ function remove_duplicates(cands::AbstractVector{Candidate}; dr_tol::Real=1.0)
         prev_r = c.r
     end
     push!(kept, best)
+    sort!(kept; by=c -> c.freq)
+    return kept
+end
+
+"""
+    _harmonically_related(r1, r2; numharm, tol) -> Bool
+
+Whether the Fourier frequencies `r1`, `r2` (bins) are harmonics of a common
+fundamental: `hi/lo ≈ n/m` for integers `1 ≤ m, n ≤ numharm`.  With the best
+common fundamental `f₀ = lo/m = hi/n`, `|m·hi - n·lo|` is `m ·` the residual of
+`hi` from `n·f₀`, so the test `|m·hi - n·lo| ≤ tol·m` holds `hi` to `tol` bins on
+the shared comb — a bin-scale tolerance that (unlike a fixed `|m·hi - n·lo|`
+bound) does not tighten spuriously at high harmonic number.
+"""
+@inline function _harmonically_related(r1::Real, r2::Real; numharm::Integer, tol::Real)
+    lo, hi = minmax(r1, r2)
+    lo > 0 || return false
+    @inbounds for m in 1:numharm
+        n = round(Int, m * hi / lo)             # nearest harmonic ratio hi/lo ≈ n/m
+        (1 <= n <= numharm) || continue
+        abs(m * hi - n * lo) <= tol * m && return true
+    end
+    return false
+end
+
+"""
+    remove_harmonics(cands; numharm=16, tol=1.0) -> Vector{Candidate}
+
+Collapse harmonically-related candidates — the `f/2`, `3f/2`, `2f`, … family a
+single real signal lights up (made more prominent by harmonic decimation, whose
+subharmonic folds report genuinely different Fourier frequencies `r`) — keeping
+the strongest member of each family.  Candidates are visited strongest-metric
+first; each is kept unless its `r` is [`_harmonically_related`](@ref) (up to
+`numharm`, within `tol` bins) to an already-kept stronger one.  Distinct from
+[`remove_duplicates`](@ref), which collapses only *near-identical* `r`; run this
+after it.  Returns the kept candidates sorted by frequency.
+"""
+function remove_harmonics(cands::AbstractVector{Candidate}; numharm::Integer=16, tol::Real=1.0)
+    isempty(cands) && return Candidate[]
+    order = sortperm(cands; by=c -> c.metric, rev=true)   # strongest first
+    kept = Candidate[]
+    @inbounds for idx in order
+        c = cands[idx]
+        if !any(k -> _harmonically_related(c.r, k.r; numharm=numharm, tol=tol), kept)
+            push!(kept, c)
+        end
+    end
     sort!(kept; by=c -> c.freq)
     return kept
 end

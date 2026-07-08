@@ -90,6 +90,27 @@ end
     @test isempty(remove_duplicates(Candidate[]))
 end
 
+@testset "remove_harmonics collapses harmonic families" begin
+    mk(r, s) = Candidate(r / 1000.0, s, r, 16)
+    # A family around r0=10000 (r0/2, r0, 3r0/2, 2r0): keep only the strongest.
+    fam = [mk(5000.0, 9.0), mk(10000.0, 20.0), mk(15000.0, 8.5), mk(20000.0, 12.0)]
+    kept = remove_harmonics(fam; numharm=16, tol=1.0)
+    @test length(kept) == 1
+    @test kept[1].r == 10000.0 && kept[1].metric == 20.0
+
+    # An unrelated candidate (13337/10000 = 1.3337, no small n/m) survives.
+    mixed = vcat(fam, [mk(13337.0, 11.0)])
+    kept2 = remove_harmonics(mixed; numharm=16, tol=1.0)
+    @test length(kept2) == 2
+    @test issorted(kept2; by=c -> c.freq)
+    @test Set(round(Int, c.r) for c in kept2) == Set([10000, 13337])
+
+    # numharm bounds the ratios tested: with numharm=1 only exact (1/1, i.e.
+    # near-identical) matches collapse, so the whole spread-out family survives.
+    @test length(remove_harmonics(fam; numharm=1, tol=1.0)) == 4
+    @test isempty(remove_harmonics(Candidate[]))
+end
+
 if isfile(EXAMPLE_FFT)
     ft = FFTFile(EXAMPLE_FFT)
 
@@ -148,7 +169,8 @@ if isfile(EXAMPLE_FFT)
 
         # De-duplication collapses the cluster of above-threshold trials around
         # the pulsar: far fewer candidates out.
-        raw = search(ft, params; lofreq=9.5, hifreq=10.5, threshold=8.0, remove=false)
+        raw = search(ft, params; lofreq=9.5, hifreq=10.5, threshold=8.0,
+                     remove=false, harm_remove=false)
         @test length(cands) < length(raw)
         # Dedup is a pure function of the list: it must return the exact strongest
         # candidate untouched (checked on the same list to avoid FFTW-plan jitter
@@ -210,7 +232,11 @@ if isfile(EXAMPLE_FFT)
         for k in (2, 3)
             base_f = f / k                            # fundamental band that only k hits
             params = SearchParams(nharms=nharms, decimations=decimation_set(nharms, k))
-            cands = search(ft, params; lofreq=base_f - 0.5, hifreq=base_f + 0.5, threshold=8.0)
+            # harm_remove=false to isolate decimation: otherwise the whole f/k, 2f/k,
+            # ... family (which decimation lights up) collapses to its single
+            # strongest member, which need not be the direct-f (k-pass) detection.
+            cands = search(ft, params; lofreq=base_f - 0.5, hifreq=base_f + 0.5,
+                           threshold=8.0, harm_remove=false)
             match = filter(c -> isapprox(c.freq, f; atol=1e-2), cands)
             @info "decimation detection" k n_match=length(match)
             @test !isempty(match)
@@ -221,6 +247,30 @@ if isfile(EXAMPLE_FFT)
                          lofreq=base_f - 0.5, hifreq=base_f + 0.5, threshold=8.0)
             @test isempty(filter(c -> isapprox(c.freq, f; atol=1e-2), off))
         end
+    end
+
+    @testset "harmonic removal collapses the subharmonic family" begin
+        # In a band near f/3, decimation lights up the pulsar as a three-member
+        # harmonic family: f/3 (60 harm), 2f/3 (30 harm), f (20 harm), at Fourier
+        # frequency ratios 1:2:3.  Harmonic removal must collapse it to a single
+        # survivor (the strongest), independent of which physical frequency wins.
+        nharms = 60
+        params = SearchParams(nharms=nharms, decimations=decimation_set(nharms, 3))
+        kw = (lofreq=10.0123 / 3 - 0.4, hifreq=10.0123 / 3 + 0.4, threshold=8.0)
+        raw = search(ft, params; kw..., harm_remove=false)
+        one = search(ft, params; kw..., harm_remove=true)
+        @test length(one) < length(raw)
+
+        top3 = sort(raw; by=c -> c.metric, rev=true)[1:3]
+        strongest = top3[1]
+        rel(a, b) = CoherentSearch._harmonically_related(a, b; numharm=16, tol=1.0)
+        @info "harmonic family" freqs=[round(c.freq, digits=4) for c in top3]
+        # The three strongest detections are one harmonic family (all related to the top).
+        @test all(rel(strongest.r, c.r) for c in top3)
+        # Removal keeps exactly one member of that family -- the strongest -- and drops the rest.
+        @test count(c -> rel(strongest.r, c.r), one) == 1
+        surv = one[argmax(c.metric for c in one)]
+        @test surv.freq == strongest.freq && surv.metric == strongest.metric
     end
 else
     @info "Skipping search data tests; example file not found" EXAMPLE_FFT

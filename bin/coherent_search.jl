@@ -25,11 +25,14 @@ function parse_cmdline(argv)
         detection metric sums the on-pulse flux and divides by a width penalty
         (--metric): 'non' = N_on^p (duty cycle; p=1/2 is a calibrated equivalent-σ,
         larger p suppresses broad/RFI-like signals) or 'sd2' = Σd²^p (phase spread).
-        Near-identical candidates are collapsed by default (--noremove disables it).
+        Near-identical candidates are collapsed by default (--noremove disables it),
+        as are harmonically-related ones -- the f/2, 2f, 3f/2, ... family of a real
+        signal (--noharmremove disables it, --numharm sets the max harmonic).
         With --maxdecim>1, harmonic decimation also folds each fundamental at 2..k
         times its frequency almost for free (re-using the interpolated harmonics),
         extending the search to faster pulsars with fewer summed harmonics; the
         reported harmonic count identifies which decimation found each candidate.
+        A progress meter prints to stderr (--progressbar for a bar, --noprogress off).
         If no output filename is given, results are written to stdout.  Pass
         `-t auto` to Julia for multi-threaded runs.
         """,
@@ -99,11 +102,24 @@ function parse_cmdline(argv)
             help = "Fourier-bin tolerance for collapsing near-identical candidates"
             arg_type = Float64
             default = 1.0
+        "--numharm"
+            help = "Max harmonic number when removing harmonically-related candidates"
+            arg_type = Int
+            default = 16
         "--noalign"
             help = "Use a fixed numbetween for all harmonics (disable per-harmonic tuning)"
             action = :store_true
         "--noremove"
             help = "Do not collapse near-identical (duplicate) candidates"
+            action = :store_true
+        "--noharmremove"
+            help = "Do not collapse harmonically-related candidates (f/2, 2f, 3f/2, ...)"
+            action = :store_true
+        "--progressbar"
+            help = "Show a progress bar instead of the default text percentage meter"
+            action = :store_true
+        "--noprogress"
+            help = "Do not print a progress meter"
             action = :store_true
     end
     return parse_args(argv, s)
@@ -130,10 +146,13 @@ function main(argv)
 
     @info "Searching" file=a["fftfile"] T=ft.T nharms=params.nharms decimations=decimations threads=nthreads()
 
+    progress = a["noprogress"] ? :none : (a["progressbar"] ? :bar : :text)
     cands = search(ft, params;
                    lofreq = a["lofreq"], hifreq = a["hifreq"], lobin = a["lobin"],
                    blocksize = a["blocksize"], threshold = a["threshold"],
-                   remove = !a["noremove"], dr_tol = a["drtol"])
+                   remove = !a["noremove"], dr_tol = a["drtol"],
+                   harm_remove = !a["noharmremove"], numharm = a["numharm"],
+                   progress = progress)
 
     # Report the strongest `ncands` candidates, sorted best metric first.
     sort!(cands; by = c -> c.metric, rev = true)
@@ -141,7 +160,10 @@ function main(argv)
         cands = cands[1:a["ncands"]]
     end
 
-    lines = [@sprintf("Candidate at %.6f Hz (P = %.9g s) with S/N %.2f using %d harmonics",
+    # Fixed-width columns; %.12g keeps at least 12 significant figures for the
+    # frequency and period at any magnitude (fast pulsars have very short periods,
+    # where a fixed number of decimal places would lose precision).
+    lines = [@sprintf("Candidate:  f = %-18.12g Hz   P = %-18.12g s   S/N = %8.2f   harmonics = %3d",
                       c.freq, 1.0 / c.freq, c.metric, c.nharm) for c in cands]
     if isempty(a["outputfilenm"])
         foreach(println, lines)

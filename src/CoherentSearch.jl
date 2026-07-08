@@ -24,7 +24,8 @@ include("fileio.jl")
 # --- Search ---
 export SearchParams, Candidate, search, search_block, block_metrics, coherent_profiles,
        reference_profiles, snr_metrics, chunk_ngoodbins, remove_duplicates,
-       chunk_metrics, build_harmonic_plans, harmonic_numbetween, decimation_set
+       remove_harmonics, chunk_metrics, build_harmonic_plans, harmonic_numbetween,
+       decimation_set
 include("search.jl")
 
 end # module

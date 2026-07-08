@@ -91,7 +91,7 @@ three nested loops, with parallelism at the *outermost* one:
   row `h+1` of an `(nharms+1) × Nprof` complex amplitude array `ftprofs`.
 - **Loop #3 — profiles.** A single *batched* complex→real transform inverts all
   `Nprof` profiles at once (`plan_brfft(ftprofs, 2*nharms, 1)`), then a
-  peak/|trough| metric is read off each profile column.
+  width-sensitive S/N metric (see §3) is read off each profile column.
 
 ### What makes it fast
 
@@ -111,8 +111,9 @@ three nested loops, with parallelism at the *outermost* one:
   call. No per-chunk garbage means no GC pauses serializing the threads.
 - **Batched inverse FFT.** The `Nprof` profiles are short (`2*nharms` points);
   one batched `brfft` amortizes FFTW overhead far better than `Nprof` tiny calls.
-  (The `1/Nbins` irfft normalization cancels in the peak/|trough| *ratio*, so the
-  unnormalized transform is used directly.)
+  (Every part of the S/N metric except its linear signal term is scale-invariant,
+  and that term folds the missing `1/Nbins` irfft normalization into its `scale`
+  argument, so the unnormalized transform is used directly — see §3.)
 
 ### Per-harmonic `numbetween` (the `align` option)
 
@@ -134,9 +135,9 @@ prove bit-level equivalence with the reference.
 > interpolation between finterp grid points needs the grid finer than the ~1-bin
 > response curvature regardless of how coarse `deltar_h` is, which is why the
 > floor exists and why high harmonics stay at `numbetween`. On the *nonlinear*
-> peak/|trough| metric the end-to-end difference from a fixed grid is ~1% and not
-> strictly monotonic (per-harmonic errors partially cancel); the win is real and
-> large at the *amplitude* level, where it physically belongs.
+> width-sensitive S/N metric the end-to-end difference from a fixed grid is order
+> ~1% and not strictly monotonic (per-harmonic errors partially cancel); the win
+> is real and large at the *amplitude* level, where it physically belongs.
 
 ### Measured behavior
 
@@ -166,9 +167,23 @@ prove bit-level equivalence with the reference.
   (`--drtol`, default 1.0 — one bin is `1/T` Hz, far finer than the spacing of
   distinct sources yet comfortably wider than the sub-bin coherent cluster),
   keep the max-metric candidate per group. On the test band this turns ~32k
-  above-threshold trials into the single 10.0123 Hz candidate. *Still open:*
-  removing **harmonically-related** duplicates (a candidate at `2f`, `3f`, … of a
-  real signal) — a distinct problem from the near-identical collapse done here.
+  above-threshold trials into the single 10.0123 Hz candidate.
+- **Harmonically-related de-duplication (implemented).** `remove_harmonics` (wired
+  to the default; `--noharmremove` disables it, `--numharm` sets the max harmonic)
+  collapses the `f/2`, `2f`, `3f/2`, … family a real signal produces — a distinct
+  problem from the near-identical collapse above, and one made especially
+  prominent by harmonic decimation (whose subharmonic folds report genuinely
+  different Fourier frequencies `r`). Candidates are visited strongest-metric
+  first; each is kept unless its `r` is a small-integer ratio `n/m` (both ≤
+  `--numharm`) of an already-kept stronger one, tested as `|m·r_hi − n·r_lo| ≤
+  tol·m` (a bin-scale tolerance on the shared comb that does not tighten
+  spuriously at high harmonic number). On a band spanning `f/3 … f` with
+  decimation the ~10-member family collapses to the single strongest survivor.
+  *Worth noting:* the survivor is whichever member scored highest, which may be a
+  subharmonic fold (e.g. `f/3` summed with all 60 harmonics can outscore the
+  direct `f` fold with 20) rather than the true fundamental — reporting the
+  physical fundamental of each family is a further refinement, as is threshold
+  comparability across differing harmonic counts.
 - **Statistically meaningful detection metric (implemented).** The old
   peak/|trough| ratio is replaced by a width-sensitive metric ported from the
   Python `snr_metric` (`_profile_snr` / the public `snr_metrics`):
@@ -232,10 +247,10 @@ prove bit-level equivalence with the reference.
   collapses them. Guarded by a machine-precision test that each decimation pass
   reproduces the *native* `Hₖ`-harmonic fold (transitively oracle-pinned via
   `reference_profiles`) plus a detection test recovering the bundled 10.0123 Hz
-  pulsar via `k=2` and `k=3`. *Still open* (unchanged by this): removing
-  **harmonically-related** duplicates — decimation makes the `f`, `f/2`, `3f/2`
-  family of a real signal even more visible (they sit at genuinely different `r`
-  and so are *not* collapsed by the near-identical dedup), and threshold
+  pulsar via `k=2` and `k=3`. The `f`, `f/2`, `3f/2`, … family that decimation
+  makes prominent (its subharmonic folds report genuinely different `r`, so the
+  near-identical dedup does not touch them) is now collapsed by the
+  **harmonically-related de-duplication** above. *Still open:* threshold
   comparability now has `Hₖ` as an extra axis alongside `--metric`/`--pexp`.
 
 - **Profile plots for the best candidates.** For the top-`ncands` survivors,

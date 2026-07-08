@@ -86,6 +86,26 @@ See `decimation_design.md` for the derivation that decimation stays correctly
 sampled (each `k`'s top harmonic still steps by ≤ `hidr`, and the base input-FFT
 read depth already covers every `k`) and the full bookkeeping.
 
+### Candidate de-duplication
+
+Two collapses run on the candidate list, both on by default:
+
+- **Near-identical** (`remove_duplicates`, `--noremove`, `--drtol`): the run of
+  adjacent trial fundamentals a single signal lights up, grouped by Fourier
+  frequency `r` within `--drtol` bins, reduced to the strongest member.
+- **Harmonically-related** (`remove_harmonics`, `--noharmremove`, `--numharm`):
+  the `f/2`, `2f`, `3f/2`, … family a real signal (and its decimation folds)
+  produces at genuinely different `r`. Candidates whose frequencies form a
+  ratio `n/m` of small integers (up to `--numharm`) are collapsed to the
+  strongest member. Decimation makes this family especially prominent, so the
+  two work together.
+
+### Progress meter
+
+The CLI prints a chunk-completion meter to `stderr`: a text percentage by
+default, a bar with `--progressbar`, or nothing with `--noprogress`. From the
+library, pass `progress = :text | :bar | :none` to `search`.
+
 ## Testing
 
 ```sh
@@ -121,10 +141,12 @@ sums the on-pulse flux and divides by a selectable width penalty (`--metric`):
 suppresses broad/RFI-like signals) or `sd2` = `Σd²^p` (phase spread). It is a
 port of the Python `snr_metric`, oracle-pinned to machine precision for both
 penalties. Near-identical candidates are collapsed by default (`--noremove`
-disables it, `--drtol` sets the tolerance). A cheap multi-frequency search by
-harmonic decimation (`--maxdecim`) re-uses the interpolated harmonics to fold at
-integer multiples of each fundamental, pinned by a test that every decimation
-pass reproduces the native reduced-harmonic fold. Next: a throughput sweep to
-tune per-harmonic `fftlen`/`numbetween`, and harmonically-related candidate
-filtering. See `Summary_and_Future_Work.md` and `decimation_design.md` for
-details.
+disables it, `--drtol` sets the tolerance), and harmonically-related candidates
+(the `f/2`, `2f`, `3f/2`, … family) are collapsed to their strongest member
+(`--noharmremove`, `--numharm`). A cheap multi-frequency search by harmonic
+decimation (`--maxdecim`) re-uses the interpolated harmonics to fold at integer
+multiples of each fundamental, pinned by a test that every decimation pass
+reproduces the native reduced-harmonic fold. A progress meter prints to stderr
+(`--progressbar`, `--noprogress`). Next: a throughput sweep to tune per-harmonic
+`fftlen`/`numbetween`. See `Summary_and_Future_Work.md` and
+`decimation_design.md` for details.
