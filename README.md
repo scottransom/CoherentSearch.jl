@@ -61,6 +61,31 @@ ft = FFTFile("FILE.fft")
 cands = search(ft, SearchParams(nharms=32); lofreq=0.1, hifreq=100, threshold=8)
 ```
 
+Each candidate reports its barycentric spin frequency, period (`1/f`), the S/N
+metric, and the number of harmonics summed in the detection.
+
+### Multi-frequency search by harmonic decimation
+
+`--maxdecim k` (default `1` = off) additionally folds every trial fundamental at
+`2×, 3×, … k×` its frequency *almost for free*, by re-using the harmonic
+amplitudes already interpolated for the base fold: taking every `k`-th harmonic
+and running a shorter inverse FFT yields the fold at `k·rf` with
+`⌊nharms/k⌋` harmonics. This extends the search to faster pulsars (which tend to
+have wider profiles and so need fewer harmonics) without paying for extra
+interpolation. When enabled, `nharms` defaults to a composite `60` so that many
+`k` give clean integer harmonic counts. The harmonic count printed for each
+candidate identifies the decimation that found it (`k = nharms ÷ nharm`).
+
+```sh
+# Search fundamentals 0.1–100 Hz and, via decimation, faster pulsars up to ~600 Hz
+julia --project=. -t auto bin/coherent_search.jl FILE.fft \
+    --lofreq 0.1 --hifreq 100 --maxdecim 6 --threshold 8
+```
+
+See `decimation_design.md` for the derivation that decimation stays correctly
+sampled (each `k`'s top harmonic still steps by ≤ `hidr`, and the base input-FFT
+read depth already covers every `k`) and the full bookkeeping.
+
 ## Testing
 
 ```sh
@@ -96,6 +121,10 @@ sums the on-pulse flux and divides by a selectable width penalty (`--metric`):
 suppresses broad/RFI-like signals) or `sd2` = `Σd²^p` (phase spread). It is a
 port of the Python `snr_metric`, oracle-pinned to machine precision for both
 penalties. Near-identical candidates are collapsed by default (`--noremove`
-disables it, `--drtol` sets the tolerance). Next: a throughput sweep to tune
-per-harmonic `fftlen`/`numbetween`, and harmonically-related candidate
-filtering. See `Summary_and_Future_Work.md` for details.
+disables it, `--drtol` sets the tolerance). A cheap multi-frequency search by
+harmonic decimation (`--maxdecim`) re-uses the interpolated harmonics to fold at
+integer multiples of each fundamental, pinned by a test that every decimation
+pass reproduces the native reduced-harmonic fold. Next: a throughput sweep to
+tune per-harmonic `fftlen`/`numbetween`, and harmonically-related candidate
+filtering. See `Summary_and_Future_Work.md` and `decimation_design.md` for
+details.

@@ -214,20 +214,29 @@ prove bit-level equivalence with the reference.
   fold in the number of independent trials searched. Until then, `--threshold`
   must be re-tuned by hand whenever `--metric` or `--pexp` changes.
 
-- **Cheap multi-frequency search by harmonic decimation.** Note (Scott): instead
-  of one `Nbins = 2·nharms`, start from a large, highly-factorable `Nbins` (e.g.
-  120). Once the full set of harmonic amplitudes for a fundamental is in hand, we
-  can search candidates at 2×, 3×, 4×, 5×, 6× that frequency *almost for free* by
-  inverse-FFT-ing only every 2nd / 3rd / 4th / … harmonic (a stride/decimation in
-  the harmonic array → a shorter irfft) — i.e. reuse the expensive interpolation
-  work to fold at integer multiples of the base frequency. This targets faster
-  pulsars, which also tend to have wider profiles (so the shorter folds are
-  appropriate). The catch: the step in fundamental frequency (`deltar`,
-  `numbetween`, and how far each chunk must read into the long FFT) is tuned for
-  the base `Nbins`; serving the higher multiples well will likely mean rethinking
-  how we stride through the input FFT and how many harmonics each chunk
-  generates. Sketch the bookkeeping (which decimations share which interpolated
-  amplitudes, and the per-multiple range/Nyquist limits) before implementing.
+- **Cheap multi-frequency search by harmonic decimation (implemented).** Starting
+  from a large, composite `nharms` (default 60 when enabled), the full harmonic
+  amplitude stack for each fundamental is re-used to fold at 2×, 3×, … that
+  frequency *almost for free*: taking every `k`-th interpolated harmonic and
+  running a shorter batched `irfft` yields the fold at `k·rf` with
+  `Hₖ = ⌊nharms/k⌋` harmonics. Enabled with `--maxdecim k` (default 1 = off);
+  each candidate now reports its frequency, **period** (`1/f`), and the number of
+  harmonics summed — which identifies the decimation (`k = nharms ÷ nharm`). The
+  full bookkeeping and the derivation that decimation stays *correctly sampled*
+  (each `k`'s top harmonic still steps by ≤ `hidr`, and the base input-FFT read
+  depth already covers every `k`) live in `decimation_design.md`. Two properties
+  fell out cleanly: the caveats about re-striding the input FFT / `deltar` /
+  `numbetween` turned out **not** to bite (top-harmonic sampling and read depth
+  are preserved automatically), and cross-`k` detections of the *same* frequency
+  share an `r`, so the existing near-identical `remove_duplicates` already
+  collapses them. Guarded by a machine-precision test that each decimation pass
+  reproduces the *native* `Hₖ`-harmonic fold (transitively oracle-pinned via
+  `reference_profiles`) plus a detection test recovering the bundled 10.0123 Hz
+  pulsar via `k=2` and `k=3`. *Still open* (unchanged by this): removing
+  **harmonically-related** duplicates — decimation makes the `f`, `f/2`, `3f/2`
+  family of a real signal even more visible (they sit at genuinely different `r`
+  and so are *not* collapsed by the near-identical dedup), and threshold
+  comparability now has `Hₖ` as an extra axis alongside `--metric`/`--pexp`.
 
 - **Profile plots for the best candidates.** For the top-`ncands` survivors,
   reconstruct and plot the actual pulse profile. This can be done with

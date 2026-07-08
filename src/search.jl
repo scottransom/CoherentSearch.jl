@@ -37,7 +37,7 @@ set, low harmonics use a finer `numbetween` matched to their finer `deltar_h`
 (see [`harmonic_numbetween`](@ref)).
 """
 Base.@kwdef struct SearchParams
-    nharms::Int = 32        # number of harmonics to coherently sum (power of two)
+    nharms::Int = 32        # number of harmonics to coherently sum
     m::Int = 32             # Fourier bins in the interpolation kernel (even)
     numbetween::Int = 16    # *minimum* interpolated points between Fourier bins
     hidr::Float64 = 0.5     # Fourier-bin step at the highest harmonic
@@ -46,19 +46,35 @@ Base.@kwdef struct SearchParams
     xsignal::Float64 = 0.2  # peak fraction bounding the on-pulse signal region
     metric::Symbol = :non   # width penalty: :non (N_on^pexp) or :sd2 (Σd²^pexp)
     pexp::Float64 = 0.5     # width-penalty exponent (1/2 = calibrated for :non)
+    decimations::Vector{Int} = [1]  # harmonic-decimation factors k (see decimation_design.md)
 end
+
+"""
+    decimation_set(nharms, maxdecim) -> Vector{Int}
+
+The harmonic-decimation factors `k` to search, `1:maxdecim`, keeping only those
+that still leave at least two harmonics (`⌊nharms/k⌋ ≥ 2`) to fold.  `k=1` is the
+ordinary search; `k>1` re-uses the interpolated harmonic amplitudes to fold at
+`k·rf` almost for free (see `decimation_design.md`).
+"""
+decimation_set(nharms::Integer, maxdecim::Integer) =
+    [k for k in 1:max(1, maxdecim) if fld(nharms, k) >= 2]
 
 """
     Candidate
 
 A detected candidate: barycentric spin frequency (Hz), the width-sensitive S/N
-detection metric (see [`snr_metrics`](@ref)), and the fundamental Fourier
-frequency (bins).
+detection metric (see [`snr_metrics`](@ref)), the fundamental Fourier frequency
+(bins), and the number of harmonics `nharm` summed in the detection.  For a
+decimation-`k` detection `nharm = ⌊nharms/k⌋`, so `k = nharms ÷ nharm` — i.e.
+`nharm` records which decimation found the candidate.  The pulse period is
+`1/freq`.
 """
 struct Candidate
     freq::Float64
     metric::Float64
     r::Float64
+    nharm::Int
 end
 
 """
@@ -283,7 +299,7 @@ function search_block(ft::FFTFile, rfund::AbstractVector{<:Real}, params::Search
     cands = Candidate[]
     @inbounds for j in eachindex(rfund)
         if metrics[j] > threshold
-            push!(cands, Candidate(rfund[j] / ft.T, metrics[j], rfund[j]))
+            push!(cands, Candidate(rfund[j] / ft.T, metrics[j], rfund[j], params.nharms))
         end
     end
     return cands
@@ -379,12 +395,42 @@ function FFTScratch(fftlen::Integer)
 end
 
 """
+    DecimBuf
+
+Per-decimation-factor `k` scratch for the harmonic-decimation multi-frequency
+search: the decimated amplitude stack `dftprofs` (`(Hₖ+1, Nprof)`, `Hₖ =
+⌊nharms/k⌋`), the real profile array `dprofs` (`(2Hₖ, Nprof)`), a per-profile
+median buffer, and the batched complex→real inverse plan.  Built once per
+`Workspace`; never shared.  Row `j+1` of `dftprofs` is filled from base harmonic
+`j·k` (row `j·k+1` of the workspace `ftprofs`); the DC row stays zero.
+"""
+struct DecimBuf{B}
+    k::Int
+    Hk::Int
+    dftprofs::Matrix{ComplexF64}  # (Hk+1, Nprof)
+    dprofs::Matrix{Float64}       # (2*Hk, Nprof)
+    medbuf::Vector{Float64}       # (2*Hk,)
+    brfftplan::B                   # plan_brfft(dftprofs, 2*Hk, 1)
+end
+
+function DecimBuf(k::Integer, nharms::Integer, Nprof::Integer)
+    Hk = fld(nharms, k)
+    dftprofs = zeros(ComplexF64, Hk + 1, Nprof)
+    dprofs   = Matrix{Float64}(undef, 2Hk, Nprof)
+    medbuf   = Vector{Float64}(undef, 2Hk)
+    brfftplan = plan_brfft(dftprofs, 2Hk, 1; flags=FFTW.MEASURE)
+    fill!(dftprofs, 0)   # MEASURE planning may have dirtied the buffer
+    return DecimBuf(Int(k), Hk, dftprofs, dprofs, medbuf, brfftplan)
+end
+
+"""
     Workspace
 
 Everything one task needs to process a chunk with zero allocation in the hot
 loop: an `FFTScratch` per distinct harmonic `fftlen`, the stacked-harmonic
-amplitude array `ftprofs`, the real profile array `profs`, and the prebuilt
-batched complex→real inverse plan.  One `Workspace` per task; never shared.
+amplitude array `ftprofs`, the real profile array `profs`, the prebuilt batched
+complex→real inverse plan, and a [`DecimBuf`](@ref) for each harmonic-decimation
+factor `k > 1`.  One `Workspace` per task; never shared.
 """
 struct Workspace{B}
     scratch::Dict{Int,FFTScratch}
@@ -392,6 +438,7 @@ struct Workspace{B}
     profs::Matrix{Float64}        # (2*nharms, Nprof)
     medbuf::Vector{Float64}       # (2*nharms,) scratch for the per-profile median
     brfftplan::B                   # plan_brfft(ftprofs, 2*nharms, 1)
+    decims::Vector{DecimBuf}       # one per decimation factor k > 1
 end
 
 function Workspace(params::SearchParams, hplans::Vector{HarmonicPlan}, Nprof::Integer)
@@ -405,7 +452,9 @@ function Workspace(params::SearchParams, hplans::Vector{HarmonicPlan}, Nprof::In
     medbuf  = Vector{Float64}(undef, 2nh)
     brfftplan = plan_brfft(ftprofs, 2nh, 1; flags=FFTW.MEASURE)
     fill!(ftprofs, 0)   # MEASURE planning may have dirtied the buffer
-    return Workspace(scratch, ftprofs, profs, medbuf, brfftplan)
+    # A DecimBuf per k > 1 (k = 1 is the base ftprofs/profs above).
+    decims = DecimBuf[DecimBuf(k, nh, Nprof) for k in params.decimations if k > 1]
+    return Workspace(scratch, ftprofs, profs, medbuf, brfftplan, decims)
 end
 
 """
@@ -491,6 +540,46 @@ function fill_chunk_profiles!(ws::Workspace, hplans::Vector{HarmonicPlan}, ft::F
 end
 
 """
+    decim_pass!(out, ws, db, ft, params, rstart, lodr, n; threshold)
+
+Harmonic-decimation multi-frequency pass for factor `db.k`: re-use the base
+harmonic amplitudes already in `ws.ftprofs` to fold at `k·rf` for each of the
+`n` trial fundamentals `rstart .+ (0:n-1)*lodr`.  Gathers every `k`-th base
+harmonic into `db`'s compact stack, inverse-FFTs all `n` decimated profiles at
+once, and appends above-`threshold` [`Candidate`](@ref)s (tagged with `Hₖ`
+harmonics) to `out`.  Trials whose decimated fundamental `k·rf` reaches Nyquist
+are skipped.  Nearly free relative to the interpolation the base pass paid.
+"""
+function decim_pass!(out::Vector{Candidate}, ws::Workspace, db::DecimBuf, ft::FFTFile,
+                     params::SearchParams, rstart::Real, lodr::Real, n::Integer;
+                     threshold::Real=params.threshold)
+    k = db.k
+    Hk = db.Hk
+    nbins = 2Hk
+    src = ws.ftprofs
+    # Row j+1 of the decimated stack is base harmonic j*k (row j*k+1); DC stays 0.
+    @inbounds for j in 1:Hk
+        rowbase = j * k + 1
+        @views db.dftprofs[j + 1, 1:n] .= src[rowbase, 1:n]
+    end
+    mul!(db.dprofs, db.brfftplan, db.dftprofs)
+
+    rmean = rstart + (n - 1) * lodr / 2
+    invrms = sqrt(2 * chunk_ngoodbins(ft, Hk, k * rmean) + 1)
+    nyq = ft.N / 2
+    @inbounds for j in 1:n
+        r_dec = k * (rstart + (j - 1) * lodr)
+        r_dec < nyq || continue                       # fundamental past Nyquist
+        mval = _profile_snr(db.dprofs, j, db.medbuf, nbins, invrms,
+                            1.0 / nbins, params.xsignal, params.metric, params.pexp)
+        if mval > threshold
+            push!(out, Candidate(r_dec / ft.T, mval, r_dec, Hk))
+        end
+    end
+    return
+end
+
+"""
     chunk_metrics(ft, params, rstart, n; lodr) -> Vector{Float64}
 
 Single-threaded convenience that runs the optimised path over one chunk of `n`
@@ -563,8 +652,13 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
                     metric = _profile_snr(ws.profs, j, ws.medbuf, nbins, invrms, 1.0 / nbins, params.xsignal, params.metric, params.pexp)
                     if metric > threshold
                         rf = rstart + (j - 1) * lodr
-                        push!(out, Candidate(rf / ft.T, metric, rf))
+                        push!(out, Candidate(rf / ft.T, metric, rf, params.nharms))
                     end
+                end
+                # Harmonic-decimation multi-frequency passes (k > 1), re-using the
+                # base harmonic amplitudes already in ws.ftprofs (see decimation_design.md).
+                for db in ws.decims
+                    decim_pass!(out, ws, db, ft, params, rstart, lodr, n; threshold=threshold)
                 end
                 c += nt
             end

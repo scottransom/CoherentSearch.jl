@@ -26,6 +26,10 @@ function parse_cmdline(argv)
         (--metric): 'non' = N_on^p (duty cycle; p=1/2 is a calibrated equivalent-σ,
         larger p suppresses broad/RFI-like signals) or 'sd2' = Σd²^p (phase spread).
         Near-identical candidates are collapsed by default (--noremove disables it).
+        With --maxdecim>1, harmonic decimation also folds each fundamental at 2..k
+        times its frequency almost for free (re-using the interpolated harmonics),
+        extending the search to faster pulsars with fewer summed harmonics; the
+        reported harmonic count identifies which decimation found each candidate.
         If no output filename is given, results are written to stdout.  Pass
         `-t auto` to Julia for multi-threaded runs.
         """,
@@ -43,9 +47,9 @@ function parse_cmdline(argv)
             arg_type = String
             default = ""
         "--nharms", "-n"
-            help = "Number of harmonics to sum (a power of two)"
+            help = "Number of harmonics to sum (default: 32, or 60 when --maxdecim>1)"
             arg_type = Int
-            default = 32
+            default = -1
         "--ncands"
             help = "Maximum number of candidates to return"
             arg_type = Int
@@ -87,6 +91,10 @@ function parse_cmdline(argv)
             help = "Trial fundamentals per parallel chunk (Nprof)"
             arg_type = Int
             default = 2048
+        "--maxdecim"
+            help = "Max harmonic-decimation factor k: also search 2..k times each fundamental (default: 1 = off)"
+            arg_type = Int
+            default = 1
         "--drtol"
             help = "Fourier-bin tolerance for collapsing near-identical candidates"
             arg_type = Float64
@@ -105,17 +113,22 @@ function main(argv)
     a = parse_cmdline(argv)
 
     ft = FFTFile(a["fftfile"])
+    maxdecim = a["maxdecim"]
+    # Resolve nharms: explicit if given, else 60 when decimating (composite) or 32.
+    nharms = a["nharms"] >= 1 ? a["nharms"] : (maxdecim > 1 ? 60 : 32)
+    decimations = decimation_set(nharms, maxdecim)
     params = SearchParams(
-        nharms = a["nharms"],
+        nharms = nharms,
         numbetween = a["numbetween"],
         threshold = a["threshold"],
         align = !a["noalign"],
         xsignal = a["xsignal"],
         metric = Symbol(a["metric"]),
         pexp = a["pexp"],
+        decimations = decimations,
     )
 
-    @info "Searching" file=a["fftfile"] T=ft.T nharms=params.nharms threads=nthreads()
+    @info "Searching" file=a["fftfile"] T=ft.T nharms=params.nharms decimations=decimations threads=nthreads()
 
     cands = search(ft, params;
                    lofreq = a["lofreq"], hifreq = a["hifreq"], lobin = a["lobin"],
@@ -128,7 +141,8 @@ function main(argv)
         cands = cands[1:a["ncands"]]
     end
 
-    lines = [@sprintf("Candidate at %.6f Hz with S/N %.2f", c.freq, c.metric) for c in cands]
+    lines = [@sprintf("Candidate at %.6f Hz (P = %.9g s) with S/N %.2f using %d harmonics",
+                      c.freq, 1.0 / c.freq, c.metric, c.nharm) for c in cands]
     if isempty(a["outputfilenm"])
         foreach(println, lines)
         println(stderr, "# $(length(cands)) candidates above threshold $(a["threshold"])")
