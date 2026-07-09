@@ -151,6 +151,14 @@ prove bit-level equivalence with the reference.
 
 ## 3. Next steps
 
+> **Status: feature-complete.** The search, detection metric, candidate
+> de-duplication, harmonic decimation, and candidate profile plots are all
+> implemented, tested, and oracle-validated. The primary focus now shifts from
+> features to **performance**: careful profiling of the hot loop (interpolation,
+> batched inverse FFTs, allocation and memory-bandwidth behavior under threading)
+> and acting on what it finds. The throughput-tuning and tiling items below are
+> the concrete starting points for that work.
+
 - **Throughput tuning script.** Port `examples/speed_test.py` to Julia and sweep
   the `finterp_fft` rate over both `fftlen` *and* `numbetween` to pick the
   per-harmonic sweet spots (the design's 1024 < `fftlen` < 65536 expectation),
@@ -253,15 +261,35 @@ prove bit-level equivalence with the reference.
   **harmonically-related de-duplication** above. *Still open:* threshold
   comparability now has `Hₖ` as an extra axis alongside `--metric`/`--pexp`.
 
-- **Profile plots for the best candidates.** For the top-`ncands` survivors,
-  reconstruct and plot the actual pulse profile. This can be done with
-  brute-force, high-accuracy Fourier interpolation (`fourier_interp` /
-  `finterp_multi`) of each harmonic at the candidate's exact frequencies followed
-  by a plain inverse FFT — no need for the throughput-tuned approximations of the
-  search hot loop, since it runs on a handful of candidates. A good visual sanity
-  check and a natural companion to the new metric (overlay the measured width /
-  baseline). Likely a small `Plots.jl`/`Makie.jl` helper in `bin/` or a
-  `plots.jl`, kept out of the core search dependencies.
+- **Profile plots for the best candidates (implemented).** For the reported
+  survivors, `candidate_profile` (`src/candidate.jl`) reconstructs the actual
+  pulse profile by the brute-force, high-accuracy path anticipated here: one wide
+  (`m=64`) exact `fourier_interp` per harmonic at the candidate's exact
+  frequencies (`r·h`), packed into a harmonic stack and inverted with a plain
+  `irfft` — no throughput-tuned approximation, since it runs on only a handful of
+  candidates. It is pinned to the search's independent `reference_profiles` path
+  (matched kernel `m`, fine grid) to ~1e-4, guarding indexing/FFT convention.
+  Each profile is folded at the **full `--nharms` depth** regardless of the
+  decimation factor `k` that found the candidate (a `k=3` detection summed only
+  `⌊nharms/k⌋` harmonics; its profile still uses all `nharms`), so it much more
+  closely matches a true time-domain fold at the candidate period. Harmonics that
+  would cross the Nyquist frequency are omitted rather than zero-padded — the fold
+  stops at the first such harmonic and inverts the `H ≤ nharms` available ones to
+  `2H` bins — so fast candidates simply get fewer bins. `rotate_to_peak`
+  circularly shifts each profile so its peak sits at phase 0.5. The
+  `CandidatePlots` helper (`bin/plotting.jl`, CairoMakie) lays the profiles out in
+  a `ncols×nrows` grid (default 3×5) on US-Letter portrait pages, written one PNG
+  per page (`<stem>_NN.png`, zero-padded so pages sort) with the full grid
+  geometry reserved even on a partly filled last page (so every panel is the same
+  size), each panel captioned with the full candidate text-line (index, S/N,
+  frequency, period, harmonic count, decimation `k`) and each page with a metadata
+  banner. Plotting runs by default from the CLI (`--noplot` disables,
+  `--plotstem/--plotcols/--plotrows` configure) and can be regenerated later from
+  a saved candidate file with `bin/plot_candidates.jl`. CairoMakie is a project
+  dependency but is loaded *lazily* — only `bin/plotting.jl` imports it — so
+  `using CoherentSearch`, `Pkg.test`, and the cross-validation never pay for it.
+  *Still worth doing:* optionally overlay the metric's measured on-pulse width /
+  baseline.
 
 - **`Distributed.jl` backend** reusing the same chunk abstraction, for
   cluster-scale searches across nodes.

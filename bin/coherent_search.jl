@@ -121,6 +121,21 @@ function parse_cmdline(argv)
         "--noprogress"
             help = "Do not print a progress meter"
             action = :store_true
+        "--noplot"
+            help = "Do not plot the candidate pulse profiles (plotting is on by default)"
+            action = :store_true
+        "--plotstem"
+            help = "Output path stem for profile-plot PNGs (default: derived from -o or the FFT name)"
+            arg_type = String
+            default = ""
+        "--plotcols"
+            help = "Profile-plot grid columns per page"
+            arg_type = Int
+            default = 3
+        "--plotrows"
+            help = "Profile-plot grid rows per page"
+            arg_type = Int
+            default = 5
     end
     return parse_args(argv, s)
 end
@@ -176,6 +191,38 @@ function main(argv)
         end
         @info "Wrote candidates" n=length(cands) file=a["outputfilenm"]
     end
+
+    # Plot the candidate pulse profiles (on by default; --noplot disables).  The
+    # plotting backend (CairoMakie) is loaded lazily here so ordinary searches,
+    # tests, and the cross-validation never pay for it.
+    if !a["noplot"] && !isempty(cands)
+        stem = plot_stem(a["plotstem"], a["outputfilenm"], a["fftfile"])
+        include(joinpath(@__DIR__, "plotting.jl"))
+        # `include` defines CandidatePlots in a newer world age than this running
+        # function.  Resolve the binding *and* call it inside an `invokelatest`
+        # closure so both happen in the latest world (Julia 1.12 world semantics).
+        files = Base.invokelatest() do
+            CandidatePlots.plot_candidates(ft, cands, params;
+                                           outstem = stem,
+                                           ncols = a["plotcols"], nrows = a["plotrows"])
+        end
+        @info "Wrote candidate profile plots" pages=length(files) stem=stem
+    end
+end
+
+"""
+    plot_stem(plotstem, outputfilenm, fftfile) -> String
+
+Resolve the PNG output stem: an explicit `--plotstem` wins; otherwise derive it
+from the candidate output filename, or (for stdout runs) from the FFT filename.
+"""
+function plot_stem(plotstem, outputfilenm, fftfile)
+    isempty(plotstem) || return plotstem
+    # Use the candidate filename verbatim; do NOT run splitext on it, since a
+    # trailing token like `sd2_0.5` looks like an extension but is part of the
+    # name.  Only the fallback fftfile name has a real extension (.fft) to strip.
+    isempty(outputfilenm) || return string(outputfilenm, "_profiles")
+    return string(first(splitext(basename(fftfile))), "_profiles")
 end
 
 abspath(PROGRAM_FILE) == abspath(@__FILE__) && main(ARGS)

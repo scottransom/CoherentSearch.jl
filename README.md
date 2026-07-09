@@ -23,8 +23,11 @@ src/
   fourierinterp.jl    interpolation kernels (the indexing-critical code)
   fileio.jl           PRESTO .fft / .inf readers (mmap)
   search.jl           chunk-parallel coherent harmonic-summing search
+  candidate.jl        per-candidate high-accuracy profile reconstruction
 bin/
   coherent_search.jl  ArgParse command-line front-end
+  plotting.jl         CairoMakie candidate-profile plotting (loaded on demand)
+  plot_candidates.jl  standalone: re-plot profiles from a saved candidate file
 test/                 unit tests (golden values, analytic signals, indexing)
 crossval/             Python-as-oracle accuracy + speed cross-validation
 ```
@@ -99,6 +102,37 @@ Two collapses run on the candidate list, both on by default:
   ratio `n/m` of small integers (up to `--numharm`) are collapsed to the
   strongest member. Decimation makes this family especially prominent, so the
   two work together.
+
+### Candidate profile plots
+
+By default the CLI reconstructs and plots the pulse profile of every reported
+candidate, one grid of panels per US-Letter portrait page, written as
+zero-padded PNGs (`<stem>_01.png`, `<stem>_02.png`, …).  Each profile is folded
+with a high-accuracy exact-interpolation path (independent of the throughput-
+tuned search) and rotated so its peak sits at phase 0.5; the panel caption
+carries the full text-line information (index, S/N, frequency, period, harmonic
+count, and the decimation `k`).  Plotting loads CairoMakie lazily — searches
+that pass `--noplot`, the test suite, and the cross-validation never load it.
+
+Every profile is folded at the **full `--nharms` harmonic depth**, regardless of
+the harmonic-decimation factor `k` that found the candidate (a `k=3` detection
+summed only `nharms/3` harmonics, but its profile still uses all `nharms`): this
+much more closely matches a true time-domain fold of the time series at the
+candidate period.  Harmonics that would exceed the Nyquist frequency are simply
+omitted (not zero-padded), so a fast candidate's profile uses fewer bins.  The
+`#Harm`/`k` in each caption still report what the *search* summed to detect it.
+
+```sh
+julia --project=. -t auto bin/coherent_search.jl FILE.fft -o cands.txt \
+    --plotstem cands --plotcols 3 --plotrows 5     # -> cands_01.png, ...
+```
+
+The same plots can be regenerated later from a saved candidate file, without
+re-running the search:
+
+```sh
+julia --project=. bin/plot_candidates.jl FILE.fft cands.txt --nharms 60
+```
 
 ### Progress meter
 

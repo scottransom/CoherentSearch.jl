@@ -28,4 +28,8 @@ export SearchParams, Candidate, search, search_block, block_metrics, coherent_pr
        decimation_set
 include("search.jl")
 
+# --- Per-candidate profile reconstruction (for plotting) ---
+export candidate_profile, rotate_to_peak
+include("candidate.jl")
+
 end # module
