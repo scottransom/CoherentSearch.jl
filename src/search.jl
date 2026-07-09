@@ -686,13 +686,19 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
     end
 
     cands = reduce(vcat, results; init=Candidate[])
+    ntotal = length(cands)
+    @info "Search complete; post-processing candidates" total_above_threshold=ntotal
     if remove
+        n0 = length(cands)
         cands = remove_duplicates(cands; dr_tol=dr_tol)
+        @info "Collapsed near-identical (duplicate) candidates" removed=(n0 - length(cands)) remaining=length(cands)
     else
         sort!(cands; by=c -> c.freq)
     end
     if harm_remove
+        n1 = length(cands)
         cands = remove_harmonics(cands; numharm=numharm, tol=harm_tol)
+        @info "Collapsed harmonically-related candidates" removed=(n1 - length(cands)) remaining=length(cands)
     end
     return cands
 end
