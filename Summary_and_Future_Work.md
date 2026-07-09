@@ -237,6 +237,25 @@ prove bit-level equivalence with the reference.
   fold in the number of independent trials searched. Until then, `--threshold`
   must be re-tuned by hand whenever `--metric` or `--pexp` changes.
 
+- **Default metric produces many non-pulsar-like false positives (to
+  investigate; may change defaults).** On real data the current defaults
+  `--metric non --pexp 0.5` empirically generate *many* more false-positive
+  candidates than `--metric sd2` at a comparable threshold. Crucially, a large
+  fraction of the `non` false positives are not merely marginal — their
+  reconstructed profiles (now easy to eyeball via the candidate profile plots)
+  look like **random noise**, with no narrow, low-duty-cycle pulse of the kind
+  most real pulsars show. In other words the `N_on^p` duty-cycle penalty at
+  `pexp=0.5` appears to let broad, noise-like profiles through too readily. This
+  is distinct from (but entangled with) the threshold-calibration item above:
+  even at a fixed false-alarm *rate*, the *character* of the survivors differs
+  between penalties. Action items: (1) quantify the false-positive rate and the
+  profile "pulsar-likeness" of survivors for `non` vs `sd2` across `pexp` on
+  pure-noise and real data; (2) reconsider whether the shipped defaults should
+  move to `sd2` and/or a larger `pexp` (a stronger width penalty suppresses
+  broad/noise-like profiles); (3) consider an explicit profile-shape / narrowness
+  discriminant as a post-detection cut. Until this is settled the defaults are
+  provisional — `sd2` is worth trying on real searches.
+
 - **Cheap multi-frequency search by harmonic decimation (implemented).** Starting
   from a large, composite `nharms` (default 60 when enabled), the full harmonic
   amplitude stack for each fundamental is re-used to fold at 2×, 3×, … that

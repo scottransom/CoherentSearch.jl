@@ -174,7 +174,17 @@ sums the on-pulse flux and divides by a selectable width penalty (`--metric`):
 `non` = `N_on^p` (duty cycle; `p=1/2` is a calibrated matched filter, larger `p`
 suppresses broad/RFI-like signals) or `sd2` = `Σd²^p` (phase spread). It is a
 port of the Python `snr_metric`, oracle-pinned to machine precision for both
-penalties. Near-identical candidates are collapsed by default (`--noremove`
+penalties.
+
+> **Note (defaults under review).** On real data the default
+> `--metric non --pexp 0.5` empirically produces *many* more false-positive
+> candidates than `--metric sd2`, and many of those false positives do not look
+> pulsar-like at all — their reconstructed profiles resemble random noise rather
+> than the narrow-duty-cycle pulse most real pulsars show. This suggests the
+> default CLI options may need to change (e.g. to `sd2`, and/or a larger `pexp`).
+> See `Summary_and_Future_Work.md` for the follow-up.
+
+Near-identical candidates are collapsed by default (`--noremove`
 disables it, `--drtol` sets the tolerance), and harmonically-related candidates
 (the `f/2`, `2f`, `3f/2`, … family) are collapsed to their strongest member
 (`--noharmremove`, `--numharm`). A cheap multi-frequency search by harmonic
