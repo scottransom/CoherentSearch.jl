@@ -163,14 +163,16 @@ function main(argv)
     # Fixed-width columns; %.12g keeps at least 12 significant figures for the
     # frequency and period at any magnitude (fast pulsars have very short periods,
     # where a fixed number of decimal places would lose precision).
-    lines = [@sprintf("Candidate:  f = %-18.12g Hz   P = %-18.12g s   S/N = %8.2f   harmonics = %3d",
-                      c.freq, 1.0 / c.freq, c.metric, c.nharm) for c in cands]
+    header = ["#       'S/N'      Frequency (Hz)        Period (ms)    #Harm"]
+    lines = [@sprintf("%-4d  %8.2f  %18.12f  %18.12f   %3d",
+                      i, c.metric, c.freq, 1000.0 / c.freq, c.nharm) for (i, c) in enumerate(cands)]
+    outlines = vcat(header, lines)
     if isempty(a["outputfilenm"])
-        foreach(println, lines)
+        foreach(println, outlines)
         println(stderr, "# $(length(cands)) candidates above threshold $(a["threshold"])")
     else
         open(a["outputfilenm"], "w") do io
-            foreach(l -> println(io, l), lines)
+            foreach(l -> println(io, l), outlines)
         end
         @info "Wrote candidates" n=length(cands) file=a["outputfilenm"]
     end
