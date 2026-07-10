@@ -500,28 +500,35 @@ amplitude array `ftprofs`, the real profile array `profs`, the prebuilt batched
 complex→real inverse plan, and a [`DecimBuf`](@ref) for each harmonic-decimation
 factor `k > 1`.  One `Workspace` per task; never shared.
 """
-struct Workspace{B}
-    scratch::Dict{Int,FFTScratch}
+# Parameterised on the *concrete* scratch (`S`), inverse-plan (`B`), and
+# decimation-buffer (`D`) types so field access stays type-stable: an untyped
+# `Dict{Int,FFTScratch}` / `Vector{DecimBuf}` would make `sc.fwd`/`sc.bwd`/
+# `db.brfftplan` `::Any`, turning every `mul!` in the hot loop into a dynamic
+# dispatch (and boxing its result).  All `cFFTWPlan{ComplexF64,…}` share one
+# concrete type regardless of length, so a single `S`/`B` covers every fftlen.
+struct Workspace{S<:FFTScratch, B, D<:DecimBuf}
+    scratch::Dict{Int,S}
     ftprofs::Matrix{ComplexF64}   # (nharms+1, Nprof)
     profs::Matrix{Float64}        # (2*nharms, Nprof)
     medbuf::Vector{Float64}       # (2*nharms,) scratch for the per-profile median
     brfftplan::B                   # plan_brfft(ftprofs, 2*nharms, 1)
-    decims::Vector{DecimBuf}       # one per decimation factor k > 1
+    decims::Vector{D}              # one per decimation factor k > 1
 end
 
 function Workspace(params::SearchParams, hplans::Vector{HarmonicPlan}, Nprof::Integer)
     nh = params.nharms
-    scratch = Dict{Int,FFTScratch}()
-    for fl in unique(hp.fftlen for hp in hplans)
-        scratch[fl] = FFTScratch(fl)
-    end
+    # Build the Dict from concrete pairs so it infers Dict{Int,FFTScratch{P,Q}}
+    # (a concrete value type) rather than the abstract Dict{Int,FFTScratch}.
+    scratch = Dict(fl => FFTScratch(fl) for fl in unique(hp.fftlen for hp in hplans))
     ftprofs = zeros(ComplexF64, nh + 1, Nprof)
     profs   = Matrix{Float64}(undef, 2nh, Nprof)
     medbuf  = Vector{Float64}(undef, 2nh)
     brfftplan = plan_brfft(ftprofs, 2nh, 1; flags=FFTW.MEASURE)
     fill!(ftprofs, 0)   # MEASURE planning may have dirtied the buffer
-    # A DecimBuf per k > 1 (k = 1 is the base ftprofs/profs above).
-    decims = DecimBuf[DecimBuf(k, nh, Nprof) for k in params.decimations if k > 1]
+    # A DecimBuf per k > 1 (k = 1 is the base ftprofs/profs above).  `map` (not a
+    # `DecimBuf[...]` comprehension) keeps the element type the concrete
+    # `DecimBuf{B}` even when empty, so `Workspace`'s `D<:DecimBuf` stays concrete.
+    decims = map(k -> DecimBuf(k, nh, Nprof), filter(>(1), params.decimations))
     return Workspace(scratch, ftprofs, profs, medbuf, brfftplan, decims)
 end
 
