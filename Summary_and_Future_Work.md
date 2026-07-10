@@ -147,6 +147,39 @@ prove bit-level equivalence with the reference.
 - **Detection** of the bundled 10.0123 Hz pulsar is recovered at
   `10.0123125 Hz`, independent of chunk size.
 
+### Performance optimization (2026-07)
+
+A profiling pass (`bench/`: `microbench.jl`, `profile_search.jl`,
+`median_bench.jl`) found the hot-loop cost was **not** where the design narrative
+assumed. On the heavy `--metric sd2 --maxdecim 6` config (`nharms=60`), single-
+thread self-time split as: **profile-median `sort!` ~41%**, FFTW ~30%, everything
+else ~29% — while `uniform_linear_interp`, despite ~1.5 billion calls, was ~0%.
+Two changes followed, each guarded by the `align=false` machine-precision gate
+and a byte-identical full-run candidate diff:
+
+- **Quickselect median** (`_median!`/`_select!` in `search.jl`) replacing the
+  radix `sort!` in `_profile_snr`, plus fusing the copy/argmax passes and
+  special-casing `w^pexp` for `pexp ∈ {0.5, 1}`. The median ran ~1e8× on short,
+  *cold* profile columns where radix sort mispredicts; quickselect for just the
+  two central order statistics is ~2× and returns the identical value. Median
+  bucket 41% → 7.5%.
+- **Type-stable `Workspace`** (`Workspace{S,B,D}` with a concrete
+  `Dict{Int,FFTScratch{…}}` / `Vector{DecimBuf{…}}`). The abstract containers had
+  made `sc.fwd`/`sc.bwd`/`db.brfftplan` `::Any`, so every hot-loop `mul!`
+  dispatched dynamically and boxed its result (`fill_harmonic_row!` 64–80 B/call
+  → 0 B).
+
+Net: warm single-thread search **~1.6× faster** (0.1–5 Hz band, 20.1 → 12.6 s),
+results provably unchanged.
+
+**Investigated and rejected:** sizing the interpolation `fftlen` to smooth
+`2·3·5·7` numbers instead of the next power of two. Per large size it looks ~2×
+faster, but the total ceiling is only ~3% (mixed-radix per-point cost cancels the
+smaller size), and smooth sizes need ~60 distinct lengths whose `MEASURE`
+planning is ~0.7 s *each*; `ESTIMATE` avoids that but executes slower, making it a
+net regression. **`next_pow_of_2` + `MEASURE` is already ≈ FFTW's best case** — so
+the throughput-tuning/tiling items below are lower-value than expected.
+
 ---
 
 ## 3. Next steps
@@ -159,15 +192,24 @@ prove bit-level equivalence with the reference.
 > and acting on what it finds. The throughput-tuning and tiling items below are
 > the concrete starting points for that work.
 
-- **Throughput tuning script.** Port `examples/speed_test.py` to Julia and sweep
-  the `finterp_fft` rate over both `fftlen` *and* `numbetween` to pick the
-  per-harmonic sweet spots (the design's 1024 < `fftlen` < 65536 expectation),
-  then feed the result back into `build_harmonic_plans`. Persisting **FFTW
-  wisdom** so repeated runs skip planning is a cheap add-on here.
-- **Tiling for very large chunks.** At the default `blocksize` each harmonic fits
-  one transform; large `Nprof` (or small capped `fftlen`) will need the harmonic
-  span split into overlapping tiles. The `fill_harmonic_row!` structure leaves
-  room for this — add the tile loop when the benchmark wants a capped `fftlen`.
+- **The big remaining lever: `ComplexF32` interpolation.** The `.fft` amplitudes
+  are already `ComplexF32`; the interpolation pipeline widens to `ComplexF64`.
+  Keeping it `ComplexF32` would ~halve the bandwidth of the two dominant buckets
+  (the interp FFTs *and* the full-length `spec .* coeffs` multiply). It breaks the
+  `Float64` oracle pins (~1e-7 vs ~1e-15), so it needs a deliberate precision-mode
+  design and fresh validation against injected fake pulsars — a separate effort,
+  not a drop-in. This is the most promising throughput item.
+- **Rethink FFT-correlation vs. direct interpolation.** The FFT computes ~16k
+  fine-grid points per harmonic to then linear-interp only the ~`Nprof` we need; a
+  cached-coefficient *direct* `O(m)` interpolation of just those points is ~7×
+  fewer arithmetic ops in principle. An architectural change to `interp_tile!` /
+  `fill_harmonic_row!` — higher risk, potentially a large win. Profile first.
+- **`fftlen` sizing is settled (do not revisit).** Sweeping `fftlen`/`numbetween`
+  or smooth (`2·3·5·7`) sizes was investigated (see §2) and rejected:
+  `next_pow_of_2` + `MEASURE` is already ≈ FFTW's best case. Tiling a chunk into
+  smaller overlapping transforms only matters if a future capped `fftlen` is
+  forced (e.g. a memory-constrained `ComplexF32` mode); `fill_harmonic_row!`
+  leaves room for the tile loop, but it is not a throughput win on its own.
 - **Candidate de-duplication (implemented).** `remove_duplicates` (wired to the
   default; `--noremove` now disables it) collapses the run of adjacent trial
   fundamentals a single signal lights up down to its strongest member: sort by

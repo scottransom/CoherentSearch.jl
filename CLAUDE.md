@@ -65,12 +65,18 @@ the hot loop. See `Summary_and_Future_Work.md` (§3) for the roadmap.
   Run single-threaded (`-t 1`) for clean profile attribution; warm up before
   timing to exclude JIT. Example FFT for longer runs:
   `PM0063_034C1_DM445.0_red.fft`.
-- **Measured hotspots** (config above): after the quickselect-median change, the
-  top bucket is now **FFTW (~38%)** — the high-harmonic interpolation transforms,
-  whose `fftlen` balloons to 16384/32768. Next levers: per-harmonic
-  `fftlen`/`numbetween` sweep + tiling, FFTW wisdom/PATIENT, and fixing the
-  `Workspace.scratch::Dict{Int,FFTScratch}` / `decims::Vector{DecimBuf}` type
-  instability (abstract element types ⇒ dynamic `mul!` dispatch).
+- **Done (2026-07):** quickselect median in `_profile_snr` (was 41% of runtime →
+  7.5%) and a type-stable `Workspace{S,B,D}` (killed hot-loop dynamic `mul!`
+  dispatch) — together ~1.6× warm single-thread, results unchanged. See §2 of
+  `Summary_and_Future_Work.md`.
+- **Settled — do not revisit:** smooth (`2·3·5·7`) `fftlen` sizing. Investigated
+  and rejected; `next_pow_of_2` + `MEASURE` is already ≈ FFTW's best case (~3%
+  ceiling, and smooth needs ~60 sizes whose MEASURE planning is ~0.7 s each).
+- **Biggest remaining lever:** `ComplexF32` interpolation (halve bandwidth on the
+  interp FFTs + the `spec.*coeffs` multiply), but it breaks the `Float64` oracle
+  pins → needs a precision-mode design + injected-signal validation. Second:
+  direct `O(m)` interpolation of only the needed points instead of FFT-correlation
+  over a full fine grid. Profile before committing to either.
 
 ## Environment gotchas (Julia 1.12)
 
