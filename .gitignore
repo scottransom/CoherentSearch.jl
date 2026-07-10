@@ -17,3 +17,7 @@ oracle.json
 # Editors / OS
 .DS_Store
 *.swp
+
+# Benchmark sub-env manifest (regenerated) and profiler HTML output
+/bench/Manifest.toml
+/bench/statprof/

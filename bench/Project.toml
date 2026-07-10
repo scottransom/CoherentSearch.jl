@@ -1,0 +1,5 @@
+[deps]
+BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
+CoherentSearch = "b7e4a1c2-3d6f-4e8a-9c1b-2a5d8f3e6c40"
+LoopVectorization = "bdcacae8-1622-11e9-2a5c-532679323890"
+StatProfilerHTML = "a8a75453-ed82-57c9-9e16-4cd1196ecbf5"
