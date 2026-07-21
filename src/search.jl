@@ -43,9 +43,11 @@ Base.@kwdef struct SearchParams
     hidr::Float64 = 0.5     # Fourier-bin step at the highest harmonic
     threshold::Float64 = 8.0
     align::Bool = true      # per-harmonic numbetween matched to deltar_h
-    xsignal::Float64 = 0.2  # peak fraction bounding the on-pulse signal region
-    metric::Symbol = :non   # width penalty: :non (N_on^pexp) or :sd2 (Σd²^pexp)
-    pexp::Float64 = 0.5     # width-penalty exponent (1/2 = calibrated for :non)
+    xsignal::Float64 = 0.2  # peak fraction bounding the on-pulse signal region (:non/:sd2 only)
+    metric::Symbol = :non   # :non (N_on^pexp), :sd2 (Σd²^pexp), or :boxcar (matched filter)
+    pexp::Float64 = 0.5     # width-penalty exponent (1/2 = calibrated for :non; :non/:sd2 only)
+    boxcar_fsp::Float64 = 1.5    # :boxcar geometric width-recurrence factor (riptide default)
+    boxcar_maxfrac::Float64 = 0.3  # :boxcar widest boxcar as a fraction of nbins
     decimations::Vector{Int} = [1]  # harmonic-decimation factors k (see decimation_design.md)
 end
 
@@ -254,6 +256,131 @@ and width are all scale-invariant, so only the linear `signal` term needs
     return scale * signal * invrms / denom
 end
 
+# ---------------------------------------------------------------------------
+# Boxcar matched-filter metric (:boxcar)
+#
+# A cleaner alternative to the on-pulse-selection metric above, whose adaptive
+# on-pulse set gives the pure-noise metric a non-analytic ~√nbins floor (so the
+# low-k decimations dominate the candidate list; see `MetricStats`).  Here we
+# instead correlate each profile with a *fixed* bank of boxcar (top-hat) filters
+# and report the peak matched-filter S/N — exactly PRESTO single-pulse / the
+# riptide FFA (Morello et al. 2020, MNRAS 497, 4654, §5.4).  Because the widths
+# are chosen a priori (not from the data), a width-w boxcar over white noise is
+# N(0, w·σ²); dividing by σ√w makes every trial unit-variance regardless of w or
+# nbins, so the peak over trials follows analytic extreme-value statistics with a
+# known, ~nbins-flat trials factor — no √nbins floor to normalise away.
+# ---------------------------------------------------------------------------
+
+"""
+    boxcar_widths(nbins; fsp=1.5, maxfrac=0.3) -> Vector{Int}
+
+Geometric bank of boxcar widths (in profile bins) for a `nbins`-bin profile:
+`w₀=1`, `wₖ₊₁ = max(⌊fsp·wₖ⌋, wₖ+1)`, truncated at `⌊maxfrac·nbins⌋` (the widest
+duty cycle worth testing).  The `fsp=1.5` recurrence is riptide's default and
+reproduces the hand-picked `[1,2,3,4,6,9,13,19,…]` sequence.  Always contains at
+least the width-1 (single-bin) filter.
+"""
+function boxcar_widths(nbins::Integer; fsp::Real=1.5, maxfrac::Real=0.3)
+    wmax = max(1, floor(Int, maxfrac * nbins))
+    ws = Int[]
+    w = 1
+    while w <= wmax
+        push!(ws, w)
+        w = max(floor(Int, fsp * w), w + 1)
+    end
+    return ws
+end
+
+const _BOXCAR_SIGMA_SAMPLES = 8192     # bins subsampled per block to fix the noise σ
+
+"""
+    _block_sigma(M, nbins, n, buf) -> Float64
+
+Robust per-bin noise scale (`1.4826 × MAD`) for one block, pooled over a strided
+subsample of the `nbins × n` profile matrix `M[:, 1:n]` into `buf` (length
+`_BOXCAR_SIGMA_SAMPLES`).  A block carries thousands of noise bins, so this `σ̂`
+has sub-percent variance — unlike a per-profile MAD (`~0.76/√nbins`, i.e. ~17% at
+`nbins=20`), whose estimation noise multiplies straight into every boxcar S/N and
+inflates the small-`nbins` tail.  Median-based and pooled, so the rare signal/RFI
+bin does not bias it.  Returns `0.0` for a degenerate (flat) block.
+
+The subsample indices depend only on `(nbins, n)`, and `M` enters only through the
+ratio the caller forms (`excess/σ`), so the unnormalised `brfft` and normalised
+`irfft` paths yield the identical scale-free S/N (the `align=false` pin holds).
+"""
+function _block_sigma(M::AbstractMatrix{Float64}, nbins::Int, n::Int, buf::Vector{Float64})
+    N = nbins * n
+    N == 0 && return 0.0
+    cap = length(buf)
+    ns = 0
+    if N <= cap
+        @inbounds for j in 1:n, i in 1:nbins
+            ns += 1; buf[ns] = M[i, j]
+        end
+    else
+        s = N ÷ cap                               # stride ≥ 1; not a multiple of nbins in general
+        @inbounds for t in 1:s:N
+            ns == cap && break
+            j = (t - 1) ÷ nbins + 1
+            i = (t - 1) % nbins + 1
+            ns += 1; buf[ns] = M[i, j]
+        end
+    end
+    med = _median!(buf, ns)                       # destroys buf order (values preserved)
+    @inbounds for t in 1:ns
+        buf[t] = abs(buf[t] - med)                # MAD over the same multiset (order irrelevant)
+    end
+    return 1.4826 * _median!(buf, ns)
+end
+
+"""
+    _profile_boxcar(profs, j, medbuf, psum, widths, nbins, invsigma) -> Float64
+
+Peak boxcar matched-filter S/N of profile column `j` (see the section comment).
+`medbuf` (length `nbins`) is quickselect scratch for the per-profile baseline
+median; `psum` (length `≥ nbins + widths[end] + 1`) holds the phase-tiled prefix
+sum so wrap-around boxcars need no special case.  `invsigma = 1/σ` is the block's
+robust per-bin noise scale ([`_block_sigma`](@ref)) — shared across the block so
+its (negligible) estimation noise does not leak into the per-trial statistic,
+which is then exactly `N(0,1)` per (phase, width) under white noise.
+
+The baseline is the profile median; the reported S/N
+`max_{w,p} (Σ_{i=p}^{p+w-1}(P_i − med)) · invsigma / √w` is a ratio of two
+linear-in-amplitude quantities, hence invariant to the profile's overall scale —
+so the unnormalised hot-loop `brfft` and the normalised reference `irfft` yield
+the identical value, and neither `ngoodbins` nor the `scale` factor is needed.
+"""
+@inline function _profile_boxcar(profs::AbstractMatrix{Float64}, j::Integer,
+                                 medbuf::Vector{Float64}, psum::Vector{Float64},
+                                 widths::Vector{Int}, nbins::Int, invsigma::Float64)
+    invsigma > 0 || return 0.0                    # degenerate (flat block): no detection
+    col = @view profs[:, j]
+    @inbounds for i in 1:nbins
+        medbuf[i] = col[i]
+    end
+    med = _median!(medbuf, nbins)                 # per-profile baseline (destroys medbuf)
+
+    # Prefix sum of the median-subtracted profile, tiled by one extra `wmax`
+    # samples so a boxcar that wraps past bin `nbins` reads real (wrapped) data:
+    # boxcar sum of bins p..p+w-1 (1-based) = psum[p+w] - psum[p].
+    wmax = widths[end]
+    psum[1] = 0.0
+    @inbounds for i in 1:(nbins + wmax)
+        idx = i > nbins ? i - nbins : i
+        psum[i + 1] = psum[i] + (col[idx] - med)
+    end
+
+    best = -Inf
+    @inbounds for w in widths
+        invsw = invsigma / sqrt(float(w))
+        for p in 1:nbins
+            snr = (psum[p + w] - psum[p]) * invsw
+            snr > best && (best = snr)
+        end
+    end
+    return best
+end
+
 """
     snr_metrics(profs, ngoodbins; xsignal=0.2, metric=:non, pexp=0.5) -> Vector{Float64}
 
@@ -266,12 +393,22 @@ fraction bounding the on-pulse region; `metric` (`:non` or `:sd2`) and `pexp`
 select and tune the width penalty (see [`_profile_snr`](@ref)).
 """
 function snr_metrics(profs::AbstractMatrix{<:Real}, ngoodbins::Real;
-                     xsignal::Real=0.2, metric::Symbol=:non, pexp::Real=0.5)
-    metric in (:non, :sd2) || throw(ArgumentError("metric must be :non or :sd2, got :$metric"))
+                     xsignal::Real=0.2, metric::Symbol=:non, pexp::Real=0.5,
+                     boxcar_fsp::Real=1.5, boxcar_maxfrac::Real=0.3)
+    metric in (:non, :sd2, :boxcar) ||
+        throw(ArgumentError("metric must be :non, :sd2 or :boxcar, got :$metric"))
     nbins, L = size(profs)
-    invrms = sqrt(2 * ngoodbins + 1)
     medbuf = Vector{Float64}(undef, nbins)
     P = profs isa Matrix{Float64} ? profs : convert(Matrix{Float64}, profs)
+    if metric === :boxcar
+        widths = boxcar_widths(nbins; fsp=boxcar_fsp, maxfrac=boxcar_maxfrac)
+        psum = Vector{Float64}(undef, nbins + widths[end] + 1)
+        sigbuf = Vector{Float64}(undef, min(nbins * L, _BOXCAR_SIGMA_SAMPLES))
+        sigma = _block_sigma(P, nbins, L, sigbuf)          # one robust σ for the whole set
+        invsigma = sigma > 0 ? 1.0 / sigma : 0.0
+        return [_profile_boxcar(P, j, medbuf, psum, widths, nbins, invsigma) for j in 1:L]
+    end
+    invrms = sqrt(2 * ngoodbins + 1)
     return [_profile_snr(P, j, medbuf, nbins, invrms, 1.0, Float64(xsignal), metric, Float64(pexp))
             for j in 1:L]
 end
@@ -345,10 +482,21 @@ function block_metrics(ft::FFTFile, rfund::AbstractVector{<:Real}, params::Searc
     L = length(rfund)
     profs = reference_profiles(ft, rfund, params)
 
-    rmean = sum(rfund) / L
-    invrms = sqrt(2 * chunk_ngoodbins(ft, nh, rmean) + 1)
     medbuf = Vector{Float64}(undef, nbins)
     metrics = Vector{Float64}(undef, L)
+    if params.metric === :boxcar
+        widths = boxcar_widths(nbins; fsp=params.boxcar_fsp, maxfrac=params.boxcar_maxfrac)
+        psum = Vector{Float64}(undef, nbins + widths[end] + 1)
+        sigbuf = Vector{Float64}(undef, min(nbins * L, _BOXCAR_SIGMA_SAMPLES))
+        sigma = _block_sigma(profs, nbins, L, sigbuf)
+        invsigma = sigma > 0 ? 1.0 / sigma : 0.0
+        for j in 1:L
+            metrics[j] = _profile_boxcar(profs, j, medbuf, psum, widths, nbins, invsigma)
+        end
+        return metrics
+    end
+    rmean = sum(rfund) / L
+    invrms = sqrt(2 * chunk_ngoodbins(ft, nh, rmean) + 1)
     for j in 1:L
         metrics[j] = _profile_snr(profs, j, medbuf, nbins, invrms, 1.0, params.xsignal, params.metric, params.pexp)
     end
@@ -479,16 +627,22 @@ struct DecimBuf{B}
     dprofs::Matrix{Float64}       # (2*Hk, Nprof)
     medbuf::Vector{Float64}       # (2*Hk,)
     brfftplan::B                   # plan_brfft(dftprofs, 2*Hk, 1)
+    bcwidths::Vector{Int}          # :boxcar width bank for 2*Hk-bin profiles
+    bcpsum::Vector{Float64}        # :boxcar prefix-sum scratch (2*Hk + wmax + 1)
+    bcsig::Vector{Float64}         # :boxcar per-block σ subsample scratch
 end
 
-function DecimBuf(k::Integer, nharms::Integer, Nprof::Integer)
+function DecimBuf(k::Integer, nharms::Integer, Nprof::Integer, params::SearchParams)
     Hk = fld(nharms, k)
     dftprofs = zeros(ComplexF64, Hk + 1, Nprof)
     dprofs   = Matrix{Float64}(undef, 2Hk, Nprof)
     medbuf   = Vector{Float64}(undef, 2Hk)
     brfftplan = plan_brfft(dftprofs, 2Hk, 1; flags=FFTW.MEASURE)
     fill!(dftprofs, 0)   # MEASURE planning may have dirtied the buffer
-    return DecimBuf(Int(k), Hk, dftprofs, dprofs, medbuf, brfftplan)
+    bcwidths = boxcar_widths(2Hk; fsp=params.boxcar_fsp, maxfrac=params.boxcar_maxfrac)
+    bcpsum   = Vector{Float64}(undef, 2Hk + bcwidths[end] + 1)
+    bcsig    = Vector{Float64}(undef, min(2Hk * Nprof, _BOXCAR_SIGMA_SAMPLES))
+    return DecimBuf(Int(k), Hk, dftprofs, dprofs, medbuf, brfftplan, bcwidths, bcpsum, bcsig)
 end
 
 """
@@ -512,6 +666,9 @@ struct Workspace{S<:FFTScratch, B, D<:DecimBuf}
     profs::Matrix{Float64}        # (2*nharms, Nprof)
     medbuf::Vector{Float64}       # (2*nharms,) scratch for the per-profile median
     brfftplan::B                   # plan_brfft(ftprofs, 2*nharms, 1)
+    bcwidths::Vector{Int}          # :boxcar width bank for the base 2*nharms-bin profiles
+    bcpsum::Vector{Float64}        # :boxcar prefix-sum scratch (2*nharms + wmax + 1)
+    bcsig::Vector{Float64}         # :boxcar per-block σ subsample scratch
     decims::Vector{D}              # one per decimation factor k > 1
 end
 
@@ -525,11 +682,14 @@ function Workspace(params::SearchParams, hplans::Vector{HarmonicPlan}, Nprof::In
     medbuf  = Vector{Float64}(undef, 2nh)
     brfftplan = plan_brfft(ftprofs, 2nh, 1; flags=FFTW.MEASURE)
     fill!(ftprofs, 0)   # MEASURE planning may have dirtied the buffer
+    bcwidths = boxcar_widths(2nh; fsp=params.boxcar_fsp, maxfrac=params.boxcar_maxfrac)
+    bcpsum   = Vector{Float64}(undef, 2nh + bcwidths[end] + 1)
+    bcsig    = Vector{Float64}(undef, min(2nh * Nprof, _BOXCAR_SIGMA_SAMPLES))
     # A DecimBuf per k > 1 (k = 1 is the base ftprofs/profs above).  `map` (not a
     # `DecimBuf[...]` comprehension) keeps the element type the concrete
     # `DecimBuf{B}` even when empty, so `Workspace`'s `D<:DecimBuf` stays concrete.
-    decims = map(k -> DecimBuf(k, nh, Nprof), filter(>(1), params.decimations))
-    return Workspace(scratch, ftprofs, profs, medbuf, brfftplan, decims)
+    decims = map(k -> DecimBuf(k, nh, Nprof, params), filter(>(1), params.decimations))
+    return Workspace(scratch, ftprofs, profs, medbuf, brfftplan, bcwidths, bcpsum, bcsig, decims)
 end
 
 """
@@ -1001,12 +1161,26 @@ function decim_pass!(out::Vector{Candidate}, ws::Workspace, db::DecimBuf, ft::FF
     ngood = chunk_ngoodbins(ft, Hk, k * rmean)
     invrms = sqrt(2 * ngood + 1)
     nyq = ft.N / 2
+    # Valid decimated trials are the prefix j = 1..nvalid (k·rf increases with j).
+    nvalid = 0
+    @inbounds while nvalid < n && k * (rstart + nvalid * lodr) < nyq
+        nvalid += 1
+    end
+    # One robust per-bin σ for this (block, k), from the valid profiles only (past-
+    # Nyquist columns are partly zero-padded and would deflate it).
+    invsigma = 0.0
+    if params.metric === :boxcar
+        sig = _block_sigma(db.dprofs, nbins, nvalid, db.bcsig)
+        invsigma = sig > 0 ? 1.0 / sig : 0.0
+    end
     mbuf = stats === nothing ? nothing : Float64[]     # gather metrics if requested
     @inbounds for j in 1:n
         r_dec = k * (rstart + (j - 1) * lodr)
         r_dec < nyq || continue                       # fundamental past Nyquist
-        mval = _profile_snr(db.dprofs, j, db.medbuf, nbins, invrms,
-                            1.0 / nbins, params.xsignal, params.metric, params.pexp)
+        mval = params.metric === :boxcar ?
+            _profile_boxcar(db.dprofs, j, db.medbuf, db.bcpsum, db.bcwidths, nbins, invsigma) :
+            _profile_snr(db.dprofs, j, db.medbuf, nbins, invrms,
+                         1.0 / nbins, params.xsignal, params.metric, params.pexp)
         if mbuf !== nothing
             push!(mbuf, mval)
             hist === nothing || _hist_push!(hist, mval)
@@ -1042,6 +1216,11 @@ function chunk_metrics(ft::FFTFile, params::SearchParams, rstart::Real, n::Integ
     hplans = build_harmonic_plans(params, n)
     ws = Workspace(params, hplans, n)
     fill_chunk_profiles!(ws, hplans, ft, params, rstart, lodr, n)
+    if params.metric === :boxcar
+        sigma = _block_sigma(ws.profs, nbins, n, ws.bcsig)
+        invsigma = sigma > 0 ? 1.0 / sigma : 0.0
+        return [_profile_boxcar(ws.profs, j, ws.medbuf, ws.bcpsum, ws.bcwidths, nbins, invsigma) for j in 1:n]
+    end
     rmean = rstart + (n - 1) * lodr / 2
     invrms = sqrt(2 * chunk_ngoodbins(ft, nh, rmean) + 1)
     return [_profile_snr(ws.profs, j, ws.medbuf, nbins, invrms, 1.0 / nbins, params.xsignal, params.metric, params.pexp) for j in 1:n]
@@ -1100,11 +1279,18 @@ function _search_region!(ft::FFTFile, params::SearchParams, hplans::Vector{Harmo
                 rmean = rstart + (n - 1) * lodr / 2
                 ngood = chunk_ngoodbins(ft, params.nharms, rmean)
                 invrms = sqrt(2 * ngood + 1)
+                invsigma = 0.0
+                if params.metric === :boxcar
+                    sig = _block_sigma(ws.profs, nbins, n, ws.bcsig)   # one robust σ per block
+                    invsigma = sig > 0 ? 1.0 / sig : 0.0
+                end
                 # Whole (narrow) block → one window, keyed by its centre freq.
                 basehist = collect_stats ?
                     hists[1][_window_index(wedges[1], rmean / ft.T)] : nothing
                 for j in 1:n
-                    metric = _profile_snr(ws.profs, j, ws.medbuf, nbins, invrms, 1.0 / nbins, params.xsignal, params.metric, params.pexp)
+                    metric = params.metric === :boxcar ?
+                        _profile_boxcar(ws.profs, j, ws.medbuf, ws.bcpsum, ws.bcwidths, nbins, invsigma) :
+                        _profile_snr(ws.profs, j, ws.medbuf, nbins, invrms, 1.0 / nbins, params.xsignal, params.metric, params.pexp)
                     if collect_stats
                         mbuf[j] = metric
                         _hist_push!(basehist, metric)

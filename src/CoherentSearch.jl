@@ -25,7 +25,7 @@ include("fileio.jl")
 export SearchParams, Candidate, search, search_block, block_metrics, coherent_profiles,
        reference_profiles, snr_metrics, chunk_ngoodbins, remove_duplicates,
        remove_harmonics, chunk_metrics, build_harmonic_plans, harmonic_numbetween,
-       decimation_set, BlockMetricStats, MetricHistogram, MetricStats,
+       decimation_set, boxcar_widths, BlockMetricStats, MetricHistogram, MetricStats,
        metricstats_summary, metricstats_windows, hist_quantile,
        MetricNorm, build_metricnorm
 include("search.jl")

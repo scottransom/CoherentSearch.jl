@@ -1,5 +1,6 @@
 using Test
 using CoherentSearch
+using Random
 
 # The optimised chunk/plan-caching path must agree with the simple reference
 # `block_metrics` (which is itself pinned to the Python oracle to ~1e-15), and
@@ -72,6 +73,45 @@ end
     @test_throws ArgumentError snr_metrics(reshape(spike, nbins, 1), ngood; metric=:bogus)
 end
 
+@testset "boxcar_widths: geometric bank capped at maxfrac*nbins" begin
+    w = boxcar_widths(64; fsp=1.5, maxfrac=0.3)
+    @test w == [1, 2, 3, 4, 6, 9, 13, 19]        # riptide's wₖ₊₁=max(⌊1.5wₖ⌋,wₖ+1)
+    @test w[1] == 1 && issorted(w) && allunique(w)
+    @test w[end] <= floor(Int, 0.3 * 64)
+    @test all(w[i+1] == max(floor(Int, 1.5 * w[i]), w[i] + 1) for i in 1:length(w)-1)
+    @test boxcar_widths(4) == [1]                # tiny profile keeps only width-1
+    @test boxcar_widths(64; maxfrac=0.5)[end] <= 32
+end
+
+@testset "boxcar metric: scale-invariant, robust, detects a pulse" begin
+    nbins = 64
+
+    # A ratio of two linear-in-amplitude quantities: invariant to overall scale
+    # (this is why the unnormalised brfft hot path and the normalised reference
+    # irfft yield the identical value, with no `scale`/`ngoodbins` correction).
+    ramp = collect(1.0:nbins)
+    m1 = snr_metrics(reshape(ramp, nbins, 1), 32.0; metric=:boxcar)[1]
+    m2 = snr_metrics(reshape(ramp .* 7.0, nbins, 1), 32.0; metric=:boxcar)[1]
+    @test m1 ≈ m2 rtol=1e-12
+    @test m1 > 0
+
+    # A flat profile has zero MAD -> guarded to 0.0, not NaN/Inf.
+    @test snr_metrics(reshape(fill(3.0, nbins), nbins, 1), 32.0; metric=:boxcar)[1] == 0.0
+
+    # A narrow pulse on Gaussian noise scores far above the noise-only profile,
+    # and the pure-noise peak-over-trials sits at a few sigma (analytic EVD).
+    noise = randn(MersenneTwister(1234), nbins)
+    snr_noise = snr_metrics(reshape(copy(noise), nbins, 1), 32.0; metric=:boxcar)[1]
+    sig = copy(noise); sig[30] += 20.0
+    snr_sig = snr_metrics(reshape(sig, nbins, 1), 32.0; metric=:boxcar)[1]
+    @test snr_sig > snr_noise + 10
+    @test 0 < snr_noise < 8
+    @test snr_sig > 15
+
+    # ngoodbins is ignored for :boxcar (it measures its own noise level).
+    @test snr_metrics(reshape(copy(noise), nbins, 1), 5.0; metric=:boxcar)[1] ≈ snr_noise
+end
+
 @testset "remove_duplicates collapses clusters" begin
     # Two tight clusters (near-identical r) plus one isolated candidate; each
     # cluster should collapse to its single strongest member.
@@ -131,6 +171,32 @@ if isfile(EXAMPLE_FFT)
         # Both paths compute identical profiles to ~1e-10; the snr metric is a
         # continuous function of them except at the (rare) half-max threshold tie.
         @test relerr < 1e-8
+    end
+
+    @testset "boxcar metric: optimised path reproduces the reference (align=false)" begin
+        # Same equivalence pin as above, for :boxcar.  The metric is scale-free,
+        # so the unnormalised brfft (chunk_metrics) and the normalised irfft
+        # (block_metrics) must agree to ~machine precision on identical grids.
+        params = SearchParams(nharms=32, m=32, numbetween=16, align=false, metric=:boxcar)
+        lodr = params.hidr / params.nharms
+        rstart = 10010.0
+        n = 256
+        rfund = rstart .+ (0:n-1) .* lodr
+
+        ref = block_metrics(ft, rfund, params)
+        opt = chunk_metrics(ft, params, rstart, n; lodr=lodr)
+        relerr = maximum(abs.(opt .- ref)) / maximum(abs.(ref))
+        @info "boxcar align=false reference agreement" relerr
+        @test relerr < 1e-8
+    end
+
+    @testset "boxcar metric detects the 10.0123 Hz pulsar" begin
+        params = SearchParams(nharms=32, m=32, numbetween=16, metric=:boxcar)
+        cands = search(ft, params; lofreq=9.5, hifreq=10.5, threshold=8.0)
+        @test !isempty(cands)
+        best = cands[argmax(c.metric for c in cands)]
+        @info "boxcar strongest candidate" best.freq best.metric
+        @test isapprox(best.freq, 10.0123; atol=1e-2)
     end
 
     @testset "per-harmonic alignment is more accurate at low harmonics" begin

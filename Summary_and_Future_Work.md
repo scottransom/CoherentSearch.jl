@@ -267,6 +267,51 @@ the throughput-tuning/tiling items below are lower-value than expected.
   metric's discontinuous on-pulse threshold). *Still worth doing:* validate
   against injected fake pulsars of varying width, and sweep `pexp` on real data.
 
+- **Boxcar matched-filter metric `:boxcar` (implemented) — fixes the `√nbins`
+  disease at the source.** Rather than *normalise away* the non-analytic noise
+  floor (the `--normalize` route below), `--metric boxcar` replaces the
+  data-adaptive on-pulse selection with a *fixed* bank of top-hat filters, whose
+  noise statistics are analytic. It correlates each profile with boxcars of
+  geometric width (`wₖ₊₁ = max(⌊1.5·wₖ⌋, wₖ+1)`, riptide's recurrence, capped at
+  `boxcar_maxfrac·nbins`, default 0.3) via the prefix-sum "strided differences" of
+  Morello et al. 2020 (MNRAS 497, 4654, §5.4): one exclusive prefix sum of the
+  median-subtracted, phase-tiled profile, then every boxcar sum is a two-index
+  difference. The reported metric is the peak matched-filter S/N,
+  `max_{w,p} (Σ_{i=p}^{p+w-1}(Pᵢ − med)) / (σ·√w)`. Because the widths are chosen
+  a priori, a width-`w` boxcar over white noise is `N(0, w·σ²)`, so `/√w` makes
+  every (phase, width) trial exactly `N(0,1)` — the peak over trials follows
+  analytic extreme-value statistics with a known, ~`nbins`-flat trials factor, and
+  there is *no* `√nbins` floor to correct. It is scale-free (a ratio of two
+  linear-in-amplitude quantities), so the unnormalised hot-loop `brfft` and the
+  normalised reference `irfft` give the identical value — the `align=false`
+  equivalence pin extends to it unchanged — and neither `ngoodbins` nor the
+  `scale` factor enters. `xsignal`/`pexp` are unused.
+  - **The noise `σ` is estimated once per `(block, k)`**, not per profile:
+    `1.4826·MAD` over a strided subsample (`_BOXCAR_SIGMA_SAMPLES = 8192` bins) of
+    the block. A per-*profile* MAD (only `nbins` samples) has `~0.76/√nbins`
+    relative error — ~17% at `nbins=20` — which multiplies straight into every
+    S/N and re-inflates the small-`nbins` tail (measured: it flipped the FAP=1e-4
+    drift to run *up* with `k`, 5.9→9.5). Pooling thousands of block bins drops
+    `σ̂`'s variance below 1%, restoring the clean per-trial `N(0,1)`; it is also
+    cheaper (one MAD per block vs one per profile) and, being median-based and
+    pooled, immune to the rare signal/RFI bin. The subsample indices depend only
+    on `(nbins, n)` and enter only through the `excess/σ` ratio, so the pins hold.
+  - **Measured (`PM0063…red.fft`, 1–20 Hz, `maxdecim 6`, 4.78M trials/k):** the
+    FAP=1e-4 threshold is now **flat across decimations** — 5.28 (k=1, 120 bins) →
+    5.02 (k=6, 20 bins), a 5% spread, vs `:non`'s 9.82→5.90 (67%) and the
+    per-profile-MAD boxcar's 5.86→9.52. The std is tight and stable (0.46→0.61 vs
+    `:non` ~0.71). A single `--threshold` finally means one consistent false-alarm
+    rate for every `k`. The residual mean drift (2.89→2.12) is just the analytic
+    expected-max-over-phase-trials growth (does not move the detection threshold),
+    and the ~2× low-f/high-f drift that remains is the *same* red-noise structure
+    for every `k` (per-`k` FAP=1e-4 min ~4.9–5.1), cleanly separated from
+    decimation. **This is the preferred path** and largely obviates `--normalize`'s
+    motivation; the frequency (red-noise) drift is the only thing left for a
+    per-`f` threshold, and it is now `k`-independent. *Still worth doing:*
+    injected-signal width/S/N validation, a semi-analytic trials-factor →
+    equivalent-σ map (the analytic EVD makes this tractable now), and deciding
+    whether `:boxcar` becomes the default (retiring `:non`/`--normalize`).
+
 - **Threshold calibration across metric / `pexp` / decimation (to investigate).**
   The metric's numeric scale is *not* comparable across `--metric` or `--pexp`,
   so a fixed `--threshold` means different things in each configuration. On the
