@@ -614,8 +614,107 @@ function fill_chunk_profiles!(ws::Workspace, hplans::Vector{HarmonicPlan}, ft::F
     return
 end
 
+# ---------------------------------------------------------------------------
+# Per-block metric statistics (opt-in diagnostic; see the CLI `--metricstats`)
+# ---------------------------------------------------------------------------
+
 """
-    decim_pass!(out, ws, db, ft, params, rstart, lodr, n; threshold)
+    BlockMetricStats
+
+Summary statistics of the detection metric over one processed *block* of trial
+fundamentals at one harmonic-decimation factor `k` (`Hk = ⌊nharms/k⌋` harmonics
+summed into `nbins = 2*Hk`-bin profiles).  `ngoodbins` is the per-block noise
+normalisation ([`chunk_ngoodbins`](@ref)); `flo`/`fhi` bound the *searched* spin
+frequency (Hz) — for `k>1` this is `k×` the fundamental.  `n` is the number of
+trials counted (decimation trials whose `k·rf` reaches Nyquist are excluded, so
+`n` can be below the block size for the low-`k`, high-frequency blocks).
+Collected only when [`search`](@ref) is passed a `metricstats` sink.
+
+These exist to expose how the metric's noise floor depends on the profile bin
+count.  With the default `:non`/`pexp=0.5` penalty the pure-noise metric scales
+~`√nbins = √(2·Hk)`, so the low-`k` (more-bin) decimations sit at a
+systematically higher floor and dominate the candidate list at a fixed
+`threshold`.  Comparing the per-`k` distributions is how one should choose a
+`--threshold` (and see that it is *not* comparable across decimations).
+"""
+struct BlockMetricStats
+    block::Int
+    k::Int
+    Hk::Int
+    nbins::Int
+    ngoodbins::Float64
+    flo::Float64
+    fhi::Float64
+    n::Int
+    min::Float64
+    median::Float64
+    mean::Float64
+    std::Float64
+    max::Float64
+end
+
+# Exact min/median/mean/std/max of `v` (which is treated as scratch: `_median!`
+# reorders it, so this is called last, after the linear passes).
+function _block_stats(block::Integer, k::Integer, Hk::Integer, nbins::Integer,
+                      ngoodbins::Real, flo::Real, fhi::Real, v::Vector{Float64})
+    n = length(v)
+    n == 0 && return BlockMetricStats(block, k, Hk, nbins, ngoodbins, flo, fhi,
+                                      0, NaN, NaN, NaN, NaN, NaN)
+    vmin = v[1]; vmax = v[1]; s = 0.0
+    @inbounds for x in v
+        x < vmin && (vmin = x)
+        x > vmax && (vmax = x)
+        s += x
+    end
+    mean = s / n
+    ss = 0.0
+    @inbounds for x in v
+        d = x - mean; ss += d * d
+    end
+    std = n > 1 ? sqrt(ss / (n - 1)) : 0.0
+    med = _median!(v, n)                        # destroys v (scratch); done last
+    return BlockMetricStats(Int(block), Int(k), Int(Hk), Int(nbins), Float64(ngoodbins),
+                            Float64(flo), Float64(fhi), n, vmin, med, mean, std, vmax)
+end
+
+"""
+    metricstats_summary(stats) -> Vector{<:NamedTuple}
+
+Aggregate a vector of [`BlockMetricStats`](@ref) into one row per decimation
+factor `k` (sorted by `k`).  `min`/`max`/`mean`/`std` are the exact global
+values across all blocks of that `k` (the global std is reconstructed from the
+per-block moments); `median` is the median of the per-block medians (a robust
+stand-in for the exact global median, which the per-block reduction does not
+retain); `blockmax_mean` is the mean of the per-block maxima — the typical
+worst-case noise excursion per block, which is what a false-alarm-driven
+threshold trades against.
+"""
+function metricstats_summary(stats::AbstractVector{BlockMetricStats})
+    ks = sort!(unique(s.k for s in stats))
+    rows = map(ks) do k
+        rs = filter(s -> s.k == k && s.n > 0, stats)
+        isempty(rs) && return (k=k, Hk=0, nbins=0, nblocks=0, ntrials=0,
+                               min=NaN, median=NaN, mean=NaN, std=NaN,
+                               blockmax_mean=NaN, max=NaN)
+        N = sum(s.n for s in rs)
+        gmean = sum(s.mean * s.n for s in rs) / N
+        # Global Σ(x-gmean)² = Σ_block[(n-1)·s² + n·(mean-gmean)²]; exact.
+        ss = sum(((s.n - 1) * s.std^2 + s.n * (s.mean - gmean)^2) for s in rs)
+        gstd = N > 1 ? sqrt(ss / (N - 1)) : 0.0
+        blockmeds = sort!([s.median for s in rs])
+        L = length(blockmeds)
+        gmed = isodd(L) ? blockmeds[(L + 1) ÷ 2] :
+               0.5 * (blockmeds[L ÷ 2] + blockmeds[L ÷ 2 + 1])
+        (k=k, Hk=rs[1].Hk, nbins=rs[1].nbins, nblocks=length(rs), ntrials=N,
+         min=minimum(s.min for s in rs), median=gmed, mean=gmean, std=gstd,
+         blockmax_mean=sum(s.max for s in rs) / length(rs),
+         max=maximum(s.max for s in rs))
+    end
+    return rows
+end
+
+"""
+    decim_pass!(out, ws, db, ft, params, rstart, lodr, n; threshold, block, stats)
 
 Harmonic-decimation multi-frequency pass for factor `db.k`: re-use the base
 harmonic amplitudes already in `ws.ftprofs` to fold at `k·rf` for each of the
@@ -624,10 +723,15 @@ harmonic into `db`'s compact stack, inverse-FFTs all `n` decimated profiles at
 once, and appends above-`threshold` [`Candidate`](@ref)s (tagged with `Hₖ`
 harmonics) to `out`.  Trials whose decimated fundamental `k·rf` reaches Nyquist
 are skipped.  Nearly free relative to the interpolation the base pass paid.
+
+When a `stats` sink (a `Vector{BlockMetricStats}`) is passed, every folded
+trial's metric is also gathered and a [`BlockMetricStats`](@ref) for this
+`(block, k)` is appended — the opt-in `--metricstats` diagnostic.
 """
 function decim_pass!(out::Vector{Candidate}, ws::Workspace, db::DecimBuf, ft::FFTFile,
                      params::SearchParams, rstart::Real, lodr::Real, n::Integer;
-                     threshold::Real=params.threshold)
+                     threshold::Real=params.threshold, block::Integer=0,
+                     stats::Union{Nothing,Vector{BlockMetricStats}}=nothing)
     k = db.k
     Hk = db.Hk
     nbins = 2Hk
@@ -640,16 +744,25 @@ function decim_pass!(out::Vector{Candidate}, ws::Workspace, db::DecimBuf, ft::FF
     mul!(db.dprofs, db.brfftplan, db.dftprofs)
 
     rmean = rstart + (n - 1) * lodr / 2
-    invrms = sqrt(2 * chunk_ngoodbins(ft, Hk, k * rmean) + 1)
+    ngood = chunk_ngoodbins(ft, Hk, k * rmean)
+    invrms = sqrt(2 * ngood + 1)
     nyq = ft.N / 2
+    mbuf = stats === nothing ? nothing : Float64[]     # gather metrics if requested
     @inbounds for j in 1:n
         r_dec = k * (rstart + (j - 1) * lodr)
         r_dec < nyq || continue                       # fundamental past Nyquist
         mval = _profile_snr(db.dprofs, j, db.medbuf, nbins, invrms,
                             1.0 / nbins, params.xsignal, params.metric, params.pexp)
+        mbuf === nothing || push!(mbuf, mval)
         if mval > threshold
             push!(out, Candidate(r_dec / ft.T, mval, r_dec, Hk))
         end
+    end
+    if mbuf !== nothing && !isempty(mbuf)
+        # Valid trials are the prefix j=1..length(mbuf) (r_dec increases with j).
+        flo = k * rstart / ft.T
+        fhi = k * (rstart + (length(mbuf) - 1) * lodr) / ft.T
+        push!(stats, _block_stats(block, k, Hk, nbins, ngood, flo, fhi, mbuf))
     end
     return
 end
@@ -691,13 +804,20 @@ Candidate post-processing: near-identical clusters are collapsed by
 candidates by [`remove_harmonics`](@ref) (`harm_remove`, `numharm`, `harm_tol`).
 `progress` (`:none`, `:text`, or `:bar`) prints a chunk-completion meter to
 `stderr`.
+
+If a `metricstats` vector is supplied, per-block, per-decimation
+[`BlockMetricStats`](@ref) (the metric distribution over *every* trial, not just
+those above `threshold`) are collected and appended to it (sorted by block then
+`k`) after the search — the opt-in `--metricstats` diagnostic.  The candidate
+results are identical whether or not `metricstats` is collected.
 """
 function search(ft::FFTFile, params::SearchParams=SearchParams();
                 lofreq::Real=0.1, hifreq::Real=100.0, lobin::Integer=100,
                 blocksize::Integer=2048, threshold::Real=params.threshold,
                 remove::Bool=true, dr_tol::Real=1.0,
                 harm_remove::Bool=true, numharm::Integer=16, harm_tol::Real=1.0,
-                progress::Symbol=:none)
+                progress::Symbol=:none,
+                metricstats::Union{Nothing,Vector{BlockMetricStats}}=nothing)
     progress in (:none, :text, :bar) ||
         throw(ArgumentError("progress must be :none, :text or :bar, got :$progress"))
     FFTW.set_num_threads(1)   # parallelise at the Julia-task level, not inside FFTW
@@ -720,12 +840,16 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
     # Planning is not thread-safe: build all workspaces serially, here.
     workspaces = [Workspace(params, hplans, Nprof) for _ in 1:nt]
 
+    collect_stats = metricstats !== nothing
     results = Vector{Vector{Candidate}}(undef, nt)
+    statparts = collect_stats ? Vector{Vector{BlockMetricStats}}(undef, nt) : nothing
     done = Atomic{Int}(0)     # chunks completed across all tasks (for the progress meter)
     @sync for t in 1:nt
         @spawn begin
             ws = workspaces[t]
             out = Candidate[]
+            stats = collect_stats ? BlockMetricStats[] : nothing
+            mbuf = collect_stats ? Vector{Float64}(undef, Nprof) : nothing
             c = t
             while c <= nchunks
                 i0 = (c - 1) * Nprof
@@ -733,18 +857,26 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
                 rstart = r_lo + i0 * lodr
                 fill_chunk_profiles!(ws, hplans, ft, params, rstart, lodr, n)
                 rmean = rstart + (n - 1) * lodr / 2
-                invrms = sqrt(2 * chunk_ngoodbins(ft, params.nharms, rmean) + 1)
+                ngood = chunk_ngoodbins(ft, params.nharms, rmean)
+                invrms = sqrt(2 * ngood + 1)
                 for j in 1:n
                     metric = _profile_snr(ws.profs, j, ws.medbuf, nbins, invrms, 1.0 / nbins, params.xsignal, params.metric, params.pexp)
+                    collect_stats && (mbuf[j] = metric)
                     if metric > threshold
                         rf = rstart + (j - 1) * lodr
                         push!(out, Candidate(rf / ft.T, metric, rf, params.nharms))
                     end
                 end
+                if collect_stats
+                    flo = rstart / ft.T
+                    fhi = (rstart + (n - 1) * lodr) / ft.T
+                    push!(stats, _block_stats(c, 1, params.nharms, nbins, ngood, flo, fhi, mbuf[1:n]))
+                end
                 # Harmonic-decimation multi-frequency passes (k > 1), re-using the
                 # base harmonic amplitudes already in ws.ftprofs (see decimation_design.md).
                 for db in ws.decims
-                    decim_pass!(out, ws, db, ft, params, rstart, lodr, n; threshold=threshold)
+                    decim_pass!(out, ws, db, ft, params, rstart, lodr, n;
+                                threshold=threshold, block=c, stats=stats)
                 end
                 atomic_add!(done, 1)
                 # One task owns the display (avoids interleaved \r writes); it reads
@@ -753,11 +885,17 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
                 c += nt
             end
             results[t] = out
+            collect_stats && (statparts[t] = stats)
         end
     end
     if progress !== :none                    # clean 100% line after the parallel region
         _render_progress(progress, nchunks, nchunks)
         println(stderr)
+    end
+    if collect_stats
+        allstats = reduce(vcat, statparts; init=BlockMetricStats[])
+        sort!(allstats; by = s -> (s.block, s.k))
+        append!(metricstats, allstats)
     end
 
     cands = reduce(vcat, results; init=Candidate[])

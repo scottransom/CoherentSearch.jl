@@ -272,6 +272,38 @@ if isfile(EXAMPLE_FFT)
         surv = one[argmax(c.metric for c in one)]
         @test surv.freq == strongest.freq && surv.metric == strongest.metric
     end
+
+    @testset "metricstats: read-only diagnostic, correct per-k aggregation" begin
+        nharms = 60
+        params = SearchParams(nharms=nharms, decimations=decimation_set(nharms, 3))
+        kw = (lofreq=8.0, hifreq=12.0, threshold=8.0, blocksize=1024)
+        # Collecting stats must not change the candidate results.
+        ref = search(ft, params; kw...)
+        ms = BlockMetricStats[]
+        with = search(ft, params; kw..., metricstats=ms)
+        @test length(with) == length(ref)
+        @test all(a.freq == b.freq && a.metric == b.metric for (a, b) in zip(with, ref))
+
+        @test !isempty(ms)
+        @test Set(s.k for s in ms) == Set([1, 2, 3])
+        @test all(s.nbins == 2 * s.Hk for s in ms)
+        @test all(s.Hk == fld(nharms, s.k) for s in ms)
+        @test all(s.min <= s.median <= s.max && s.min <= s.mean <= s.max for s in ms)
+
+        # Summary aggregation: global mean reconstructed from per-block moments
+        # must equal the trial-count-weighted mean of the blocks; nbins ordering
+        # must show the sqrt(nbins) noise-floor growth (k=1 mean > k=2 > k=3).
+        summ = metricstats_summary(ms)
+        @test [r.k for r in summ] == [1, 2, 3]
+        for r in summ
+            rs = filter(s -> s.k == r.k, ms)
+            N = sum(s.n for s in rs)
+            @test r.ntrials == N
+            @test r.mean ≈ sum(s.mean * s.n for s in rs) / N
+            @test r.max == maximum(s.max for s in rs)
+        end
+        @test summ[1].mean > summ[2].mean > summ[3].mean          # more bins -> higher floor
+    end
 else
     @info "Skipping search data tests; example file not found" EXAMPLE_FFT
 end

@@ -25,7 +25,7 @@ include("fileio.jl")
 export SearchParams, Candidate, search, search_block, block_metrics, coherent_profiles,
        reference_profiles, snr_metrics, chunk_ngoodbins, remove_duplicates,
        remove_harmonics, chunk_metrics, build_harmonic_plans, harmonic_numbetween,
-       decimation_set
+       decimation_set, BlockMetricStats, metricstats_summary
 include("search.jl")
 
 # --- Per-candidate profile reconstruction (for plotting) ---

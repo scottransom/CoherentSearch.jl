@@ -121,6 +121,9 @@ function parse_cmdline(argv)
         "--noprogress"
             help = "Do not print a progress meter"
             action = :store_true
+        "--metricstats"
+            help = "Report per-block, per-decimation metric stats (min/median/mean/std/max) to help set --threshold; writes a full per-block table to <stem>_metricstats.txt"
+            action = :store_true
         "--noplot"
             help = "Do not plot the candidate pulse profiles (plotting is on by default)"
             action = :store_true
@@ -162,12 +165,19 @@ function main(argv)
     @info "Searching" file=a["fftfile"] T=ft.T nharms=params.nharms decimations=decimations threads=nthreads()
 
     progress = a["noprogress"] ? :none : (a["progressbar"] ? :bar : :text)
+    mstats = a["metricstats"] ? BlockMetricStats[] : nothing
     cands = search(ft, params;
                    lofreq = a["lofreq"], hifreq = a["hifreq"], lobin = a["lobin"],
                    blocksize = a["blocksize"], threshold = a["threshold"],
                    remove = !a["noremove"], dr_tol = a["drtol"],
                    harm_remove = !a["noharmremove"], numharm = a["numharm"],
-                   progress = progress)
+                   progress = progress, metricstats = mstats)
+
+    if mstats !== nothing
+        base = isempty(a["outputfilenm"]) ?
+               first(splitext(basename(a["fftfile"]))) : a["outputfilenm"]
+        report_metricstats(mstats, string(base, "_metricstats.txt"), params, a["threshold"])
+    end
 
     # Report the strongest `ncands` candidates, sorted best metric first.
     sort!(cands; by = c -> c.metric, rev = true)
@@ -223,6 +233,56 @@ function plot_stem(plotstem, outputfilenm, fftfile)
     # name.  Only the fallback fftfile name has a real extension (.fft) to strip.
     isempty(outputfilenm) || return string(outputfilenm, "_profiles")
     return string(first(splitext(basename(fftfile))), "_profiles")
+end
+
+"""
+    report_metricstats(stats, filename, params, threshold)
+
+Print a per-decimation summary of the metric distribution to `stderr` (to help
+choose `--threshold`) and write the full per-block table to `filename`.  The
+summary makes the key point visible: with `--metric non --pexp 0.5` the metric's
+noise floor grows ~`√nbins = √(2·Hk)`, so each decimation `k` sits at a
+different mean/max and a single `--threshold` is *not* comparable across them.
+"""
+function report_metricstats(stats::Vector{BlockMetricStats}, filename::String,
+                            params, threshold)
+    if isempty(stats)
+        @warn "No metric statistics collected (no blocks searched)"
+        return
+    end
+    summ = metricstats_summary(stats)
+
+    # --- per-decimation summary to stderr ---
+    println(stderr)
+    println(stderr, "Metric statistics by decimation  (metric=$(params.metric), pexp=$(params.pexp), threshold=$(threshold))")
+    println(stderr, "  Pure-noise floor scales ~sqrt(nbins); a fixed threshold is NOT comparable across k.")
+    @printf(stderr, "  %-3s %5s %6s %8s %11s %8s %8s %8s %8s %10s %8s\n",
+            "k", "Hk", "nbins", "nblocks", "ntrials",
+            "min", "median", "mean", "std", "blkmax", "max")
+    for r in summ
+        @printf(stderr, "  %-3d %5d %6d %8d %11d %8.3f %8.3f %8.3f %8.3f %10.3f %8.3f\n",
+                r.k, r.Hk, r.nbins, r.nblocks, r.ntrials,
+                r.min, r.median, r.mean, r.std, r.blockmax_mean, r.max)
+    end
+    println(stderr, "  (blkmax = mean of per-block maxima; max = global max — the worst noise excursion seen)")
+    println(stderr)
+
+    # --- full per-block table to file ---
+    open(filename, "w") do io
+        println(io, "# Per-block, per-decimation metric statistics")
+        println(io, "# metric=$(params.metric) pexp=$(params.pexp) xsignal=$(params.xsignal) nharms=$(params.nharms) threshold=$(threshold)")
+        println(io, "# nbins = 2*Hk; the pure-noise metric floor scales ~sqrt(nbins).")
+        @printf(io, "#%-7s %3s %4s %5s %10s %14s %14s %8s %9s %9s %9s %9s %9s\n",
+                "block", "k", "Hk", "nbins", "ngoodbins", "f_lo(Hz)", "f_hi(Hz)",
+                "n", "min", "median", "mean", "std", "max")
+        for s in stats
+            @printf(io, "%-8d %3d %4d %5d %10.3f %14.8f %14.8f %8d %9.3f %9.3f %9.3f %9.3f %9.3f\n",
+                    s.block, s.k, s.Hk, s.nbins, s.ngoodbins, s.flo, s.fhi,
+                    s.n, s.min, s.median, s.mean, s.std, s.max)
+        end
+    end
+    @info "Wrote per-block metric statistics" file=filename nrows=length(stats)
+    return
 end
 
 abspath(PROGRAM_FILE) == abspath(@__FILE__) && main(ARGS)

@@ -267,17 +267,51 @@ the throughput-tuning/tiling items below are lower-value than expected.
   metric's discontinuous on-pulse threshold). *Still worth doing:* validate
   against injected fake pulsars of varying width, and sweep `pexp` on real data.
 
-- **Threshold calibration across metric / `pexp` (to investigate).** The metric's
-  numeric scale is *not* comparable across `--metric` or `--pexp`, so a fixed
-  `--threshold` means different things in each configuration. On the test pulsar,
-  the same signal reads ~28 at `:non`/`pexp=0.5`, ~20 at `:non`/`pexp=1.0`, and
-  ~39 at `:sd2`/`pexp=0.5`; only `:non`/`pexp=1/2` is a calibrated equivalent-σ,
-  and even that is single-trial (no trials factor). We need to work out how the
-  detection threshold should be set for each metric/`pexp` — ideally derive (or
-  empirically fit, from pure-noise runs) the false-alarm rate vs. threshold for
-  each configuration so a single "sigma"-like knob has a consistent meaning, and
-  fold in the number of independent trials searched. Until then, `--threshold`
-  must be re-tuned by hand whenever `--metric` or `--pexp` changes.
+- **Threshold calibration across metric / `pexp` / decimation (to investigate).**
+  The metric's numeric scale is *not* comparable across `--metric` or `--pexp`,
+  so a fixed `--threshold` means different things in each configuration. On the
+  test pulsar, the same signal reads ~28 at `:non`/`pexp=0.5`, ~20 at
+  `:non`/`pexp=1.0`, and ~39 at `:sd2`/`pexp=0.5`; only `:non`/`pexp=1/2` is a
+  calibrated equivalent-σ, and even that is single-trial (no trials factor). We
+  need to work out how the detection threshold should be set for each
+  metric/`pexp` — ideally derive (or empirically fit, from pure-noise runs) the
+  false-alarm rate vs. threshold for each configuration so a single "sigma"-like
+  knob has a consistent meaning, and fold in the number of independent trials
+  searched. Until then, `--threshold` must be re-tuned by hand whenever
+  `--metric` or `--pexp` changes.
+  - **`nbins`-dependence of the noise floor — confirmed, and it bites under
+    decimation.** The pure-noise metric is *not* `nbins`-independent as the
+    `snr_metric` docstring hoped: with `:non`/`pexp=0.5` its whole distribution
+    scales as `√nbins = √(2·Hk)` (mean, min, max all shift up together; the std
+    stays ~constant). Measured on `PM0063…red.fft`, 5–30 Hz: mean metric / √nbins
+    ≈ 0.61–0.63, flat across `k=1..6`, so the raw mean runs 6.87 (k=1, 120 bins)
+    → 2.74 (k=6, 20 bins). Because harmonic decimation folds `nbins = 2·⌊nharms/k⌋`
+    (fewer bins at higher `k`), a single `--threshold` is systematically biased
+    toward the low-`k` (many-bin) decimations — at `threshold=6` the k=1 *median*
+    already sits above threshold, flooding the candidate list from one decimation
+    while k=5/6 contribute almost nothing. The cause is the adaptive on-pulse set:
+    under noise `N_on ∝ nbins`, and summing `N_on` selected noise excesses gives a
+    "signal" whose fluctuation grows as `√N_on ∝ √nbins`, which the `width^0.5 =
+    N_on^0.5` penalty does *not* cancel (it cancels the *count*, not the
+    selection-induced bias). A proper fix is a per-`nbins` (equivalently per-`k`)
+    threshold, or renormalising the metric by its measured pure-noise mean/σ at
+    each `nbins` so a single sigma-like threshold is comparable across
+    decimations. **Diagnose with `--metricstats`** (see below) before changing the
+    metric.
+
+- **`--metricstats` diagnostic (implemented).** `--metricstats` reports the
+  metric distribution — min / median / mean / std / max — for every processed
+  block *and* every harmonic decimation, without perturbing the candidate results
+  (verified byte-identical, and read-only by construction). A per-decimation
+  summary prints to `stderr` (the actionable view for picking `--threshold`: it
+  shows each `k`'s floor, the mean of per-block maxima, and the global max noise
+  excursion), and the full per-block table — with the per-block `ngoodbins` and
+  searched frequency range, so the extra Nyquist-limited drop in `ngoodbins` at
+  high frequency is visible too — is written to `<stem>_metricstats.txt` for
+  offline plotting/fitting. Plumbed through `search(...; metricstats=sink)`
+  ([`BlockMetricStats`](@ref), [`metricstats_summary`](@ref)); collection allocates
+  only a per-task metric buffer and is disabled by default. This is the data
+  source for the false-alarm-rate-vs-threshold fit the calibration item needs.
 
 - **Default metric produces many non-pulsar-like false positives (to
   investigate; may change defaults).** On real data the current defaults
