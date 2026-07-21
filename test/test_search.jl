@@ -341,6 +341,35 @@ if isfile(EXAMPLE_FFT)
         @test all(r.ntrials > 0 for r in wrows)
         @test Set(r.k for r in wrows) ⊆ Set([1, 2, 3])
     end
+
+    @testset "normalize: two-pass adaptive threshold" begin
+        nharms = 60
+        params = SearchParams(nharms=nharms, decimations=decimation_set(nharms, 3))
+        # This example file is signal-dominated (huge metric values), so widen the
+        # histogram range via the sink so the noise loc/scale are well resolved.
+        ms = MetricStats(hist_hi=30000.0, hist_nb=6000, nwin=8)
+        kw = (lofreq=9.5, hifreq=10.5, blocksize=1024)
+        cands = search(ft, params; kw..., threshold=5.0, metricstats=ms, normalize=true)
+        @test !isempty(ms.hists)                       # pass 1 measured the noise
+        @test any(isapprox(c.freq, 10.0123; atol=1e-2) for c in cands)   # still detects
+
+        # build_metricnorm: per-k edges/loc/scale, all scales strictly positive,
+        # loc equals the histogram median, and normalization is monotone in M.
+        norm = build_metricnorm(ms)
+        @test Set(keys(norm.loc)) == Set([1, 2, 3])
+        for g in ms.hists
+            k = g.k
+            @test length(norm.loc[k]) == ms.nwin
+            @test all(>(0), norm.scale[k])
+            @test all(g.vmin <= l <= g.vmax for l in norm.loc[k])   # loc within the data
+        end
+        f = 10.0123
+        @test CoherentSearch._normalize(norm, 1, f, 200.0) >
+              CoherentSearch._normalize(norm, 1, f, 100.0)
+
+        # Normalizing must not perturb the *measurement* pass: the pulsar is found.
+        @test !isempty(cands)
+    end
 else
     @info "Skipping search data tests; example file not found" EXAMPLE_FFT
 end

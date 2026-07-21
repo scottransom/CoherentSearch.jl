@@ -124,6 +124,9 @@ function parse_cmdline(argv)
         "--metricstats"
             help = "Report per-block, per-decimation metric stats (min/median/mean/std/max) to help set --threshold; writes a full per-block table to <stem>_metricstats.txt"
             action = :store_true
+        "--normalize"
+            help = "Adaptive threshold: a first pass measures the per-(decimation,frequency) noise, then the metric is normalised to a significance before thresholding (--threshold is then in noise-sigma units, comparable across decimations). Doubles the runtime."
+            action = :store_true
         "--noplot"
             help = "Do not plot the candidate pulse profiles (plotting is on by default)"
             action = :store_true
@@ -171,7 +174,8 @@ function main(argv)
                    blocksize = a["blocksize"], threshold = a["threshold"],
                    remove = !a["noremove"], dr_tol = a["drtol"],
                    harm_remove = !a["noharmremove"], numharm = a["numharm"],
-                   progress = progress, metricstats = mstats)
+                   progress = progress, metricstats = mstats,
+                   normalize = a["normalize"])
 
     if mstats !== nothing
         base = isempty(a["outputfilenm"]) ?

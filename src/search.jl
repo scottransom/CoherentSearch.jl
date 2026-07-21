@@ -877,6 +877,90 @@ trials) are dropped.  This is where the red-noise (low-`f`) and Nyquist-rolloff
 metricstats_windows(ms::MetricStats; faps=(0.1, 0.01, 1e-3, 1e-4)) =
     [_hist_row(h, faps) for h in ms.whists if h.total > 0]
 
+# ---------------------------------------------------------------------------
+# In-situ metric normalisation (the `--normalize` adaptive-threshold search)
+# ---------------------------------------------------------------------------
+
+const _MIN_WIN_TRIALS = 200            # below this, a window uses the per-k global loc/scale
+
+"""
+    MetricNorm
+
+A per-`(k, searched-frequency window)` normalisation of the detection metric,
+built from a first ([`MetricStats`](@ref)-collecting) pass (see
+[`build_metricnorm`](@ref)) and applied on a second: the raw metric `M` of a
+trial at decimation `k` and searched spin frequency `f` (Hz) becomes
+
+    z = (M − loc(k,f)) / scale(k,f)
+
+with `loc` the window's noise median and `scale` its upper-side robust spread
+(`q(0.8413) − median`, Gaussian-calibrated to one `σ` and taken from the noise
+bulk so signals/RFI in the tail do not bias it).  This makes a single threshold
+mean a *consistent* noise level across every decimation and across frequency —
+collapsing the `√nbins` per-`k` floor and the red-noise / Nyquist frequency
+drift that `--metricstats` exposes.  `z` is a comparable *significance* (used as
+the reported metric and for cross-`k` candidate ranking), but note it is only a
+true equivalent-`σ` where the noise is Gaussian; the right-skewed metric makes
+`z` an over-estimate deep in the tail — an absolute calibration (pure-noise
+simulation, with the `ngoodbins` Nyquist rolloff handled semi-analytically) is
+the intended follow-up.  Per-window estimates fall back to a per-`k` global one
+where a window has too few trials (`< $(_MIN_WIN_TRIALS)`) or a degenerate scale.
+"""
+struct MetricNorm
+    edges::Dict{Int,Vector{Float64}}   # per-k searched-frequency window edges (Hz)
+    loc::Dict{Int,Vector{Float64}}     # per-k, per-window location (noise median)
+    scale::Dict{Int,Vector{Float64}}   # per-k, per-window scale (upper 1σ-equivalent)
+end
+
+# Robust (loc, scale) of a single histogram; scale ≤ 0 → NaN (caller falls back).
+function _loc_scale(h::MetricHistogram)
+    loc = hist_quantile(h, 0.5)
+    scale = hist_quantile(h, 0.8413) - loc      # upper 1σ-equivalent, noise-bulk
+    return loc, (scale > 0 ? scale : NaN)
+end
+
+"""
+    build_metricnorm(ms) -> MetricNorm
+
+Build a [`MetricNorm`](@ref) from a filled [`MetricStats`](@ref): per `(k,
+window)` a robust noise location/scale (see [`MetricNorm`](@ref)), with a per-`k`
+band-wide fallback for sparse or degenerate windows.
+"""
+function build_metricnorm(ms::MetricStats)
+    edges = Dict{Int,Vector{Float64}}()
+    locs = Dict{Int,Vector{Float64}}()
+    scales = Dict{Int,Vector{Float64}}()
+    for g in ms.hists                            # one per k (band-wide fallback)
+        k = g.k
+        gloc, gscale = _loc_scale(g)
+        isnan(gscale) && (gscale = 1.0)          # fully degenerate k: identity-ish
+        wins = sort([h for h in ms.whists if h.k == k]; by = h -> h.win)
+        isempty(wins) && continue
+        edges[k] = vcat([h.flo for h in wins], wins[end].fhi)
+        L = length(wins)
+        locv = Vector{Float64}(undef, L)
+        sclv = Vector{Float64}(undef, L)
+        for (i, h) in enumerate(wins)
+            wloc, wscale = _loc_scale(h)
+            if h.total < _MIN_WIN_TRIALS || isnan(wscale)
+                locv[i], sclv[i] = gloc, gscale    # fall back to the k-global estimate
+            else
+                locv[i], sclv[i] = wloc, wscale
+            end
+        end
+        locs[k], scales[k] = locv, sclv
+    end
+    return MetricNorm(edges, locs, scales)
+end
+
+# Normalise raw metric `M` for decimation `k` at searched frequency `f` (Hz).
+@inline function _normalize(norm::MetricNorm, k::Integer, f::Real, M::Real)
+    e = get(norm.edges, k, nothing)
+    e === nothing && return M            # no model for this k (should not happen)
+    w = _window_index(e, f)
+    @inbounds return (M - norm.loc[k][w]) / norm.scale[k][w]
+end
+
 """
     decim_pass!(out, ws, db, ft, params, rstart, lodr, n; threshold, block, stats)
 
@@ -889,15 +973,19 @@ harmonics) to `out`.  Trials whose decimated fundamental `k·rf` reaches Nyquist
 are skipped.  Nearly free relative to the interpolation the base pass paid.
 
 When a `stats` sink (a `Vector{BlockMetricStats}`) is passed, every folded
-trial's metric is gathered into a [`BlockMetricStats`](@ref) for this
+trial's (raw) metric is gathered into a [`BlockMetricStats`](@ref) for this
 `(block, k)`, and (if a `hist` is also passed) streamed into the per-`k`
-[`MetricHistogram`](@ref) — the opt-in `--metricstats` diagnostic.
+[`MetricHistogram`](@ref) — the opt-in `--metricstats` diagnostic.  When a
+[`MetricNorm`](@ref) `norm` is passed, each trial's raw metric is normalised to a
+significance `z` before the `threshold` test, and `z` (not the raw metric) is
+recorded in the candidate — the `--normalize` adaptive-threshold path.
 """
 function decim_pass!(out::Vector{Candidate}, ws::Workspace, db::DecimBuf, ft::FFTFile,
                      params::SearchParams, rstart::Real, lodr::Real, n::Integer;
                      threshold::Real=params.threshold, block::Integer=0,
                      stats::Union{Nothing,Vector{BlockMetricStats}}=nothing,
-                     hist::Union{Nothing,MetricHistogram}=nothing)
+                     hist::Union{Nothing,MetricHistogram}=nothing,
+                     norm::Union{Nothing,MetricNorm}=nothing)
     k = db.k
     Hk = db.Hk
     nbins = 2Hk
@@ -923,8 +1011,10 @@ function decim_pass!(out::Vector{Candidate}, ws::Workspace, db::DecimBuf, ft::FF
             push!(mbuf, mval)
             hist === nothing || _hist_push!(hist, mval)
         end
-        if mval > threshold
-            push!(out, Candidate(r_dec / ft.T, mval, r_dec, Hk))
+        fdec = r_dec / ft.T
+        score = norm === nothing ? mval : _normalize(norm, k, fdec, mval)
+        if score > threshold
+            push!(out, Candidate(fdec, score, r_dec, Hk))
         end
     end
     if mbuf !== nothing && !isempty(mbuf)
@@ -957,59 +1047,23 @@ function chunk_metrics(ft::FFTFile, params::SearchParams, rstart::Real, n::Integ
     return [_profile_snr(ws.profs, j, ws.medbuf, nbins, invrms, 1.0 / nbins, params.xsignal, params.metric, params.pexp) for j in 1:n]
 end
 
-"""
-    search(ft, params; lofreq, hifreq, lobin, blocksize, threshold) -> Vector{Candidate}
-
-Run the full coherent harmonic-summing search over `[lofreq, hifreq]` Hz,
-parallelised across independent fundamental-frequency chunks of `blocksize`
-trials each.  Each task owns a private [`Workspace`](@ref); all FFTW plans and
-interpolation kernels are built once before the parallel region.
-
-The `lofreq`/`lobin` precedence matches the Python CLI: `lofreq` is used unless
-`lobin` is set to something other than its default of 100.
-
-Candidate post-processing: near-identical clusters are collapsed by
-[`remove_duplicates`](@ref) (`remove`, `dr_tol`), then harmonically-related
-candidates by [`remove_harmonics`](@ref) (`harm_remove`, `numharm`, `harm_tol`).
-`progress` (`:none`, `:text`, or `:bar`) prints a chunk-completion meter to
-`stderr`.
-
-If a [`MetricStats`](@ref) is supplied as `metricstats`, the metric of *every*
-trial (not just those above `threshold`) is accumulated into it — per-block,
-per-decimation [`BlockMetricStats`](@ref) plus [`MetricHistogram`](@ref)s both
-per-`k` and per-`(k, log-spaced searched-frequency window)` for empirical
-(frequency-resolved) quantiles — the opt-in `--metricstats` diagnostic.  The
-candidate results are identical whether or not `metricstats` is collected.
-"""
-function search(ft::FFTFile, params::SearchParams=SearchParams();
-                lofreq::Real=0.1, hifreq::Real=100.0, lobin::Integer=100,
-                blocksize::Integer=2048, threshold::Real=params.threshold,
-                remove::Bool=true, dr_tol::Real=1.0,
-                harm_remove::Bool=true, numharm::Integer=16, harm_tol::Real=1.0,
-                progress::Symbol=:none,
-                metricstats::Union{Nothing,MetricStats}=nothing)
-    progress in (:none, :text, :bar) ||
-        throw(ArgumentError("progress must be :none, :text or :bar, got :$progress"))
-    FFTW.set_num_threads(1)   # parallelise at the Julia-task level, not inside FFTW
-    lodr = params.hidr / params.nharms
-    nbins = 2 * params.nharms
-    # Faithful (if brittle) port of the Python precedence rule.
-    r_lo = lofreq * ft.T
-    if lobin != 100
-        r_lo = float(lobin)
-    end
-    r_hi = hifreq * ft.T
-
-    total = max(0, floor(Int, (r_hi - r_lo) / lodr) + 1)
-    total == 0 && return Candidate[]
-    Nprof = max(1, Int(blocksize))
-    nchunks = cld(total, Nprof)
-
-    hplans = build_harmonic_plans(params, Nprof)
-    nt = max(1, min(nthreads(), nchunks))
-    # Planning is not thread-safe: build all workspaces serially, here.
-    workspaces = [Workspace(params, hplans, Nprof) for _ in 1:nt]
-
+# ---------------------------------------------------------------------------
+# The parallel candidate-finding region, shared by both search passes.
+#
+# Runs the chunk-parallel loop once over `[r_lo, r_hi]`, returning the
+# above-`threshold` candidates.  If `metricstats` is set it accumulates the
+# per-block / per-(k,window) diagnostics (on the *raw* metric); if `norm` is set
+# each trial's metric is normalised to a significance before the threshold test
+# and that significance is what the candidate records.  Both `search` passes call
+# this: pass 1 with `norm=nothing`+`metricstats` (measure), pass 2 with the built
+# `norm` (detect).  Workspaces are reusable scratch, so both passes share them.
+# ---------------------------------------------------------------------------
+function _search_region!(ft::FFTFile, params::SearchParams, hplans::Vector{HarmonicPlan},
+                         workspaces::Vector{<:Workspace}, nbins::Integer,
+                         r_lo::Real, r_hi::Real, lodr::Real, total::Integer,
+                         Nprof::Integer, nchunks::Integer, nt::Integer;
+                         threshold::Real, norm::Union{Nothing,MetricNorm},
+                         metricstats::Union{Nothing,MetricStats}, progress::Symbol)
     collect_stats = metricstats !== nothing
     # Decimation factors present (base pass = k=1, plus each Workspace DecimBuf).
     statks = collect_stats ? sort!(unique(vcat(1, [db.k for db in workspaces[1].decims]))) : Int[]
@@ -1055,9 +1109,10 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
                         mbuf[j] = metric
                         _hist_push!(basehist, metric)
                     end
-                    if metric > threshold
-                        rf = rstart + (j - 1) * lodr
-                        push!(out, Candidate(rf / ft.T, metric, rf, params.nharms))
+                    rf = rstart + (j - 1) * lodr
+                    score = norm === nothing ? metric : _normalize(norm, 1, rf / ft.T, metric)
+                    if score > threshold
+                        push!(out, Candidate(rf / ft.T, score, rf, params.nharms))
                     end
                 end
                 if collect_stats
@@ -1071,7 +1126,7 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
                     whist = collect_stats ?
                         hists[db.k][_window_index(wedges[db.k], db.k * rmean / ft.T)] : nothing
                     decim_pass!(out, ws, db, ft, params, rstart, lodr, n;
-                                threshold=threshold, block=c, stats=stats, hist=whist)
+                                threshold=threshold, block=c, stats=stats, hist=whist, norm=norm)
                 end
                 atomic_add!(done, 1)
                 # One task owns the display (avoids interleaved \r writes); it reads
@@ -1112,8 +1167,95 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
         sort!(metricstats.hists;  by = h -> h.k)
         sort!(metricstats.whists; by = h -> (h.k, h.win))
     end
+    return reduce(vcat, results; init=Candidate[])
+end
 
-    cands = reduce(vcat, results; init=Candidate[])
+"""
+    search(ft, params; lofreq, hifreq, lobin, blocksize, threshold) -> Vector{Candidate}
+
+Run the full coherent harmonic-summing search over `[lofreq, hifreq]` Hz,
+parallelised across independent fundamental-frequency chunks of `blocksize`
+trials each.  Each task owns a private [`Workspace`](@ref); all FFTW plans and
+interpolation kernels are built once before the parallel region.
+
+The `lofreq`/`lobin` precedence matches the Python CLI: `lofreq` is used unless
+`lobin` is set to something other than its default of 100.
+
+Candidate post-processing: near-identical clusters are collapsed by
+[`remove_duplicates`](@ref) (`remove`, `dr_tol`), then harmonically-related
+candidates by [`remove_harmonics`](@ref) (`harm_remove`, `numharm`, `harm_tol`).
+`progress` (`:none`, `:text`, or `:bar`) prints a chunk-completion meter to
+`stderr`.
+
+If a [`MetricStats`](@ref) is supplied as `metricstats`, the metric of *every*
+trial (not just those above `threshold`) is accumulated into it — per-block,
+per-decimation [`BlockMetricStats`](@ref) plus [`MetricHistogram`](@ref)s both
+per-`k` and per-`(k, log-spaced searched-frequency window)` for empirical
+(frequency-resolved) quantiles — the opt-in `--metricstats` diagnostic.  The
+candidate results are identical whether or not `metricstats` is collected.
+
+If `normalize` is set, the search runs in **two passes**: pass 1 measures the
+per-`(k, frequency window)` noise statistics (as `metricstats` does — the same
+`metricstats` sink is filled if given), pass 2 builds a [`MetricNorm`](@ref) from
+them and re-runs, thresholding on the normalised significance `z` rather than the
+raw metric (and recording `z` as each candidate's metric).  This makes a single
+`threshold` mean a consistent noise level across every decimation and frequency —
+so `threshold` is then in noise-`σ`-like units, not raw-metric units — and makes
+candidate metrics comparable across decimations (improving the cross-`k`
+[`remove_harmonics`](@ref) ranking).  It roughly doubles the runtime (two full
+passes) and assumes the input is normalised (see [`MetricNorm`](@ref)).
+"""
+function search(ft::FFTFile, params::SearchParams=SearchParams();
+                lofreq::Real=0.1, hifreq::Real=100.0, lobin::Integer=100,
+                blocksize::Integer=2048, threshold::Real=params.threshold,
+                remove::Bool=true, dr_tol::Real=1.0,
+                harm_remove::Bool=true, numharm::Integer=16, harm_tol::Real=1.0,
+                progress::Symbol=:none,
+                metricstats::Union{Nothing,MetricStats}=nothing,
+                normalize::Bool=false)
+    progress in (:none, :text, :bar) ||
+        throw(ArgumentError("progress must be :none, :text or :bar, got :$progress"))
+    FFTW.set_num_threads(1)   # parallelise at the Julia-task level, not inside FFTW
+    lodr = params.hidr / params.nharms
+    nbins = 2 * params.nharms
+    # Faithful (if brittle) port of the Python precedence rule.
+    r_lo = lofreq * ft.T
+    if lobin != 100
+        r_lo = float(lobin)
+    end
+    r_hi = hifreq * ft.T
+
+    total = max(0, floor(Int, (r_hi - r_lo) / lodr) + 1)
+    total == 0 && return Candidate[]
+    Nprof = max(1, Int(blocksize))
+    nchunks = cld(total, Nprof)
+
+    hplans = build_harmonic_plans(params, Nprof)
+    nt = max(1, min(nthreads(), nchunks))
+    # Planning is not thread-safe: build all workspaces serially, here.
+    workspaces = [Workspace(params, hplans, Nprof) for _ in 1:nt]
+
+    norm = nothing
+    if normalize
+        # Pass 1/2: measure the per-(k, frequency window) noise, build the model.
+        # Reuse the user's metricstats sink if given (same measurement); else an
+        # internal one.  threshold=Inf skips candidate bookkeeping in this pass.
+        normstats = metricstats === nothing ? MetricStats() : metricstats
+        @info "Normalising: measuring per-(k,frequency) noise (pass 1/2)"
+        _search_region!(ft, params, hplans, workspaces, nbins, r_lo, r_hi, lodr,
+                        total, Nprof, nchunks, nt;
+                        threshold=Inf, norm=nothing, metricstats=normstats, progress=progress)
+        norm = build_metricnorm(normstats)
+        @info "Built in-situ normalisation model; searching (pass 2/2)" windows=normstats.nwin
+    end
+
+    # Detection pass.  When normalising, stats were collected in pass 1, so pass 2
+    # does not re-collect (metricstats=nothing here).
+    cands = _search_region!(ft, params, hplans, workspaces, nbins, r_lo, r_hi, lodr,
+                            total, Nprof, nchunks, nt;
+                            threshold=threshold, norm=norm,
+                            metricstats=(normalize ? nothing : metricstats), progress=progress)
+
     ntotal = length(cands)
     @info "Search complete; post-processing candidates" total_above_threshold=ntotal
     if remove

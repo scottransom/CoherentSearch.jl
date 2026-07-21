@@ -340,24 +340,42 @@ the throughput-tuning/tiling items below are lower-value than expected.
     histograms); the `stderr` summary adds a FAP=1e-4-vs-frequency drift line per
     `k`. These per-`(k, f)` empirical quantiles are exactly the substrate the
     dynamic normalisation path needs.
-  *Next increment:* a pure-noise-simulation calibration to give the quantiles an
-  absolute equivalent-σ meaning (fold in the trials factor) and validate the
-  in-situ estimator, then wire the per-`(k, f)` normalisation into the detection
-  threshold itself.
+  The per-`(k, f)` normalisation is now wired into detection via `--normalize`
+  (see the threshold-calibration item below); a pure-noise-simulation calibration
+  to give the normalised significance an absolute equivalent-σ meaning is the
+  remaining step.
 
-- **Threshold-calibration plan — hybrid, in progress.** The agreed direction:
-  (1) *dynamic, in-situ* per-`k` normalisation as the shipping default — measure
-  each decimation's noise location/scale (better: empirical tail *quantile*, since
-  the metric is non-Gaussian and only shift-, not scale-, invariant across
-  `nbins`) from the search data itself, in frequency-local windows, so it absorbs
-  the real data's normalisation, red-noise residual, and Nyquist rolloff that a
-  static table cannot know; threshold on the normalised statistic (or equalise
-  the empirical per-`k` false-alarm rate directly). (2) *Offline pure-noise
-  simulation* (or a semi-analytic `μ(nbins)≈a√nbins+b`, `σ≈const` fit plus one
-  tail template, since measured `σ` is ~flat across `k` while the mean scales
-  `√nbins`) to give the normalised statistic an absolute FAP/equivalent-σ with the
-  trials factor folded in, and to validate that the in-situ estimator matches
-  ideal noise. `--metricstats`' per-`k` histograms are step one.
+- **Threshold-calibration plan — hybrid; in-situ half implemented.** The agreed
+  direction: (1) *dynamic, in-situ* per-`(k, frequency)` normalisation, measured
+  from the search data itself so it absorbs the real data's normalisation,
+  red-noise residual, and Nyquist rolloff that a static table cannot know;
+  (2) *offline pure-noise simulation* to give that normalised statistic an
+  absolute FAP/equivalent-σ (trials factor folded in) and validate the in-situ
+  estimator against ideal noise.
+  - **(1) `--normalize` (implemented).** A two-pass search: pass 1 measures the
+    per-`(k, frequency window)` noise (the `--metricstats` machinery), pass 2
+    builds a [`MetricNorm`](@ref) and thresholds on the normalised significance
+    `z = (M − loc)/scale` instead of the raw metric (recording `z` as the
+    candidate metric, which also makes the cross-`k` `remove_harmonics` ranking
+    comparable). `loc` is the window's noise median and `scale` its upper-side
+    robust spread `q(0.8413) − median` (Gaussian-calibrated, taken from the
+    noise bulk so tail signals/RFI don't bias it), with a per-`k` band-wide
+    fallback for sparse/degenerate windows. Verified on `PM0063…red.fft`
+    (5–30 Hz, threshold 6): raw gives ~100 candidates dominated by one
+    decimation (94/100 at `Hk=30`), while `--normalize` gives 6 spanning `k =
+    1,4,5,6` — the `√nbins` + frequency flood is gone — with the true 7.1187 Hz
+    pulsar still ranked first. Costs ~2× runtime (two full passes; a subsampled
+    measuring pass is a possible optimisation) and assumes a normalised input.
+    *Limitation:* `z` is only a true equivalent-σ where the noise is Gaussian;
+    the right-skewed metric makes `z` an over-estimate deep in the tail, so a
+    fixed `z` threshold is *comparable* across `(k, f)` but not yet an absolute
+    σ — that is what (2) fixes.
+  - **(2) pure-noise simulation (next).** Fit the noise distribution's absolute
+    FAP-vs-`z` tail from Monte-Carlo pure noise, handling the `ngoodbins` Nyquist
+    rolloff semi-analytically (it enters the metric only through
+    `invrms = √(2·ngoodbins+1)` plus the reduced harmonic count), then map `z` to
+    a true equivalent-σ and validate that the in-situ `loc`/`scale` match ideal
+    noise. The `--metricstats` per-`(k, f)` histograms are the validation data.
 
 - **Default metric produces many non-pulsar-like false positives (to
   investigate; may change defaults).** On real data the current defaults
