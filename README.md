@@ -47,6 +47,26 @@ crossval/             Python-as-oracle accuracy + speed cross-validation
   numpy's `np.fft.irfft` (both ignore the imaginary parts of the DC/Nyquist
   bins); this is verified directly in the tests.
 
+## Installation and first use
+
+If you've never used Julia before, install it using either your systems package
+manager, or via a method from <https://julialang.org/downloads/>.
+On Linux or Mac, the following should work:
+
+```sh
+curl -fsSL https://install.julialang.org | sh
+```
+
+Clone this repo, and cd into the top-level directory. Then do:
+
+```sh
+julia --project=. -e 'using Pkg; Pkg.instantiate()'
+```
+
+That will install all of the Julia requirements and compile them. That will
+likely take several minutes. When it is complete, you can run the tests and
+programs as described below.
+
 ## Usage
 
 Run the CLI (use `-t auto` so Julia uses all cores):
