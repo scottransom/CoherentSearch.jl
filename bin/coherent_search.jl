@@ -131,6 +131,13 @@ function parse_cmdline(argv)
         "--normalize"
             help = "Adaptive threshold: a first pass measures the per-(decimation,frequency) noise, then the metric is normalised to a significance before thresholding (--threshold is then in noise-sigma units, comparable across decimations). Doubles the runtime."
             action = :store_true
+        "--nowisdom"
+            help = "Do not import/export the FFTW plan-wisdom cache (planning is re-measured every run)"
+            action = :store_true
+        "--wisdomfile"
+            help = "Path to the FFTW plan-wisdom cache (default: per-host file under the Julia depot, or \$COHERENT_WISDOM)"
+            arg_type = String
+            default = ""
         "--noplot"
             help = "Do not plot the candidate pulse profiles (plotting is on by default)"
             action = :store_true
@@ -179,7 +186,9 @@ function main(argv)
                    remove = !a["noremove"], dr_tol = a["drtol"],
                    harm_remove = !a["noharmremove"], numharm = a["numharm"],
                    progress = progress, metricstats = mstats,
-                   normalize = a["normalize"])
+                   normalize = a["normalize"],
+                   wisdom = !a["nowisdom"],
+                   wisdom_file = isempty(a["wisdomfile"]) ? nothing : a["wisdomfile"])
 
     if mstats !== nothing
         base = isempty(a["outputfilenm"]) ?

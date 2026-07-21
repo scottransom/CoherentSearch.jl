@@ -331,18 +331,22 @@ shows a near-threshold broad-signal miss.
   smaller overlapping transforms only matters if a future capped `fftlen` is
   forced (e.g. a memory-constrained `ComplexF32` mode); `fill_harmonic_row!`
   leaves room for the tile loop, but it is not a throughput win on its own.
-- **Start-up latency: persist FFTW wisdom (to investigate).** A short search
-  spends a disproportionate share of wall-time *before* the hot loop: Julia's own
-  load/precompile plus the `FFTW.MEASURE` planning of every distinct `fftlen`
-  (built single-threaded up front — the more so if a future mode uses `PATIENT`).
-  `MEASURE` re-times the transforms on *every* process start. FFTW's plan cache is
-  serialisable: run a one-time (optionally `PATIENT`) planning pass and
-  `FFTW.export_wisdom(path)`, then `FFTW.import_wisdom(path)` at start-up so
-  planning collapses to a wisdom lookup. Store per-host (wisdom is CPU-specific);
-  keep `MEASURE` as the fallback when no wisdom covers a size. This attacks the
-  FFTW share of start-up specifically; the residual Julia load/precompile latency
-  is a separate, heavier question (sysimage / `PackageCompiler`) worth a look only
-  if the wisdom cache doesn't move the needle enough.
+- **Start-up latency: persist FFTW wisdom (implemented, 2026-07-21).** A short
+  search spent several seconds *before* the hot loop planning every distinct
+  transform with `FFTW.MEASURE`, re-timed on every process start (building all
+  plans for the standard `maxdecim 6` config measured at **4.3 s cold**). FFTW's
+  plan cache is serialisable, so `search` now `import_wisdom!`s before planning and
+  `export_wisdom!`s after (`src/wisdom.jl`; `wisdom=false` / `--nowisdom` disables,
+  `--wisdomfile`/`$COHERENT_WISDOM` set the path, default per-host under the depot).
+  With wisdom present the same planning is **13.7 ms (~315×)**. The default
+  `MEASURE` path is **byte-identical** to cold planning (verified: candidate files
+  match), so this is a free start-up win. `bin/prime_wisdom.jl` / `prime_wisdom`
+  optionally do a one-time `FFTW.PATIENT` pass whose better plans a later `MEASURE`
+  run reuses directly — *caveat:* PATIENT may pick a different algorithm than
+  MEASURE, perturbing results at the ~1e-16 level (harmless for detection, but not
+  bit-identical to a MEASURE run; the oracle pins' tolerances absorb it). The
+  residual Julia load/precompile latency (~1 s) is the separate, heavier sysimage /
+  `PackageCompiler` question, worth a look only if it becomes the bottleneck.
 - **Candidate de-duplication (implemented).** `remove_duplicates` (wired to the
   default; `--noremove` now disables it) collapses the run of adjacent trial
   fundamentals a single signal lights up down to its strongest member: sort by

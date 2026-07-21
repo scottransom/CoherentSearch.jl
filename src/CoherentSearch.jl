@@ -30,6 +30,10 @@ export SearchParams, Candidate, search, search_block, block_metrics, coherent_pr
        MetricNorm, build_metricnorm
 include("search.jl")
 
+# --- FFTW plan-wisdom persistence (faster planning / start-up) ---
+export wisdom_path, import_wisdom!, export_wisdom!, prime_wisdom
+include("wisdom.jl")
+
 # --- Per-candidate profile reconstruction (for plotting) ---
 export candidate_profile, rotate_to_peak
 include("candidate.jl")

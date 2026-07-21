@@ -680,6 +680,13 @@ function build_harmonic_plans(params::SearchParams, Nprof::Integer)
     return plans
 end
 
+# FFTW planning rigor used by every plan constructor below.  A mutable ref (not a
+# hardcoded flag) so `prime_wisdom` can temporarily raise it to `FFTW.PATIENT` for
+# a one-time, more-thorough planning pass whose result is cached as wisdom; normal
+# runs stay at `FFTW.MEASURE`.  See `wisdom.jl`.
+const _PLAN_RIGOR = Ref{UInt32}(FFTW.MEASURE)
+plan_rigor() = _PLAN_RIGOR[]
+
 """
     FFTScratch
 
@@ -698,8 +705,8 @@ function FFTScratch(fftlen::Integer)
     ftarr = zeros(ComplexF64, fftlen)
     spec  = Vector{ComplexF64}(undef, fftlen)
     corr  = Vector{ComplexF64}(undef, fftlen)
-    fwd = plan_fft(ftarr; flags=FFTW.MEASURE)
-    bwd = plan_bfft(spec;  flags=FFTW.MEASURE)
+    fwd = plan_fft(ftarr; flags=plan_rigor())
+    bwd = plan_bfft(spec;  flags=plan_rigor())
     fill!(ftarr, 0)   # MEASURE planning may have dirtied the buffer
     return FFTScratch(ftarr, spec, corr, fwd, bwd)
 end
@@ -732,7 +739,7 @@ function DecimBuf(k::Integer, nharms::Integer, Nprof::Integer, params::SearchPar
     dftprofs = zeros(ComplexF64, Hk + 1, Nprof)
     dprofs   = Matrix{Float64}(undef, 2Hk, Nprof)
     medbuf   = Vector{Float64}(undef, 2Hk)
-    brfftplan = plan_brfft(dftprofs, 2Hk, 1; flags=FFTW.MEASURE)
+    brfftplan = plan_brfft(dftprofs, 2Hk, 1; flags=plan_rigor())
     fill!(dftprofs, 0)   # MEASURE planning may have dirtied the buffer
     bcwidths = boxcar_widths(2Hk; fsp=params.boxcar_fsp, maxfrac=params.boxcar_maxfrac)
     bcpsum   = Vector{Float64}(undef, 2Hk + bcwidths[end] + 1)
@@ -777,7 +784,7 @@ function Workspace(params::SearchParams, hplans::Vector{HarmonicPlan}, Nprof::In
     ftprofs = zeros(ComplexF64, nh + 1, Nprof)
     profs   = Matrix{Float64}(undef, 2nh, Nprof)
     medbuf  = Vector{Float64}(undef, 2nh)
-    brfftplan = plan_brfft(ftprofs, 2nh, 1; flags=FFTW.MEASURE)
+    brfftplan = plan_brfft(ftprofs, 2nh, 1; flags=plan_rigor())
     fill!(ftprofs, 0)   # MEASURE planning may have dirtied the buffer
     bcwidths = boxcar_widths(2nh; fsp=params.boxcar_fsp, maxfrac=params.boxcar_maxfrac)
     bcpsum   = Vector{Float64}(undef, 2nh + bcwidths[end] + 1)
@@ -1502,7 +1509,8 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
                 harm_remove::Bool=true, numharm::Integer=16, harm_tol::Real=1.0,
                 progress::Symbol=:none,
                 metricstats::Union{Nothing,MetricStats}=nothing,
-                normalize::Bool=false)
+                normalize::Bool=false,
+                wisdom::Bool=true, wisdom_file::Union{Nothing,AbstractString}=nothing)
     progress in (:none, :text, :bar) ||
         throw(ArgumentError("progress must be :none, :text or :bar, got :$progress"))
     FFTW.set_num_threads(1)   # parallelise at the Julia-task level, not inside FFTW
@@ -1520,10 +1528,18 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
     Nprof = max(1, Int(blocksize))
     nchunks = cld(total, Nprof)
 
+    # Load saved FFTW wisdom so the (single-threaded, up-front) MEASURE planning
+    # below collapses to a lookup; persist it afterwards so the first run teaches
+    # every subsequent one.  Off with `wisdom=false`.
+    wpath = wisdom ? (wisdom_file === nothing ? wisdom_path() : String(wisdom_file)) : ""
+    wisdom && import_wisdom!(wpath)
+
     hplans = build_harmonic_plans(params, Nprof)
     nt = max(1, min(nthreads(), nchunks))
     # Planning is not thread-safe: build all workspaces serially, here.
     workspaces = [Workspace(params, hplans, Nprof) for _ in 1:nt]
+
+    wisdom && export_wisdom!(wpath)
 
     norm = nothing
     if normalize
