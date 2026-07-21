@@ -15,7 +15,7 @@ const FILE = length(ARGS) >= 1 ? ARGS[1] : "PM0063_034C1_DM445.0_red.fft"
 
 ft = FFTFile(FILE)
 nharms = 60
-params = SearchParams(nharms=nharms, threshold=6.0, metric=:sd2, pexp=0.5,
+params = SearchParams(nharms=nharms, threshold=6.0, metric=:boxcar,
                       decimations=decimation_set(nharms, 6))
 Nprof = 2048
 lodr  = params.hidr / params.nharms
@@ -86,29 +86,31 @@ let hp = hplans[1]
 end
 println("-"^70)
 
-# --- Bucket 3: _profile_snr over a full chunk of profiles ---------------------
-let profs = ws.profs, nbins = 2nharms, medbuf = ws.medbuf
-    invrms = sqrt(2 * CS.chunk_ngoodbins(ft, nharms, rstart) + 1)
-    function snr_all(profs, medbuf, nbins, invrms, xsignal, metric, pexp, n)
+# --- Bucket 3: the boxcar metric over a full chunk of profiles ----------------
+# Two parts: (a) one per-block robust σ (_block_sigma: two MADs over a strided
+# subsample), amortised across the whole block; (b) _profile_boxcar per profile
+# (per-profile median + prefix sum + width×phase matched-filter scan).
+let profs = ws.profs, nbins = 2nharms, medbuf = ws.medbuf,
+    widths = ws.bcwidths, psum = ws.bcpsum, sigbuf = ws.bcsig
+    println("boxcar widths (nbins=$nbins): ", widths, "   (", length(widths), " widths)")
+
+    b_sig = @benchmark CS._block_sigma($profs, $nbins, $Nprof, $sigbuf)
+    println("_block_sigma  (once per block, nbins=$nbins, Nprof=$Nprof):  ",
+            BenchmarkTools.prettytime(minimum(b_sig).time),
+            "  => ", round(minimum(b_sig).time/Nprof; digits=2), " ns/profile amortised")
+
+    sigma = CS._block_sigma(profs, nbins, Nprof, sigbuf)
+    invsigma = sigma > 0 ? 1.0 / sigma : 0.0
+    function boxcar_all(profs, medbuf, psum, widths, nbins, invsigma, n)
         s = 0.0
         @inbounds for j in 1:n
-            s += CS._profile_snr(profs, j, medbuf, nbins, invrms, 1.0/nbins, xsignal, metric, pexp)
+            s += CS._profile_boxcar(profs, j, medbuf, psum, widths, nbins, invsigma)
         end
         s
     end
-    b = @benchmark $snr_all($profs, $medbuf, $nbins, $invrms, $(params.xsignal), $(params.metric), $(params.pexp), $Nprof)
-    println("_profile_snr x$Nprof (quickselect median, nbins=$nbins):  ",
+    b = @benchmark $boxcar_all($profs, $medbuf, $psum, $widths, $nbins, $invsigma, $Nprof)
+    println("_profile_boxcar x$Nprof (median + prefix-sum + $(length(widths))-width scan, nbins=$nbins):  ",
             BenchmarkTools.prettytime(minimum(b).time),
             "  => ", round(minimum(b).time/Nprof; digits=1), " ns/call")
-
-    # Preview the fast-median win in isolation: full sort! vs partialsort! for
-    # just the two middle order statistics.
-    col = Vector{Float64}(undef, nbins)
-    copyto!(col, @view profs[:, 1])
-    half = nbins >>> 1
-    bs = @benchmark (copyto!($col, @view $profs[:,1]); sort!($col; alg=QuickSort))
-    bp = @benchmark (copyto!($col, @view $profs[:,1]); partialsort!($col, $half:$(half+1)))
-    println("   median cost:  sort!=", BenchmarkTools.prettytime(minimum(bs).time),
-            "   partialsort!=", BenchmarkTools.prettytime(minimum(bp).time))
 end
 println("="^70)

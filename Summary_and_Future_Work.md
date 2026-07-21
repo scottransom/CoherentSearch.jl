@@ -180,6 +180,71 @@ planning is ~0.7 s *each*; `ESTIMATE` avoids that but executes slower, making it
 net regression. **`next_pow_of_2` + `MEASURE` is already ≈ FFTW's best case** — so
 the throughput-tuning/tiling items below are lower-value than expected.
 
+### Re-baseline under the `:boxcar` default + `--maxdecim 6` (2026-07-21)
+
+The 2026-07-09 split above was taken on `--metric sd2`. Two later changes — making
+`:boxcar` the default detection metric and `--maxdecim 6` the standard config —
+reshaped the hot loop enough to warrant a fresh profile. The `bench/` harness was
+updated to match (`metric=:boxcar`, a clean **5–30 Hz** mid-band that avoids the
+low-frequency red-noise candidate flood, and boxcar-aware buckets:
+`_profile_boxcar`, `_block_sigma`). The self-time aggregator was also fixed to
+attribute Base leaf frames (`getindex`/`setindex!`/`*`) to their **nearest
+enclosing `search.jl` frame** rather than dumping them into an uninformative ~56%
+"other" — the boxcar width-scan and the interp `spec.*coeffs` multiply both inline
+down to Base arithmetic, so a leaf-only classifier mis-attributes them.
+
+Single-thread, warm, `PM0063…red.fft` 5–30 Hz, `nharms=60`, six decimations
+(68.6 s, 22 candidates, 150k samples):
+
+| bucket | self-time |
+|--------|-----------|
+| FFTW | 32.5% |
+| median-select (`_median!`/`_select!`) | 28.4% |
+| boxcar-metric (prefix-sum + width×phase scan) | 24.9% |
+| interp (`spec.*coeffs` multiply + gather) | 6.8% |
+| decim (gather + short brfft) | 3.3% |
+| `uniform_linear_interp` | 2.4% |
+| block-sigma (non-median part of `_block_sigma`) | 1.3% |
+| other | 0.3% |
+
+Grouped: **interpolation/FFT pipeline ≈ 45%** (FFTW + interp + decim + uniform),
+**detection metric ≈ 55%** (median + boxcar-scan + block-sigma). **This inverts
+the old baseline**, where interp/FFT dominated and the metric was ~12%. Two new
+costs, both consequences of the `:boxcar` default under decimation:
+
+- **Per-profile baseline median = 28.4% (now the largest non-FFT bucket).**
+  `:boxcar` subtracts a per-profile median baseline from *every* profile, and it
+  runs that at *every* one of the seven decimation passes (`k=1…6`). Decimation is
+  "cheap multi-frequency" only on the *interpolation* side — the 60-harmonic stack
+  is interpolated once per chunk and re-folded — but each `k` pays the **full
+  metric cost** on its own profiles. So the metric's share grows with `maxdecim`
+  while the interp's does not; at the default `maxdecim 6` the metric already wins.
+- **Boxcar width×phase scan = 24.9%.** `_profile_boxcar`'s inner loop is an
+  `O(nbins × nwidths)` strided max-reduction over the prefix sum (e.g. 120 phases ×
+  9 widths at `k=1`) — pure sequential FP, and it did not exist in the old profile.
+
+**Reprioritised levers (supersedes the ComplexF32-first ordering in §3):**
+
+1. **`@turbo` the boxcar width×phase scan (24.9%, easy, low-risk).** The inner
+   loop is a strided max-reduction — ideal for `LoopVectorization` (which works on
+   1.12). `max` is exactly associative, so vectorising it returns the identical
+   `Float64` and the `align=false` machine-precision pin holds trivially. Plausible
+   2–4× on a quarter of the runtime. **Best first move.**
+2. **Cut the per-profile median (28.4%, medium).** The `_median!` quickselect is
+   already tuned, but boxcar now calls it ~7× more (once per profile per
+   decimation). Options: a branchless small-`n` median network for the handful of
+   common `nbins` (20/24/30/40/60/120 — `SortingNetworks.jl` is broken on 1.12, so
+   hand-rolled), or SIMD selection. Note the baseline is intrinsically per-profile
+   (each profile has its own DC level), so it cannot be pooled per-block the way
+   `_block_sigma` pools σ without changing results.
+3. **`ComplexF32` interpolation (still the biggest *single* bucket at 32.5%, but no
+   longer the top lever).** Same precision-mode caveat as before; now it addresses
+   ~⅓ of runtime, not the old ~⅔.
+
+The takeaway: with decimation as the default, **detection-metric cost scales with
+`maxdecim` while interpolation is amortised**, so metric optimisation is the
+highest-leverage work — the opposite of the pre-decimation conclusion.
+
 ---
 
 ## 3. Next steps
@@ -192,13 +257,20 @@ the throughput-tuning/tiling items below are lower-value than expected.
 > and acting on what it finds. The throughput-tuning and tiling items below are
 > the concrete starting points for that work.
 
-- **The big remaining lever: `ComplexF32` interpolation.** The `.fft` amplitudes
+- **Metric cost now dominates (see the 2026-07-21 re-baseline in §2).** Under the
+  `:boxcar` default + `--maxdecim 6`, the detection metric is ~55% of runtime and
+  the interp/FFT pipeline ~45% — inverting the ordering these bullets were written
+  against. The two highest-leverage items are now **(1) `@turbo` the boxcar
+  width×phase max-reduction (24.9%, exact, low-risk)** and **(2) reducing the
+  per-profile baseline median (28.4%)**; both scale with `maxdecim`. Do these
+  before the FFT-side levers below.
+- **`ComplexF32` interpolation (FFT-side lever; 32.5%).** The `.fft` amplitudes
   are already `ComplexF32`; the interpolation pipeline widens to `ComplexF64`.
-  Keeping it `ComplexF32` would ~halve the bandwidth of the two dominant buckets
-  (the interp FFTs *and* the full-length `spec .* coeffs` multiply). It breaks the
-  `Float64` oracle pins (~1e-7 vs ~1e-15), so it needs a deliberate precision-mode
-  design and fresh validation against injected fake pulsars — a separate effort,
-  not a drop-in. This is the most promising throughput item.
+  Keeping it `ComplexF32` would ~halve the bandwidth of the FFTW and `spec.*coeffs`
+  buckets. It breaks the `Float64` oracle pins (~1e-7 vs ~1e-15), so it needs a
+  deliberate precision-mode design and fresh validation against injected fake
+  pulsars — a separate effort, not a drop-in. Still the biggest *single* bucket,
+  but no longer the top lever now that the metric outweighs it.
 - **Rethink FFT-correlation vs. direct interpolation.** The FFT computes ~16k
   fine-grid points per harmonic to then linear-interp only the ~`Nprof` we need; a
   cached-coefficient *direct* `O(m)` interpolation of just those points is ~7×

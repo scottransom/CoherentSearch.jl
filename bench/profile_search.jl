@@ -6,10 +6,11 @@
 # The search is compiled on a tiny warm-up band first so the profile reflects
 # steady-state hot-loop cost, not JIT.  Output: bench/statprof/index.html.
 #
-# Defaults mirror the standard heavy configuration (`--metric sd2 --maxdecim 6`
-# ⇒ nharms=60, six decimation factors), over a sub-band so a single-threaded
-# run finishes in tens of seconds while still exercising every code path
-# (all harmonics, all decimations, the metric, and post-processing).
+# Defaults mirror the standard heavy configuration (`--metric boxcar --maxdecim 6`
+# ⇒ nharms=60, six decimation factors), over a clean mid-band sub-band so a
+# single-threaded run finishes in tens of seconds while still exercising every
+# code path (all harmonics, all decimations, the boxcar metric + per-block σ,
+# and post-processing) without the low-frequency red-noise candidate flood.
 
 using CoherentSearch
 using Profile
@@ -18,15 +19,15 @@ using Printf
 using Base.Threads: nthreads
 
 const FILE   = length(ARGS) >= 1 ? ARGS[1] : "PM0063_034C1_DM445.0_red.fft"
-const HIFREQ = length(ARGS) >= 2 ? parse(Float64, ARGS[2]) : 5.0
+const LOFREQ = length(ARGS) >= 3 ? parse(Float64, ARGS[3]) : 5.0
+const HIFREQ = length(ARGS) >= 2 ? parse(Float64, ARGS[2]) : 30.0
 
 function build_params()
     nharms = 60
     SearchParams(
         nharms      = nharms,
         threshold   = 6.0,
-        metric      = :sd2,
-        pexp        = 0.5,
+        metric      = :boxcar,
         decimations = decimation_set(nharms, 6),
     )
 end
@@ -42,19 +43,19 @@ function main()
     params = build_params()
     @info "profile_search" file=FILE T=ft.T nharms=params.nharms decims=params.decimations threads=nthreads()
 
-    # Warm-up: compile the whole pipeline on a tiny band (results discarded).
+    # Warm-up: compile the whole pipeline on a tiny mid-band (results discarded).
     @info "warming up (compiling)…"
-    run_search(ft, params; lofreq=0.1, hifreq=0.2)
+    run_search(ft, params; lofreq=LOFREQ, hifreq=LOFREQ + 0.2)
 
     # Timed, un-profiled baseline for this band.
-    @info "timing warm search" hifreq=HIFREQ
-    t = @elapsed cands = run_search(ft, params; lofreq=0.1, hifreq=HIFREQ)
+    @info "timing warm search" lofreq=LOFREQ hifreq=HIFREQ
+    t = @elapsed cands = run_search(ft, params; lofreq=LOFREQ, hifreq=HIFREQ)
     @info "warm search done" seconds=round(t; digits=2) ncands=length(cands)
 
     # Profiled run.
     Profile.clear()
     Profile.init(; n=10^8, delay=0.0005)   # deep buffer, 0.5 ms sampling
-    @profile run_search(ft, params; lofreq=0.1, hifreq=HIFREQ)
+    @profile run_search(ft, params; lofreq=LOFREQ, hifreq=HIFREQ)
 
     # Flat text summary first (robust even if the HTML writer errors).
     println("\n=== Profile.print (flat, sorted by count) ===")
@@ -77,53 +78,69 @@ function main()
     end
 end
 
-# Classify a leaf stack frame into a coarse cost bucket, by function name so it
-# is robust to line-number shifts in search.jl.
+# Classify a stack frame into a coarse cost bucket, by function name so it is
+# robust to line-number shifts in search.jl.  Base arithmetic/indexing frames
+# deliberately return "other" so the aggregator walks *past* them to the nearest
+# enclosing search.jl/FFTW frame (the boxcar width-scan and the interp
+# `spec.*coeffs` multiply/gather both inline down to Base getindex/setindex/`*`,
+# which a leaf-only classifier would dump into an uninformative 56% "other").
 function classify(sf)
     fn   = string(sf.func)
     file = string(sf.file)
     (occursin("fft", lowercase(file)) || occursin("FFTW", file)) && return "FFTW"
     occursin("sort", file)                             && return "median-sort"
     (fn in ("_median!", "_select!", "_swap!"))         && return "median-select"
+    fn == "_profile_boxcar"                            && return "boxcar-metric"
+    fn == "_block_sigma"                               && return "block-sigma"
+    fn == "boxcar_widths"                              && return "boxcar-setup"
     (fn == "pow_body" || fn == "^")                    && return "pow(w^pexp)"
     fn == "_profile_snr"                               && return "profile_snr-body"
-    (fn == "interp_tile!" || fn == "fill_harmonic_row!") && return "interp_tile/fill_row"
+    (fn == "interp_tile!" || fn == "fill_harmonic_row!") && return "interp (fft-correlate)"
+    fn == "decim_pass!"                                && return "decim (gather+brfft)"
+    fn == "fill_chunk_profiles!"                       && return "fill-chunk (other)"
     fn == "uniform_linear_interp"                      && return "uniform_linear_interp"
-    occursin("complex.jl", file)                       && return "complex-arith"
-    occursin("broadcast.jl", file)                     && return "broadcast(spec*coeffs)"
     return "other"
 end
 
+# Attribute a sample to the *nearest-leaf* frame that maps to a named bucket, so
+# Base leaves (getindex/setindex/`*`) are charged to the search.jl function that
+# runs them rather than to "other".  The sample buffer is leaf-first; metadata
+# ints don't resolve through `lidict`, so a `get(...) === nothing` miss is simply
+# skipped — no dependence on the exact Julia-version metadata-block layout.
 function aggregate_buckets()
     data, lidict = Profile.retrieve()
     counts = Dict{String,Int}()
     total = 0
-    # Walk the sample buffer: 0 separates samples; the FIRST nonzero after a 0
-    # (reading backwards) is the leaf. Simpler: count the leaf of each sample.
     i = 1
     n = length(data)
     while i <= n
-        # find end of this sample (a 0 delimiter, possibly a metadata block)
         j = i
         while j <= n && data[j] != 0
             j += 1
         end
         if j > i
-            leaf = data[i]                      # first entry = leaf frame ip
-            frames = get(lidict, leaf, nothing)
-            if frames !== nothing && !isempty(frames)
-                b = classify(frames[1])   # innermost inlined frame = the real leaf
-                counts[b] = get(counts, b, 0) + 1
-                total += 1
+            bucket = "other"
+            @inbounds for t in i:(j - 1)          # leaf-first: first named frame wins
+                frames = get(lidict, data[t], nothing)
+                frames === nothing && continue
+                hit = false
+                for f in frames                   # innermost inlined frame first
+                    b = classify(f)
+                    if b != "other"
+                        bucket = b; hit = true; break
+                    end
+                end
+                hit && break
             end
+            counts[bucket] = get(counts, bucket, 0) + 1
+            total += 1
         end
-        # skip the 0 delimiter plus the trailing metadata zeros
         i = j
         while i <= n && data[i] == 0
             i += 1
         end
     end
-    println("\n=== self-time by bucket (leaf frame, ", total, " samples) ===")
+    println("\n=== self-time by bucket (nearest named frame, ", total, " samples) ===")
     for (b, c) in sort(collect(counts); by=x->-x[2])
         @printf("  %-26s %6d  %5.1f%%\n", b, c, 100c/max(total,1))
     end

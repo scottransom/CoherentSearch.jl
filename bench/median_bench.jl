@@ -13,7 +13,7 @@ const FILE = length(ARGS) >= 1 ? ARGS[1] : "PM0063_034C1_DM445.0_red.fft"
 
 ft = FFTFile(FILE)
 nharms = 60
-params = SearchParams(nharms=nharms, threshold=6.0, metric=:sd2, pexp=0.5,
+params = SearchParams(nharms=nharms, threshold=6.0, metric=:boxcar,
                       decimations=decimation_set(nharms, 6))
 Nprof = 2048
 lodr  = params.hidr / params.nharms
