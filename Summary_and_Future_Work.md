@@ -364,18 +364,37 @@ the throughput-tuning/tiling items below are lower-value than expected.
     (5–30 Hz, threshold 6): raw gives ~100 candidates dominated by one
     decimation (94/100 at `Hk=30`), while `--normalize` gives 6 spanning `k =
     1,4,5,6` — the `√nbins` + frequency flood is gone — with the true 7.1187 Hz
-    pulsar still ranked first. Costs ~2× runtime (two full passes; a subsampled
-    measuring pass is a possible optimisation) and assumes a normalised input.
+    pulsar still ranked first. Assumes a normalised input.
     *Limitation:* `z` is only a true equivalent-σ where the noise is Gaussian;
     the right-skewed metric makes `z` an over-estimate deep in the tail, so a
     fixed `z` threshold is *comparable* across `(k, f)` but not yet an absolute
     σ — that is what (2) fixes.
+    - **The ~2× runtime penalty is *definitely* not acceptable long-term** and
+      must be worked on — running the entire interpolate/profile/metric pipeline
+      twice, just so pass 2 knows the pass-1 noise floor, is the wrong shape. The
+      intended fix, once (2) exists: use the **absolute calibration as the base
+      `loc`/`scale`** (a function of `nbins`/`ngoodbins`, i.e. of `k` and
+      frequency, from the simulation + semi-analytic Nyquist rolloff) and only
+      *perturb* it with a cheap in-situ measurement — so no second full pass is
+      needed. The perturbation could come from a **sub-sampled** measuring pass,
+      or ideally from the **current block's own statistics** in a *single* pass
+      (normalise each trial against its block's measured median/scale, computed
+      from the profiles already in hand — no re-interpolation, no re-`irfft`).
+      That likely wants a **larger `blocksize`** so each block holds enough
+      trials for a stable per-block median/scale (and enough tail for the deep
+      quantile the threshold needs); the block would then be the natural
+      frequency window, superseding the separate windowing. The base calibration
+      keeps the per-block estimate honest where a block is signal-/RFI-heavy or
+      too short. This is the preferred end state: single-pass, self-calibrating,
+      no 2× tax.
   - **(2) pure-noise simulation (next).** Fit the noise distribution's absolute
     FAP-vs-`z` tail from Monte-Carlo pure noise, handling the `ngoodbins` Nyquist
     rolloff semi-analytically (it enters the metric only through
     `invrms = √(2·ngoodbins+1)` plus the reduced harmonic count), then map `z` to
     a true equivalent-σ and validate that the in-situ `loc`/`scale` match ideal
     noise. The `--metricstats` per-`(k, f)` histograms are the validation data.
+    Besides the absolute σ, this yields the **base `loc`/`scale` numbers** the
+    single-pass scheme above needs to escape the 2× penalty.
 
 - **Default metric produces many non-pulsar-like false positives (to
   investigate; may change defaults).** On real data the current defaults
