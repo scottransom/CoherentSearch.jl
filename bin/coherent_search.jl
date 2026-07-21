@@ -238,14 +238,14 @@ end
 """
     report_metricstats(ms, base, params, threshold)
 
-Summarise the metric distribution collected in `ms::MetricStats`.  Prints a
-per-decimation table to `stderr` — the exact global moments plus the empirical
-per-`k` metric value at a range of single-trial false-alarm probabilities — so
-the key point is visible: with `--metric non --pexp 0.5` the noise floor grows
-~`√nbins = √(2·Hk)`, so a fixed `--threshold` picks a *different* false-alarm
-rate in each decimation `k`.  Writes the full per-block table to
-`<base>_metricstats.txt` and the per-`k` histograms to `<base>_metrichist.txt`
-(both for offline plotting / threshold fitting).
+Summarise the metric distribution collected in `ms::MetricStats`.  Prints to
+`stderr` (1) a band-wide per-decimation table — exact moments plus the empirical
+per-`k` metric value at a range of single-trial false-alarm probabilities — and
+(2) how the FAP=1e-4 threshold *drifts across frequency* within each `k`, which
+is where the red-noise (low `f`) and Nyquist-rolloff (high `f`) effects show up.
+Writes three files for offline plotting / threshold fitting: the per-block table
+`<base>_metricstats.txt`, the per-`(k, frequency window)` false-alarm thresholds
+`<base>_metricfap.txt`, and the per-`(k, window)` histograms `<base>_metrichist.txt`.
 """
 function report_metricstats(ms::MetricStats, base::String, params, threshold)
     if isempty(ms.hists) || all(h -> h.total == 0, ms.hists)
@@ -253,17 +253,18 @@ function report_metricstats(ms::MetricStats, base::String, params, threshold)
         return
     end
     faps = (0.1, 0.01, 1e-3, 1e-4, 1e-5)
+    faplabels = ("1e-1", "1e-2", "1e-3", "1e-4", "1e-5")
     summ = metricstats_summary(ms; faps=faps)
+    wins = metricstats_windows(ms; faps=faps)
 
-    # --- per-decimation summary to stderr ---
+    # --- band-wide per-decimation summary to stderr ---
     println(stderr)
     println(stderr, "Metric statistics by decimation  (metric=$(params.metric), pexp=$(params.pexp), threshold=$(threshold))")
     println(stderr, "  Pure-noise floor scales ~sqrt(nbins); a fixed threshold picks a DIFFERENT false-alarm rate per k.")
     @printf(stderr, "  %-3s %4s %5s %10s %7s %7s %7s | metric at single-trial FAP =\n",
             "k", "Hk", "nbins", "ntrials", "mean", "std", "max")
     @printf(stderr, "  %-3s %4s %5s %10s %7s %7s %7s | %8s %8s %8s %8s %8s\n",
-            "", "", "", "", "", "", "",
-            "1e-1", "1e-2", "1e-3", "1e-4", "1e-5")
+            "", "", "", "", "", "", "", faplabels...)
     for r in summ
         @printf(stderr, "  %-3d %4d %5d %10d %7.3f %7.3f %7.3f |",
                 r.k, r.Hk, r.nbins, r.ntrials, r.mean, r.std, r.max)
@@ -274,7 +275,22 @@ function report_metricstats(ms::MetricStats, base::String, params, threshold)
         println(stderr)
     end
     println(stderr, "  A single --threshold gives these per-k FAPs; for comparable FAP, threshold each k separately")
-    println(stderr, "  (or normalise the metric per nbins).  FAP columns are single-trial, single-decimation.")
+    println(stderr, "  (or normalise the metric per (k, frequency)).  FAP columns are single-trial, single-decimation.")
+
+    # --- frequency drift of the FAP=1e-4 threshold, per k, to stderr ---
+    fi = findfirst(==(1e-4), faps)
+    println(stderr)
+    println(stderr, "  FAP=1e-4 threshold vs frequency ($(ms.nwin) log-spaced windows per k; drift = red noise / Nyquist):")
+    @printf(stderr, "  %-3s %5s %21s %9s %9s\n", "k", "nbins", "freq range (Hz)", "min", "max")
+    for k in sort(unique(r.k for r in wins))
+        rk = [r for r in wins if r.k == k]
+        isempty(rk) && continue
+        vals = [r.fap[fi] for r in rk]
+        @printf(stderr, "  %-3d %5d %9.3f -%9.3f %9.3f %9.3f\n",
+                k, rk[1].nbins, minimum(r.flo for r in rk), maximum(r.fhi for r in rk),
+                minimum(vals), maximum(vals))
+    end
+    println(stderr, "  Full per-window thresholds -> $(base)_metricfap.txt")
     println(stderr)
 
     # --- full per-block table ---
@@ -293,27 +309,47 @@ function report_metricstats(ms::MetricStats, base::String, params, threshold)
         end
     end
 
-    # --- per-k histograms (only bins spanning the populated range) ---
+    # --- per-(k, window) false-alarm thresholds ---
+    fapfile = string(base, "_metricfap.txt")
+    open(fapfile, "w") do io
+        println(io, "# Per-(decimation, frequency-window) empirical false-alarm thresholds")
+        println(io, "# metric=$(params.metric) pexp=$(params.pexp) xsignal=$(params.xsignal) nharms=$(params.nharms)")
+        println(io, "# fap_X = metric value whose single-trial, single-decimation false-alarm prob is X (in-window)")
+        @printf(io, "#%-3s %4s %5s %4s %13s %13s %10s %8s %8s %8s | %s\n",
+                "k", "Hk", "nbins", "win", "f_lo(Hz)", "f_hi(Hz)", "ntrials",
+                "mean", "std", "median", join(("fap" .* faplabels), " "))
+        for r in wins
+            @printf(io, "%-4d %4d %5d %4d %13.7f %13.7f %10d %8.3f %8.3f %8.3f |",
+                    r.k, r.Hk, r.nbins, r.win, r.flo, r.fhi, r.ntrials, r.mean, r.std, r.median)
+            for v in r.fap
+                @printf(io, " %7.3f", v)
+            end
+            r.overflow > minimum(faps) && @printf(io, "  # overflow %.1e", r.overflow)
+            println(io)
+        end
+    end
+
+    # --- per-(k, window) histograms (only bins spanning the populated range) ---
     histfile = string(base, "_metrichist.txt")
     open(histfile, "w") do io
-        println(io, "# Per-decimation metric histograms (one streaming pass over all trials)")
+        println(io, "# Per-(decimation, frequency-window) metric histograms (one streaming pass)")
         println(io, "# metric=$(params.metric) pexp=$(params.pexp) xsignal=$(params.xsignal) nharms=$(params.nharms)")
         println(io, "# bin = left edge of a bin of width $((ms.hist_hi - ms.hist_lo) / ms.hist_nb); count = trials in [bin, bin+width)")
-        @printf(io, "#%-3s %4s %5s %12s %14s\n", "k", "Hk", "nbins", "bin", "count")
+        @printf(io, "#%-3s %4s %4s %13s %13s %12s %14s\n",
+                "k", "Hk", "win", "f_lo(Hz)", "f_hi(Hz)", "bin", "count")
         w = (ms.hist_hi - ms.hist_lo) / ms.hist_nb
-        for h in ms.hists
-            # Trim to the populated range so the file stays compact.
-            firstnz = findfirst(>(0), h.counts)
+        for h in ms.whists
+            firstnz = findfirst(>(0), h.counts)   # trim to populated range
             lastnz = findlast(>(0), h.counts)
             firstnz === nothing && continue
             for i in firstnz:lastnz
-                @printf(io, "%-4d %4d %5d %12.5f %14d\n",
-                        h.k, h.Hk, h.nbins, ms.hist_lo + (i - 1) * w, h.counts[i])
+                @printf(io, "%-4d %4d %4d %13.7f %13.7f %12.5f %14d\n",
+                        h.k, h.Hk, h.win, h.flo, h.fhi, ms.hist_lo + (i - 1) * w, h.counts[i])
             end
         end
     end
 
-    @info "Wrote metric statistics" perblock=blockfile histogram=histfile nblocks=length(ms.blocks)
+    @info "Wrote metric statistics" perblock=blockfile fap=fapfile histogram=histfile nblocks=length(ms.blocks)
     return
 end
 

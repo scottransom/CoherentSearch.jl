@@ -681,11 +681,13 @@ end
     MetricHistogram
 
 A fixed-range, fixed-width histogram of every trial's detection metric for one
-decimation factor `k` (`Hk` harmonics, `nbins = 2*Hk`), accumulated in one
-streaming pass over the whole search.  This is the bounded-memory substrate for
-*exact* per-`k` empirical quantiles (and thus per-`k` false-alarm thresholds):
-`counts[i]` covers `[lo + (i-1)·w, lo + i·w)` with `w = (hi-lo)/length(counts)`;
-`under`/`over` catch values outside `[lo, hi)`.  `total`, `sum`, `sumsq`,
+decimation factor `k` (`Hk` harmonics, `nbins = 2*Hk`) within one *searched
+spin-frequency window* `[flo, fhi)` Hz (window index `win`; `win = 0` marks a
+per-`k` histogram merged over all windows).  Accumulated in one streaming pass.
+This is the bounded-memory substrate for *exact* per-`(k, frequency)` empirical
+quantiles (and thus frequency-resolved false-alarm thresholds): `counts[i]`
+covers `[lo + (i-1)·w, lo + i·w)` with `w = (hi-lo)/length(counts)`;
+`under`/`over` catch metric values outside `[lo, hi)`.  `total`, `sum`, `sumsq`,
 `vmin`, `vmax` are kept exactly (independent of the binning), so the mean, std,
 min and max are exact regardless of range — only the quantiles are resolved to
 the bin width.  One per task, summed across tasks after the parallel region.
@@ -694,6 +696,9 @@ mutable struct MetricHistogram
     const k::Int
     const Hk::Int
     const nbins::Int
+    const win::Int               # frequency-window index (0 = merged over all windows)
+    const flo::Float64           # searched-frequency window bounds (Hz)
+    const fhi::Float64
     const lo::Float64
     const hi::Float64
     const invw::Float64          # 1/binwidth
@@ -707,11 +712,36 @@ mutable struct MetricHistogram
     vmax::Float64
 end
 
-function MetricHistogram(k::Integer, Hk::Integer, lo::Real, hi::Real, nb::Integer)
+function MetricHistogram(k::Integer, Hk::Integer, win::Integer, flo::Real, fhi::Real,
+                         lo::Real, hi::Real, nb::Integer)
     hi > lo || throw(ArgumentError("histogram hi ($hi) must exceed lo ($lo)"))
     nb >= 1 || throw(ArgumentError("histogram bin count must be ≥ 1"))
-    return MetricHistogram(Int(k), Int(Hk), 2 * Int(Hk), Float64(lo), Float64(hi),
-                           nb / (hi - lo), zeros(Int, nb), 0, 0, 0, 0.0, 0.0, Inf, -Inf)
+    return MetricHistogram(Int(k), Int(Hk), 2 * Int(Hk), Int(win), Float64(flo), Float64(fhi),
+                           Float64(lo), Float64(hi), nb / (hi - lo), zeros(Int, nb),
+                           0, 0, 0, 0.0, 0.0, Inf, -Inf)
+end
+
+# Log-spaced window edges over [a, b] (nwin windows), robust to a≈b / a≤0.
+function _logedges(a::Real, b::Real, nwin::Integer)
+    a = max(Float64(a), floatmin(Float64))
+    b = max(Float64(b), a * (1 + 1e-9))
+    la, lb = log10(a), log10(b)
+    return [10.0^(la + (lb - la) * i / nwin) for i in 0:nwin]
+end
+
+# Window index of searched frequency `f` in sorted `edges` (length nwin+1),
+# clamped to [1, nwin].  Called once per (block, k), not per trial.
+@inline _window_index(edges::Vector{Float64}, f::Real) =
+    clamp(searchsortedlast(edges, f), 1, length(edges) - 1)
+
+# Merge `hs` (same binning, same k) into one fresh histogram tagged (win, flo, fhi).
+function _merge_hists(hs::AbstractVector{MetricHistogram}, win::Integer, flo::Real, fhi::Real)
+    h1 = first(hs)
+    g = MetricHistogram(h1.k, h1.Hk, win, flo, fhi, h1.lo, h1.hi, length(h1.counts))
+    for h in hs
+        _hist_merge!(g, h)
+    end
+    return g
 end
 
 @inline function _hist_push!(h::MetricHistogram, x::Float64)
@@ -770,58 +800,82 @@ end
     MetricStats
 
 Opt-in diagnostic sink passed to [`search`](@ref) (the `--metricstats` CLI
-option).  Holds two complementary views of the detection metric over *all*
+option).  Holds three complementary views of the detection metric over *all*
 trials (not just those above `threshold`):
 
   * `blocks` — one [`BlockMetricStats`](@ref) per processed block per
-    decimation, i.e. frequency-resolved min/median/mean/std/max.  Exposes the
-    frequency dependence of the noise floor (red-noise excess at low `f`, the
-    `ngoodbins` Nyquist rolloff at high `f`).
-  * `hists` — one [`MetricHistogram`](@ref) per decimation `k`, accumulated over
-    the whole band, giving exact global moments and empirical per-`k` quantiles
+    decimation, i.e. finely frequency-resolved min/median/mean/std/max.
+  * `hists` — one [`MetricHistogram`](@ref) per decimation `k`, merged over the
+    whole band, giving exact global moments and empirical per-`k` quantiles
     (hence per-`k` false-alarm thresholds via [`hist_quantile`](@ref)).
+  * `whists` — one [`MetricHistogram`](@ref) per `(k, frequency window)`: the
+    band is split into `nwin` log-spaced *searched-spin-frequency* windows per
+    `k`, so the quantiles (and false-alarm thresholds) track the frequency
+    dependence of the noise floor — the red-noise excess at low `f` and the
+    `ngoodbins` Nyquist rolloff at high `f` — which a single band-wide histogram
+    averages over.  This is the substrate the dynamic per-`(k, f)` normalisation
+    needs.
 
-Construct empty (optionally overriding the histogram range/resolution) and pass
-to `search`; it is filled after the parallel region.  Collecting it does not
-change the candidate results.
+Construct empty (optionally overriding the histogram range/resolution and the
+window count `nwin`) and pass to `search`; it is filled after the parallel
+region.  Collecting it does not change the candidate results.
 """
 mutable struct MetricStats
     hist_lo::Float64
     hist_hi::Float64
     hist_nb::Int
+    nwin::Int
     blocks::Vector{BlockMetricStats}
     hists::Vector{MetricHistogram}
+    whists::Vector{MetricHistogram}
 end
-MetricStats(; hist_lo::Real=0.0, hist_hi::Real=64.0, hist_nb::Integer=3200) =
-    MetricStats(Float64(hist_lo), Float64(hist_hi), Int(hist_nb),
-                BlockMetricStats[], MetricHistogram[])
+MetricStats(; hist_lo::Real=0.0, hist_hi::Real=64.0, hist_nb::Integer=3200, nwin::Integer=16) =
+    MetricStats(Float64(hist_lo), Float64(hist_hi), Int(hist_nb), max(1, Int(nwin)),
+                BlockMetricStats[], MetricHistogram[], MetricHistogram[])
 
 """
     metricstats_summary(ms; faps=(0.1, 0.01, 1e-3, 1e-4)) -> Vector{<:NamedTuple}
 
-One row per decimation `k` (sorted by `k`) summarising [`MetricStats`](@ref).
-`ntrials`/`mean`/`std`/`min`/`max` are exact (from the histogram accumulators);
-`median` and the `fap` metric values are empirical quantiles read from the
-per-`k` histogram — `fap[i]` is the metric threshold whose single-trial,
-single-decimation false-alarm probability is `faps[i]` (i.e. the `1-faps[i]`
-quantile).  `overflow` is the fraction of trials above the histogram range (the
-`fap` values are unreliable once it exceeds the smallest requested `fap`).
-`nblocks` counts the contributing blocks.
+One row per decimation `k` (sorted by `k`) summarising [`MetricStats`](@ref) over
+the whole band (from `ms.hists`).  `ntrials`/`mean`/`std`/`min`/`max` are exact
+(from the histogram accumulators); `median` and the `fap` metric values are
+empirical quantiles read from the per-`k` histogram — `fap[i]` is the metric
+threshold whose single-trial, single-decimation false-alarm probability is
+`faps[i]` (i.e. the `1-faps[i]` quantile).  `overflow` is the fraction of trials
+above the histogram range (the `fap` values are unreliable once it exceeds the
+smallest requested `fap`).  `nblocks` counts the contributing blocks.  See
+[`metricstats_windows`](@ref) for the frequency-resolved breakdown.
 """
-function metricstats_summary(ms::MetricStats; faps=(0.1, 0.01, 1e-3, 1e-4))
-    rows = map(ms.hists) do h
-        nblocks = count(s -> s.k == h.k && s.n > 0, ms.blocks)
-        N = h.total
-        mean = N > 0 ? h.sum / N : NaN
-        std = N > 1 ? sqrt(max(0.0, (h.sumsq - N * mean^2) / (N - 1))) : 0.0
-        (k=h.k, Hk=h.Hk, nbins=h.nbins, nblocks=nblocks, ntrials=N,
-         min=(N > 0 ? h.vmin : NaN), median=hist_quantile(h, 0.5), mean=mean, std=std,
-         max=(N > 0 ? h.vmax : NaN),
-         fap=Tuple(hist_quantile(h, 1 - p) for p in faps),
-         overflow=(N > 0 ? h.over / N : 0.0))
-    end
-    return rows
+# One summary row from a single histogram (moments exact, quantiles binned).
+function _hist_row(h::MetricHistogram, faps)
+    N = h.total
+    mean = N > 0 ? h.sum / N : NaN
+    std = N > 1 ? sqrt(max(0.0, (h.sumsq - N * mean^2) / (N - 1))) : 0.0
+    return (k=h.k, Hk=h.Hk, nbins=h.nbins, win=h.win, flo=h.flo, fhi=h.fhi, ntrials=N,
+            min=(N > 0 ? h.vmin : NaN), median=hist_quantile(h, 0.5), mean=mean, std=std,
+            max=(N > 0 ? h.vmax : NaN),
+            fap=Tuple(hist_quantile(h, 1 - p) for p in faps),
+            overflow=(N > 0 ? h.over / N : 0.0))
 end
+
+function metricstats_summary(ms::MetricStats; faps=(0.1, 0.01, 1e-3, 1e-4))
+    return [merge(_hist_row(h, faps),
+                  (nblocks=count(s -> s.k == h.k && s.n > 0, ms.blocks),))
+            for h in ms.hists]
+end
+
+"""
+    metricstats_windows(ms; faps=(0.1, 0.01, 1e-3, 1e-4)) -> Vector{<:NamedTuple}
+
+Frequency-resolved companion to [`metricstats_summary`](@ref): one row per
+`(k, frequency window)` (from `ms.whists`, sorted by `k` then window), each with
+the window's searched-frequency bounds `flo`/`fhi` (Hz), exact moments, and the
+empirical `fap` metric thresholds *within that window*.  Empty windows (no
+trials) are dropped.  This is where the red-noise (low-`f`) and Nyquist-rolloff
+(high-`f`) drift of the false-alarm threshold shows up.
+"""
+metricstats_windows(ms::MetricStats; faps=(0.1, 0.01, 1e-3, 1e-4)) =
+    [_hist_row(h, faps) for h in ms.whists if h.total > 0]
 
 """
     decim_pass!(out, ws, db, ft, params, rstart, lodr, n; threshold, block, stats)
@@ -922,9 +976,10 @@ candidates by [`remove_harmonics`](@ref) (`harm_remove`, `numharm`, `harm_tol`).
 
 If a [`MetricStats`](@ref) is supplied as `metricstats`, the metric of *every*
 trial (not just those above `threshold`) is accumulated into it — per-block,
-per-decimation [`BlockMetricStats`](@ref) plus a per-`k` [`MetricHistogram`](@ref)
-for empirical quantiles — the opt-in `--metricstats` diagnostic.  The candidate
-results are identical whether or not `metricstats` is collected.
+per-decimation [`BlockMetricStats`](@ref) plus [`MetricHistogram`](@ref)s both
+per-`k` and per-`(k, log-spaced searched-frequency window)` for empirical
+(frequency-resolved) quantiles — the opt-in `--metricstats` diagnostic.  The
+candidate results are identical whether or not `metricstats` is collected.
 """
 function search(ft::FFTFile, params::SearchParams=SearchParams();
                 lofreq::Real=0.1, hifreq::Real=100.0, lobin::Integer=100,
@@ -958,19 +1013,28 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
     collect_stats = metricstats !== nothing
     # Decimation factors present (base pass = k=1, plus each Workspace DecimBuf).
     statks = collect_stats ? sort!(unique(vcat(1, [db.k for db in workspaces[1].decims]))) : Int[]
+    # Log-spaced searched-frequency window edges per k (searched freq of a k-fold
+    # is k·f, so k's band is k× the base band).  One histogram per (k, window).
+    nwin = collect_stats ? metricstats.nwin : 0
+    wedges = collect_stats ?
+        Dict(k => _logedges(k * r_lo / ft.T, k * r_hi / ft.T, nwin) for k in statks) :
+        Dict{Int,Vector{Float64}}()
     results = Vector{Vector{Candidate}}(undef, nt)
     statparts = collect_stats ? Vector{Vector{BlockMetricStats}}(undef, nt) : nothing
-    histparts = collect_stats ? Vector{Dict{Int,MetricHistogram}}(undef, nt) : nothing
+    histparts = collect_stats ? Vector{Dict{Int,Vector{MetricHistogram}}}(undef, nt) : nothing
     done = Atomic{Int}(0)     # chunks completed across all tasks (for the progress meter)
     @sync for t in 1:nt
         @spawn begin
             ws = workspaces[t]
             out = Candidate[]
             stats = collect_stats ? BlockMetricStats[] : nothing
+            # Per task: a length-`nwin` vector of histograms per k, one per window.
             hists = collect_stats ?
-                Dict(k => MetricHistogram(k, fld(params.nharms, k),
-                                          metricstats.hist_lo, metricstats.hist_hi,
-                                          metricstats.hist_nb) for k in statks) :
+                Dict(k => [MetricHistogram(k, fld(params.nharms, k), w,
+                                           wedges[k][w], wedges[k][w + 1],
+                                           metricstats.hist_lo, metricstats.hist_hi,
+                                           metricstats.hist_nb) for w in 1:nwin]
+                     for k in statks) :
                 nothing
             mbuf = collect_stats ? Vector{Float64}(undef, Nprof) : nothing
             c = t
@@ -982,7 +1046,9 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
                 rmean = rstart + (n - 1) * lodr / 2
                 ngood = chunk_ngoodbins(ft, params.nharms, rmean)
                 invrms = sqrt(2 * ngood + 1)
-                basehist = collect_stats ? hists[1] : nothing
+                # Whole (narrow) block → one window, keyed by its centre freq.
+                basehist = collect_stats ?
+                    hists[1][_window_index(wedges[1], rmean / ft.T)] : nothing
                 for j in 1:n
                     metric = _profile_snr(ws.profs, j, ws.medbuf, nbins, invrms, 1.0 / nbins, params.xsignal, params.metric, params.pexp)
                     if collect_stats
@@ -1002,9 +1068,10 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
                 # Harmonic-decimation multi-frequency passes (k > 1), re-using the
                 # base harmonic amplitudes already in ws.ftprofs (see decimation_design.md).
                 for db in ws.decims
+                    whist = collect_stats ?
+                        hists[db.k][_window_index(wedges[db.k], db.k * rmean / ft.T)] : nothing
                     decim_pass!(out, ws, db, ft, params, rstart, lodr, n;
-                                threshold=threshold, block=c, stats=stats,
-                                hist=(collect_stats ? hists[db.k] : nothing))
+                                threshold=threshold, block=c, stats=stats, hist=whist)
                 end
                 atomic_add!(done, 1)
                 # One task owns the display (avoids interleaved \r writes); it reads
@@ -1027,15 +1094,23 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
         allstats = reduce(vcat, statparts; init=BlockMetricStats[])
         sort!(allstats; by = s -> (s.block, s.k))
         append!(metricstats.blocks, allstats)
-        # Sum each task's per-k histograms into one merged histogram per k.
+        # For each (k, window): sum that window's histogram across tasks → whists.
+        # Then merge a k's windows into one band-wide per-k histogram → hists.
         for k in statks
-            merged = histparts[1][k]
-            for t in 2:nt
-                _hist_merge!(merged, histparts[t][k])
+            kwins = MetricHistogram[]
+            for w in 1:nwin
+                merged = histparts[1][k][w]
+                for t in 2:nt
+                    _hist_merge!(merged, histparts[t][k][w])
+                end
+                push!(kwins, merged)
             end
-            push!(metricstats.hists, merged)
+            append!(metricstats.whists, kwins)
+            push!(metricstats.hists,
+                  _merge_hists(kwins, 0, wedges[k][1], wedges[k][end]))
         end
-        sort!(metricstats.hists; by = h -> h.k)
+        sort!(metricstats.hists;  by = h -> h.k)
+        sort!(metricstats.whists; by = h -> (h.k, h.win))
     end
 
     cands = reduce(vcat, results; init=Candidate[])

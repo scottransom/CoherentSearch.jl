@@ -323,12 +323,27 @@ the throughput-tuning/tiling items below are lower-value than expected.
     floor (red-noise excess at low `f`, the Nyquist `ngoodbins` rolloff at high
     `f`) is visible.
   Collection allocates only per-task buffers/histograms and is off by default.
-  This is the first piece of the hybrid threshold-calibration plan (below): the
-  per-`k` empirical quantiles are exactly the substrate the dynamic
-  normalisation path needs. *Next increment:* frequency-windowed histograms (so
-  the low-`f` red-noise and high-`f` Nyquist regimes get their own quantiles) and
-  a pure-noise-simulation calibration to give the quantiles an absolute
-  equivalent-σ meaning and validate the in-situ estimator.
+  - **Frequency-windowed histograms (implemented).** The band is now split into
+    `nwin` log-spaced *searched-spin-frequency* windows per `k` (each `k`'s band
+    is `k×` the base band; `MetricStats.nwin`, default 16), giving a
+    `MetricHistogram` per `(k, window)` (`ms.whists`, and the band-wide per-`k`
+    `ms.hists` are just their merge; `metricstats_windows` tabulates the
+    per-window rows). Each block, being narrow, is assigned whole to the window
+    of its centre frequency, so windowing costs one `searchsortedlast` per
+    `(block, k)` — nothing per trial. This resolves the frequency dependence the
+    band-wide histogram averages over: on `PM0063…red.fft` (0.5–50 Hz, `:non`,
+    k=1) the empirical FAP=1e-4 threshold runs ~12.5 at 0.5–0.9 Hz (red-noise
+    residual in the tail) → ~9.7 mid-band → 8.2 at 37–50 Hz, and the top window's
+    mean drops as the `ngoodbins` Nyquist rolloff sets in (only ~20 of 60
+    harmonics fit below Nyquist at 50 Hz). Written per `(k, window)` to
+    `<stem>_metricfap.txt` (thresholds) and `<stem>_metrichist.txt` (raw
+    histograms); the `stderr` summary adds a FAP=1e-4-vs-frequency drift line per
+    `k`. These per-`(k, f)` empirical quantiles are exactly the substrate the
+    dynamic normalisation path needs.
+  *Next increment:* a pure-noise-simulation calibration to give the quantiles an
+  absolute equivalent-σ meaning (fold in the trials factor) and validate the
+  in-situ estimator, then wire the per-`(k, f)` normalisation into the detection
+  threshold itself.
 
 - **Threshold-calibration plan — hybrid, in progress.** The agreed direction:
   (1) *dynamic, in-situ* per-`k` normalisation as the shipping default — measure

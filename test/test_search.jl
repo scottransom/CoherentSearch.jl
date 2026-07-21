@@ -293,7 +293,7 @@ if isfile(EXAMPLE_FFT)
         @test all(s.Hk == fld(nharms, s.k) for s in ms.blocks)
         @test all(s.min <= s.median <= s.max && s.min <= s.mean <= s.max for s in ms.blocks)
 
-        # Per-k histograms: one per decimation, exact counts, exact moments.
+        # Per-k global histograms: one per decimation, exact counts + moments.
         @test [h.k for h in ms.hists] == [1, 2, 3]
         for h in ms.hists
             @test sum(h.counts) + h.under + h.over == h.total
@@ -301,6 +301,24 @@ if isfile(EXAMPLE_FFT)
             @test h.total == sum(s.n for s in ms.blocks if s.k == h.k)
             @test h.vmin <= hist_quantile(h, 0.5) <= h.vmax
             @test hist_quantile(h, 0.1) <= hist_quantile(h, 0.9)   # monotone
+        end
+
+        # Windowed histograms: nwin per k, and each k's windows must sum back to
+        # its band-wide histogram (counts, total, exact moments) -- i.e. the
+        # per-k `hists` is exactly the merge of the per-window `whists`.
+        @test Set(h.k for h in ms.whists) == Set([1, 2, 3])
+        for h in ms.whists
+            @test count(w -> w.k == h.k, ms.whists) == ms.nwin
+            @test h.flo < h.fhi                                    # window has positive width
+        end
+        for g in ms.hists
+            wk = [h for h in ms.whists if h.k == g.k]
+            @test sum(h.total for h in wk) == g.total
+            @test sum(h.sum for h in wk) ≈ g.sum
+            @test mapreduce(h -> h.counts, +, wk) == g.counts
+            # windows tile the k band contiguously, low -> high
+            sort!(wk; by = h -> h.win)
+            @test all(wk[i].fhi ≈ wk[i+1].flo for i in 1:length(wk)-1)
         end
 
         # Summary: exact mean matches the histogram accumulator; nbins ordering
@@ -316,6 +334,12 @@ if isfile(EXAMPLE_FFT)
         end
         @test summ[1].mean > summ[2].mean > summ[3].mean          # more bins -> higher floor
         @test summ[1].fap[1] > summ[3].fap[1]                     # same FAP -> higher threshold at k=1
+
+        # Windowed summary rows: only nonempty windows, tagged with their k/win.
+        wrows = metricstats_windows(ms; faps=(0.1, 0.01))
+        @test !isempty(wrows)
+        @test all(r.ntrials > 0 for r in wrows)
+        @test Set(r.k for r in wrows) ⊆ Set([1, 2, 3])
     end
 else
     @info "Skipping search data tests; example file not found" EXAMPLE_FFT
