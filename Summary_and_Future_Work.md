@@ -250,7 +250,8 @@ the throughput-tuning/tiling items below are lower-value than expected.
       `pexp=1/2` is the calibrated matched filter (equivalent-σ); larger `pexp`
       suppresses high-duty-cycle signals (broad or many-toothed RFI) while
       leaving narrow pulses — even widely separated multi-component/interpulse —
-      alone, since it keys on *how many* bins are lit, not *where*. **Default.**
+      alone, since it keys on *how many* bins are lit, not *where*. Was the
+      default; superseded by `:boxcar` (see below).
     - `:sd2` — `width = Σd²`, the summed squared modular phase distance of the
       on-pulse bins from the peak. Penalises phase *spread*; larger `pexp`
       down-weights scattered profiles harder, but also genuine wide doubles.
@@ -305,12 +306,13 @@ the throughput-tuning/tiling items below are lower-value than expected.
     expected-max-over-phase-trials growth (does not move the detection threshold),
     and the ~2× low-f/high-f drift that remains is the *same* red-noise structure
     for every `k` (per-`k` FAP=1e-4 min ~4.9–5.1), cleanly separated from
-    decimation. **This is the preferred path** and largely obviates `--normalize`'s
-    motivation; the frequency (red-noise) drift is the only thing left for a
-    per-`f` threshold, and it is now `k`-independent. *Still worth doing:*
+    decimation. **This is now the default metric** (`SearchParams.metric` /
+    `--metric boxcar`) and largely obviates `--normalize`'s motivation; the
+    frequency (red-noise) drift is the only thing left for a per-`f` threshold, and
+    it is now `k`-independent. `:non`/`:sd2` remain available. *Still worth doing:*
     injected-signal width/S/N validation, a semi-analytic trials-factor →
-    equivalent-σ map (the analytic EVD makes this tractable now), and deciding
-    whether `:boxcar` becomes the default (retiring `:non`/`--normalize`).
+    equivalent-σ map (the analytic EVD makes this tractable now), and eventually
+    retiring `:non`/`--normalize` once `:boxcar` is validated on more surveys.
 
 - **Threshold calibration across metric / `pexp` / decimation (to investigate).**
   The metric's numeric scale is *not* comparable across `--metric` or `--pexp`,
@@ -441,10 +443,12 @@ the throughput-tuning/tiling items below are lower-value than expected.
     Besides the absolute σ, this yields the **base `loc`/`scale` numbers** the
     single-pass scheme above needs to escape the 2× penalty.
 
-- **Default metric produces many non-pulsar-like false positives (to
-  investigate; may change defaults).** On real data the current defaults
-  `--metric non --pexp 0.5` empirically generate *many* more false-positive
-  candidates than `--metric sd2` at a comparable threshold. Crucially, a large
+- **`:non`/`:sd2` produce many non-pulsar-like false positives (largely
+  superseded by the `:boxcar` default).** This item motivated the `:boxcar`
+  switch and is mostly of historical interest now; re-evaluate it for `:boxcar`.
+  On real data the *former* defaults `--metric non --pexp 0.5` empirically
+  generate *many* more false-positive candidates than `--metric sd2` at a
+  comparable threshold. Crucially, a large
   fraction of the `non` false positives are not merely marginal — their
   reconstructed profiles (now easy to eyeball via the candidate profile plots)
   look like **random noise**, with no narrow, low-duty-cycle pulse of the kind

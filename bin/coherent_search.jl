@@ -22,12 +22,13 @@ function parse_cmdline(argv)
         FFT produces meaningless (hugely inflated) S/N values.  Normalize an
         un-normalized FFT with PRESTO's `rednoise` routine, which also removes red
         noise.  The FFT should also be barycentered and have known RFI zapped.  The
-        detection metric (--metric) is either an on-pulse flux sum divided by a
-        width penalty -- 'non' = N_on^p (duty cycle; p=1/2 is a calibrated
-        equivalent-σ, larger p suppresses broad/RFI-like signals) or 'sd2' = Σd²^p
-        (phase spread) -- or 'boxcar', the peak boxcar matched-filter S/N over a
-        geometric bank of top-hat widths, whose pure-noise distribution is analytic
-        and (unlike 'non'/'sd2') flat across harmonic decimations.
+        detection metric (--metric) defaults to 'boxcar', the peak boxcar
+        matched-filter S/N over a geometric bank of top-hat widths, whose pure-noise
+        distribution is analytic and (unlike the others) flat across harmonic
+        decimations, so one --threshold means one false-alarm rate for every k.  The
+        older width-penalised on-pulse sums are also available: 'non' = N_on^p (duty
+        cycle; p=1/2 is a calibrated equivalent-σ, larger p suppresses broad/RFI-like
+        signals) or 'sd2' = Σd²^p (phase spread).
         Near-identical candidates are collapsed by default (--noremove disables it),
         as are harmonically-related ones -- the f/2, 2f, 3f/2, ... family of a real
         signal (--noharmremove disables it, --numharm sets the max harmonic).
@@ -85,9 +86,9 @@ function parse_cmdline(argv)
             arg_type = Float64
             default = 0.2
         "--metric"
-            help = "Detection metric: 'non' (N_on^p, duty cycle), 'sd2' (Σd²^p, phase spread), or 'boxcar' (peak boxcar matched-filter S/N; analytic noise, flat across decimations)"
+            help = "Detection metric: 'boxcar' (peak boxcar matched-filter S/N; analytic noise, flat across decimations; default), 'non' (N_on^p, duty cycle), or 'sd2' (Σd²^p, phase spread)"
             arg_type = String
-            default = "non"
+            default = "boxcar"
             range_tester = x -> x in ("non", "sd2", "boxcar")
         "--pexp"
             help = "Width-penalty exponent p (1/2 = calibrated matched filter for 'non')"

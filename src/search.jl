@@ -44,7 +44,7 @@ Base.@kwdef struct SearchParams
     threshold::Float64 = 8.0
     align::Bool = true      # per-harmonic numbetween matched to deltar_h
     xsignal::Float64 = 0.2  # peak fraction bounding the on-pulse signal region (:non/:sd2 only)
-    metric::Symbol = :non   # :non (N_on^pexp), :sd2 (Σd²^pexp), or :boxcar (matched filter)
+    metric::Symbol = :boxcar  # :boxcar (matched filter; default), :non (N_on^pexp), :sd2 (Σd²^pexp)
     pexp::Float64 = 0.5     # width-penalty exponent (1/2 = calibrated for :non; :non/:sd2 only)
     boxcar_fsp::Float64 = 1.5    # :boxcar geometric width-recurrence factor (riptide default)
     boxcar_maxfrac::Float64 = 0.3  # :boxcar widest boxcar as a fraction of nbins

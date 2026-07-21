@@ -85,6 +85,7 @@ end
 
 @testset "boxcar metric: scale-invariant, robust, detects a pulse" begin
     nbins = 64
+    @test SearchParams().metric === :boxcar      # :boxcar is now the default metric
 
     # A ratio of two linear-in-amplitude quantities: invariant to overall scale
     # (this is why the unnormalised brfft hot path and the normalised reference
@@ -157,7 +158,8 @@ if isfile(EXAMPLE_FFT)
     @testset "optimised path reproduces the reference (align=false)" begin
         # With a fixed numbetween and one chunk, the production path uses the
         # same grids as block_metrics, so it should match to ~machine precision.
-        params = SearchParams(nharms=32, m=32, numbetween=16, align=false)
+        # Pinned on :non, the oracle-validated (Python-pinned) reference metric.
+        params = SearchParams(nharms=32, m=32, numbetween=16, align=false, metric=:non)
         lodr = params.hidr / params.nharms
         rstart = 10010.0
         n = 256
@@ -226,7 +228,7 @@ if isfile(EXAMPLE_FFT)
     end
 
     @testset "detects the 10.0123 Hz pulsar" begin
-        params = SearchParams(nharms=32, m=32, numbetween=16)
+        params = SearchParams(nharms=32, m=32, numbetween=16, metric=:non)
         cands = search(ft, params; lofreq=9.5, hifreq=10.5, threshold=8.0)
         @test !isempty(cands)
         best = cands[argmax(c.metric for c in cands)]
@@ -247,7 +249,9 @@ if isfile(EXAMPLE_FFT)
     end
 
     @testset "chunk size does not change the detection" begin
-        params = SearchParams(nharms=32, m=32, numbetween=16)
+        # :non is a pure per-profile metric, so it is exactly chunk-invariant
+        # (:boxcar's per-block σ makes it only approximately so, by design).
+        params = SearchParams(nharms=32, m=32, numbetween=16, metric=:non)
         c1 = search(ft, params; lofreq=9.5, hifreq=10.5, threshold=8.0, blocksize=512)
         c2 = search(ft, params; lofreq=9.5, hifreq=10.5, threshold=8.0, blocksize=4096)
         b1 = c1[argmax(c.metric for c in c1)]
@@ -265,14 +269,14 @@ if isfile(EXAMPLE_FFT)
             nharms = 60
             Hk = fld(nharms, k)
             params = SearchParams(nharms=nharms, m=32, numbetween=16, align=false,
-                                  decimations=[1, k])
+                                  decimations=[1, k], metric=:non)
             lodr = params.hidr / nharms
             rstart = 5000.0
             n = 64
             rfund = rstart .+ (0:n-1) .* lodr
 
             # Native reduced-harmonic fold at the multiplied frequencies.
-            pnat = SearchParams(nharms=Hk, m=32, numbetween=16, align=false)
+            pnat = SearchParams(nharms=Hk, m=32, numbetween=16, align=false, metric=:non)
             ref = block_metrics(ft, k .* rfund, pnat)
 
             # Decimated fold via the production path.
@@ -297,7 +301,7 @@ if isfile(EXAMPLE_FFT)
         nharms = 60
         for k in (2, 3)
             base_f = f / k                            # fundamental band that only k hits
-            params = SearchParams(nharms=nharms, decimations=decimation_set(nharms, k))
+            params = SearchParams(nharms=nharms, decimations=decimation_set(nharms, k), metric=:non)
             # harm_remove=false to isolate decimation: otherwise the whole f/k, 2f/k,
             # ... family (which decimation lights up) collapses to its single
             # strongest member, which need not be the direct-f (k-pass) detection.
