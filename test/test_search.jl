@@ -273,36 +273,49 @@ if isfile(EXAMPLE_FFT)
         @test surv.freq == strongest.freq && surv.metric == strongest.metric
     end
 
-    @testset "metricstats: read-only diagnostic, correct per-k aggregation" begin
+    @testset "metricstats: read-only diagnostic, histograms + per-k aggregation" begin
         nharms = 60
         params = SearchParams(nharms=nharms, decimations=decimation_set(nharms, 3))
         kw = (lofreq=8.0, hifreq=12.0, threshold=8.0, blocksize=1024)
-        # Collecting stats must not change the candidate results.
+        # Collecting stats must not change the candidate results.  (This example
+        # file is signal-dominated, with metric values far above the default
+        # histogram range, so widen it here to keep the quantiles in-range.)
         ref = search(ft, params; kw...)
-        ms = BlockMetricStats[]
+        ms = MetricStats(hist_hi=30000.0, hist_nb=6000)
         with = search(ft, params; kw..., metricstats=ms)
         @test length(with) == length(ref)
         @test all(a.freq == b.freq && a.metric == b.metric for (a, b) in zip(with, ref))
 
-        @test !isempty(ms)
-        @test Set(s.k for s in ms) == Set([1, 2, 3])
-        @test all(s.nbins == 2 * s.Hk for s in ms)
-        @test all(s.Hk == fld(nharms, s.k) for s in ms)
-        @test all(s.min <= s.median <= s.max && s.min <= s.mean <= s.max for s in ms)
+        # Per-block table
+        @test !isempty(ms.blocks)
+        @test Set(s.k for s in ms.blocks) == Set([1, 2, 3])
+        @test all(s.nbins == 2 * s.Hk for s in ms.blocks)
+        @test all(s.Hk == fld(nharms, s.k) for s in ms.blocks)
+        @test all(s.min <= s.median <= s.max && s.min <= s.mean <= s.max for s in ms.blocks)
 
-        # Summary aggregation: global mean reconstructed from per-block moments
-        # must equal the trial-count-weighted mean of the blocks; nbins ordering
-        # must show the sqrt(nbins) noise-floor growth (k=1 mean > k=2 > k=3).
-        summ = metricstats_summary(ms)
+        # Per-k histograms: one per decimation, exact counts, exact moments.
+        @test [h.k for h in ms.hists] == [1, 2, 3]
+        for h in ms.hists
+            @test sum(h.counts) + h.under + h.over == h.total
+            # histogram total == sum of that k's per-block trial counts
+            @test h.total == sum(s.n for s in ms.blocks if s.k == h.k)
+            @test h.vmin <= hist_quantile(h, 0.5) <= h.vmax
+            @test hist_quantile(h, 0.1) <= hist_quantile(h, 0.9)   # monotone
+        end
+
+        # Summary: exact mean matches the histogram accumulator; nbins ordering
+        # shows the sqrt(nbins) noise-floor growth (k=1 mean > k=2 > k=3); and the
+        # FAP thresholds are monotone in k the same way.
+        summ = metricstats_summary(ms; faps=(0.1, 0.01, 1e-3))
         @test [r.k for r in summ] == [1, 2, 3]
-        for r in summ
-            rs = filter(s -> s.k == r.k, ms)
-            N = sum(s.n for s in rs)
-            @test r.ntrials == N
-            @test r.mean ≈ sum(s.mean * s.n for s in rs) / N
-            @test r.max == maximum(s.max for s in rs)
+        for (r, h) in zip(summ, ms.hists)
+            @test r.ntrials == h.total
+            @test r.mean ≈ h.sum / h.total
+            @test r.max == h.vmax
+            @test length(r.fap) == 3
         end
         @test summ[1].mean > summ[2].mean > summ[3].mean          # more bins -> higher floor
+        @test summ[1].fap[1] > summ[3].fap[1]                     # same FAP -> higher threshold at k=1
     end
 else
     @info "Skipping search data tests; example file not found" EXAMPLE_FFT

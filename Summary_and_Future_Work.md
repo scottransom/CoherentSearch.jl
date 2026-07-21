@@ -299,19 +299,50 @@ the throughput-tuning/tiling items below are lower-value than expected.
     decimations. **Diagnose with `--metricstats`** (see below) before changing the
     metric.
 
-- **`--metricstats` diagnostic (implemented).** `--metricstats` reports the
-  metric distribution — min / median / mean / std / max — for every processed
-  block *and* every harmonic decimation, without perturbing the candidate results
-  (verified byte-identical, and read-only by construction). A per-decimation
-  summary prints to `stderr` (the actionable view for picking `--threshold`: it
-  shows each `k`'s floor, the mean of per-block maxima, and the global max noise
-  excursion), and the full per-block table — with the per-block `ngoodbins` and
-  searched frequency range, so the extra Nyquist-limited drop in `ngoodbins` at
-  high frequency is visible too — is written to `<stem>_metricstats.txt` for
-  offline plotting/fitting. Plumbed through `search(...; metricstats=sink)`
-  ([`BlockMetricStats`](@ref), [`metricstats_summary`](@ref)); collection allocates
-  only a per-task metric buffer and is disabled by default. This is the data
-  source for the false-alarm-rate-vs-threshold fit the calibration item needs.
+- **`--metricstats` diagnostic (implemented).** `--metricstats` reports the metric
+  distribution over *every* trial (not just those above threshold), for every
+  harmonic decimation, without perturbing the candidate results (verified
+  byte-identical, and read-only by construction). Two complementary views are
+  collected into a `MetricStats` sink (`search(...; metricstats=ms)`):
+  - **Per-`k` histograms** (`MetricHistogram`, one streaming pass, bounded memory:
+    a fixed `[lo,hi)` linear histogram plus over/underflow and exact
+    `total/sum/sumsq/min/max` accumulators). These give the *exact* global
+    moments and *empirical* per-`k` quantiles (`hist_quantile`) — hence per-`k`
+    false-alarm thresholds. The `stderr` summary tabulates, for each `k`, the
+    metric value at single-trial FAP = 1e-1 … 1e-5, which is the directly
+    actionable view: on `PM0063…red.fft` (5–30 Hz) the FAP=1e-4 threshold runs
+    9.78 (k=1, 120 bins) → 5.91 (k=6, 20 bins), so a single `--threshold` picks a
+    wildly different false-alarm rate per decimation. The histograms are written
+    to `<stem>_metrichist.txt` for offline fitting. (The default range `[0,64)` is
+    sized for a *normalised* FFT; a signal-/RFI-dominated or un-normalised input
+    overflows it, which the summary flags — moments stay exact, only quantiles are
+    range-limited. Range/resolution are `MetricStats` keyword args.)
+  - **Per-block, per-decimation stats** (`BlockMetricStats`: min/median/mean/std/max
+    per processed block) written to `<stem>_metricstats.txt`, with the per-block
+    `ngoodbins` and searched frequency range so the frequency dependence of the
+    floor (red-noise excess at low `f`, the Nyquist `ngoodbins` rolloff at high
+    `f`) is visible.
+  Collection allocates only per-task buffers/histograms and is off by default.
+  This is the first piece of the hybrid threshold-calibration plan (below): the
+  per-`k` empirical quantiles are exactly the substrate the dynamic
+  normalisation path needs. *Next increment:* frequency-windowed histograms (so
+  the low-`f` red-noise and high-`f` Nyquist regimes get their own quantiles) and
+  a pure-noise-simulation calibration to give the quantiles an absolute
+  equivalent-σ meaning and validate the in-situ estimator.
+
+- **Threshold-calibration plan — hybrid, in progress.** The agreed direction:
+  (1) *dynamic, in-situ* per-`k` normalisation as the shipping default — measure
+  each decimation's noise location/scale (better: empirical tail *quantile*, since
+  the metric is non-Gaussian and only shift-, not scale-, invariant across
+  `nbins`) from the search data itself, in frequency-local windows, so it absorbs
+  the real data's normalisation, red-noise residual, and Nyquist rolloff that a
+  static table cannot know; threshold on the normalised statistic (or equalise
+  the empirical per-`k` false-alarm rate directly). (2) *Offline pure-noise
+  simulation* (or a semi-analytic `μ(nbins)≈a√nbins+b`, `σ≈const` fit plus one
+  tail template, since measured `σ` is ~flat across `k` while the mean scales
+  `√nbins`) to give the normalised statistic an absolute FAP/equivalent-σ with the
+  trials factor folded in, and to validate that the in-situ estimator matches
+  ideal noise. `--metricstats`' per-`k` histograms are step one.
 
 - **Default metric produces many non-pulsar-like false positives (to
   investigate; may change defaults).** On real data the current defaults

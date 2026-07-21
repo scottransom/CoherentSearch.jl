@@ -678,37 +678,147 @@ function _block_stats(block::Integer, k::Integer, Hk::Integer, nbins::Integer,
 end
 
 """
-    metricstats_summary(stats) -> Vector{<:NamedTuple}
+    MetricHistogram
 
-Aggregate a vector of [`BlockMetricStats`](@ref) into one row per decimation
-factor `k` (sorted by `k`).  `min`/`max`/`mean`/`std` are the exact global
-values across all blocks of that `k` (the global std is reconstructed from the
-per-block moments); `median` is the median of the per-block medians (a robust
-stand-in for the exact global median, which the per-block reduction does not
-retain); `blockmax_mean` is the mean of the per-block maxima — the typical
-worst-case noise excursion per block, which is what a false-alarm-driven
-threshold trades against.
+A fixed-range, fixed-width histogram of every trial's detection metric for one
+decimation factor `k` (`Hk` harmonics, `nbins = 2*Hk`), accumulated in one
+streaming pass over the whole search.  This is the bounded-memory substrate for
+*exact* per-`k` empirical quantiles (and thus per-`k` false-alarm thresholds):
+`counts[i]` covers `[lo + (i-1)·w, lo + i·w)` with `w = (hi-lo)/length(counts)`;
+`under`/`over` catch values outside `[lo, hi)`.  `total`, `sum`, `sumsq`,
+`vmin`, `vmax` are kept exactly (independent of the binning), so the mean, std,
+min and max are exact regardless of range — only the quantiles are resolved to
+the bin width.  One per task, summed across tasks after the parallel region.
 """
-function metricstats_summary(stats::AbstractVector{BlockMetricStats})
-    ks = sort!(unique(s.k for s in stats))
-    rows = map(ks) do k
-        rs = filter(s -> s.k == k && s.n > 0, stats)
-        isempty(rs) && return (k=k, Hk=0, nbins=0, nblocks=0, ntrials=0,
-                               min=NaN, median=NaN, mean=NaN, std=NaN,
-                               blockmax_mean=NaN, max=NaN)
-        N = sum(s.n for s in rs)
-        gmean = sum(s.mean * s.n for s in rs) / N
-        # Global Σ(x-gmean)² = Σ_block[(n-1)·s² + n·(mean-gmean)²]; exact.
-        ss = sum(((s.n - 1) * s.std^2 + s.n * (s.mean - gmean)^2) for s in rs)
-        gstd = N > 1 ? sqrt(ss / (N - 1)) : 0.0
-        blockmeds = sort!([s.median for s in rs])
-        L = length(blockmeds)
-        gmed = isodd(L) ? blockmeds[(L + 1) ÷ 2] :
-               0.5 * (blockmeds[L ÷ 2] + blockmeds[L ÷ 2 + 1])
-        (k=k, Hk=rs[1].Hk, nbins=rs[1].nbins, nblocks=length(rs), ntrials=N,
-         min=minimum(s.min for s in rs), median=gmed, mean=gmean, std=gstd,
-         blockmax_mean=sum(s.max for s in rs) / length(rs),
-         max=maximum(s.max for s in rs))
+mutable struct MetricHistogram
+    const k::Int
+    const Hk::Int
+    const nbins::Int
+    const lo::Float64
+    const hi::Float64
+    const invw::Float64          # 1/binwidth
+    const counts::Vector{Int}
+    under::Int
+    over::Int
+    total::Int
+    sum::Float64
+    sumsq::Float64
+    vmin::Float64
+    vmax::Float64
+end
+
+function MetricHistogram(k::Integer, Hk::Integer, lo::Real, hi::Real, nb::Integer)
+    hi > lo || throw(ArgumentError("histogram hi ($hi) must exceed lo ($lo)"))
+    nb >= 1 || throw(ArgumentError("histogram bin count must be ≥ 1"))
+    return MetricHistogram(Int(k), Int(Hk), 2 * Int(Hk), Float64(lo), Float64(hi),
+                           nb / (hi - lo), zeros(Int, nb), 0, 0, 0, 0.0, 0.0, Inf, -Inf)
+end
+
+@inline function _hist_push!(h::MetricHistogram, x::Float64)
+    h.total += 1
+    h.sum += x
+    h.sumsq += x * x
+    x < h.vmin && (h.vmin = x)
+    x > h.vmax && (h.vmax = x)
+    if x < h.lo
+        h.under += 1
+    elseif x >= h.hi
+        h.over += 1
+    else
+        @inbounds h.counts[floor(Int, (x - h.lo) * h.invw) + 1] += 1
+    end
+    return
+end
+
+# Sum `b` into `a` in place (identical binning assumed; both from the same run).
+function _hist_merge!(a::MetricHistogram, b::MetricHistogram)
+    @inbounds for i in eachindex(a.counts)
+        a.counts[i] += b.counts[i]
+    end
+    a.under += b.under; a.over += b.over; a.total += b.total
+    a.sum += b.sum; a.sumsq += b.sumsq
+    a.vmin = min(a.vmin, b.vmin); a.vmax = max(a.vmax, b.vmax)
+    return a
+end
+
+"""
+    hist_quantile(h, q) -> Float64
+
+The `q`-th quantile (`0 ≤ q ≤ 1`) of the metric values in `h`, linearly
+interpolated within the containing bin.  Returns `h.hi` (and the caller should
+treat it as a lower bound) when the quantile falls in the overflow — i.e. the
+range was too small; check `h.over / h.total` against `1-q`.
+"""
+function hist_quantile(h::MetricHistogram, q::Real)
+    h.total == 0 && return NaN
+    target = q * h.total
+    cum = h.under
+    cum >= target && return h.lo
+    w = 1 / h.invw
+    @inbounds for i in eachindex(h.counts)
+        c = h.counts[i]
+        if cum + c >= target
+            edge = h.lo + (i - 1) * w
+            return c == 0 ? edge : edge + (target - cum) / c * w
+        end
+        cum += c
+    end
+    return h.hi           # in the overflow tail
+end
+
+"""
+    MetricStats
+
+Opt-in diagnostic sink passed to [`search`](@ref) (the `--metricstats` CLI
+option).  Holds two complementary views of the detection metric over *all*
+trials (not just those above `threshold`):
+
+  * `blocks` — one [`BlockMetricStats`](@ref) per processed block per
+    decimation, i.e. frequency-resolved min/median/mean/std/max.  Exposes the
+    frequency dependence of the noise floor (red-noise excess at low `f`, the
+    `ngoodbins` Nyquist rolloff at high `f`).
+  * `hists` — one [`MetricHistogram`](@ref) per decimation `k`, accumulated over
+    the whole band, giving exact global moments and empirical per-`k` quantiles
+    (hence per-`k` false-alarm thresholds via [`hist_quantile`](@ref)).
+
+Construct empty (optionally overriding the histogram range/resolution) and pass
+to `search`; it is filled after the parallel region.  Collecting it does not
+change the candidate results.
+"""
+mutable struct MetricStats
+    hist_lo::Float64
+    hist_hi::Float64
+    hist_nb::Int
+    blocks::Vector{BlockMetricStats}
+    hists::Vector{MetricHistogram}
+end
+MetricStats(; hist_lo::Real=0.0, hist_hi::Real=64.0, hist_nb::Integer=3200) =
+    MetricStats(Float64(hist_lo), Float64(hist_hi), Int(hist_nb),
+                BlockMetricStats[], MetricHistogram[])
+
+"""
+    metricstats_summary(ms; faps=(0.1, 0.01, 1e-3, 1e-4)) -> Vector{<:NamedTuple}
+
+One row per decimation `k` (sorted by `k`) summarising [`MetricStats`](@ref).
+`ntrials`/`mean`/`std`/`min`/`max` are exact (from the histogram accumulators);
+`median` and the `fap` metric values are empirical quantiles read from the
+per-`k` histogram — `fap[i]` is the metric threshold whose single-trial,
+single-decimation false-alarm probability is `faps[i]` (i.e. the `1-faps[i]`
+quantile).  `overflow` is the fraction of trials above the histogram range (the
+`fap` values are unreliable once it exceeds the smallest requested `fap`).
+`nblocks` counts the contributing blocks.
+"""
+function metricstats_summary(ms::MetricStats; faps=(0.1, 0.01, 1e-3, 1e-4))
+    rows = map(ms.hists) do h
+        nblocks = count(s -> s.k == h.k && s.n > 0, ms.blocks)
+        N = h.total
+        mean = N > 0 ? h.sum / N : NaN
+        std = N > 1 ? sqrt(max(0.0, (h.sumsq - N * mean^2) / (N - 1))) : 0.0
+        (k=h.k, Hk=h.Hk, nbins=h.nbins, nblocks=nblocks, ntrials=N,
+         min=(N > 0 ? h.vmin : NaN), median=hist_quantile(h, 0.5), mean=mean, std=std,
+         max=(N > 0 ? h.vmax : NaN),
+         fap=Tuple(hist_quantile(h, 1 - p) for p in faps),
+         overflow=(N > 0 ? h.over / N : 0.0))
     end
     return rows
 end
@@ -725,13 +835,15 @@ harmonics) to `out`.  Trials whose decimated fundamental `k·rf` reaches Nyquist
 are skipped.  Nearly free relative to the interpolation the base pass paid.
 
 When a `stats` sink (a `Vector{BlockMetricStats}`) is passed, every folded
-trial's metric is also gathered and a [`BlockMetricStats`](@ref) for this
-`(block, k)` is appended — the opt-in `--metricstats` diagnostic.
+trial's metric is gathered into a [`BlockMetricStats`](@ref) for this
+`(block, k)`, and (if a `hist` is also passed) streamed into the per-`k`
+[`MetricHistogram`](@ref) — the opt-in `--metricstats` diagnostic.
 """
 function decim_pass!(out::Vector{Candidate}, ws::Workspace, db::DecimBuf, ft::FFTFile,
                      params::SearchParams, rstart::Real, lodr::Real, n::Integer;
                      threshold::Real=params.threshold, block::Integer=0,
-                     stats::Union{Nothing,Vector{BlockMetricStats}}=nothing)
+                     stats::Union{Nothing,Vector{BlockMetricStats}}=nothing,
+                     hist::Union{Nothing,MetricHistogram}=nothing)
     k = db.k
     Hk = db.Hk
     nbins = 2Hk
@@ -753,7 +865,10 @@ function decim_pass!(out::Vector{Candidate}, ws::Workspace, db::DecimBuf, ft::FF
         r_dec < nyq || continue                       # fundamental past Nyquist
         mval = _profile_snr(db.dprofs, j, db.medbuf, nbins, invrms,
                             1.0 / nbins, params.xsignal, params.metric, params.pexp)
-        mbuf === nothing || push!(mbuf, mval)
+        if mbuf !== nothing
+            push!(mbuf, mval)
+            hist === nothing || _hist_push!(hist, mval)
+        end
         if mval > threshold
             push!(out, Candidate(r_dec / ft.T, mval, r_dec, Hk))
         end
@@ -805,10 +920,10 @@ candidates by [`remove_harmonics`](@ref) (`harm_remove`, `numharm`, `harm_tol`).
 `progress` (`:none`, `:text`, or `:bar`) prints a chunk-completion meter to
 `stderr`.
 
-If a `metricstats` vector is supplied, per-block, per-decimation
-[`BlockMetricStats`](@ref) (the metric distribution over *every* trial, not just
-those above `threshold`) are collected and appended to it (sorted by block then
-`k`) after the search — the opt-in `--metricstats` diagnostic.  The candidate
+If a [`MetricStats`](@ref) is supplied as `metricstats`, the metric of *every*
+trial (not just those above `threshold`) is accumulated into it — per-block,
+per-decimation [`BlockMetricStats`](@ref) plus a per-`k` [`MetricHistogram`](@ref)
+for empirical quantiles — the opt-in `--metricstats` diagnostic.  The candidate
 results are identical whether or not `metricstats` is collected.
 """
 function search(ft::FFTFile, params::SearchParams=SearchParams();
@@ -817,7 +932,7 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
                 remove::Bool=true, dr_tol::Real=1.0,
                 harm_remove::Bool=true, numharm::Integer=16, harm_tol::Real=1.0,
                 progress::Symbol=:none,
-                metricstats::Union{Nothing,Vector{BlockMetricStats}}=nothing)
+                metricstats::Union{Nothing,MetricStats}=nothing)
     progress in (:none, :text, :bar) ||
         throw(ArgumentError("progress must be :none, :text or :bar, got :$progress"))
     FFTW.set_num_threads(1)   # parallelise at the Julia-task level, not inside FFTW
@@ -841,14 +956,22 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
     workspaces = [Workspace(params, hplans, Nprof) for _ in 1:nt]
 
     collect_stats = metricstats !== nothing
+    # Decimation factors present (base pass = k=1, plus each Workspace DecimBuf).
+    statks = collect_stats ? sort!(unique(vcat(1, [db.k for db in workspaces[1].decims]))) : Int[]
     results = Vector{Vector{Candidate}}(undef, nt)
     statparts = collect_stats ? Vector{Vector{BlockMetricStats}}(undef, nt) : nothing
+    histparts = collect_stats ? Vector{Dict{Int,MetricHistogram}}(undef, nt) : nothing
     done = Atomic{Int}(0)     # chunks completed across all tasks (for the progress meter)
     @sync for t in 1:nt
         @spawn begin
             ws = workspaces[t]
             out = Candidate[]
             stats = collect_stats ? BlockMetricStats[] : nothing
+            hists = collect_stats ?
+                Dict(k => MetricHistogram(k, fld(params.nharms, k),
+                                          metricstats.hist_lo, metricstats.hist_hi,
+                                          metricstats.hist_nb) for k in statks) :
+                nothing
             mbuf = collect_stats ? Vector{Float64}(undef, Nprof) : nothing
             c = t
             while c <= nchunks
@@ -859,9 +982,13 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
                 rmean = rstart + (n - 1) * lodr / 2
                 ngood = chunk_ngoodbins(ft, params.nharms, rmean)
                 invrms = sqrt(2 * ngood + 1)
+                basehist = collect_stats ? hists[1] : nothing
                 for j in 1:n
                     metric = _profile_snr(ws.profs, j, ws.medbuf, nbins, invrms, 1.0 / nbins, params.xsignal, params.metric, params.pexp)
-                    collect_stats && (mbuf[j] = metric)
+                    if collect_stats
+                        mbuf[j] = metric
+                        _hist_push!(basehist, metric)
+                    end
                     if metric > threshold
                         rf = rstart + (j - 1) * lodr
                         push!(out, Candidate(rf / ft.T, metric, rf, params.nharms))
@@ -876,7 +1003,8 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
                 # base harmonic amplitudes already in ws.ftprofs (see decimation_design.md).
                 for db in ws.decims
                     decim_pass!(out, ws, db, ft, params, rstart, lodr, n;
-                                threshold=threshold, block=c, stats=stats)
+                                threshold=threshold, block=c, stats=stats,
+                                hist=(collect_stats ? hists[db.k] : nothing))
                 end
                 atomic_add!(done, 1)
                 # One task owns the display (avoids interleaved \r writes); it reads
@@ -885,7 +1013,10 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
                 c += nt
             end
             results[t] = out
-            collect_stats && (statparts[t] = stats)
+            if collect_stats
+                statparts[t] = stats
+                histparts[t] = hists
+            end
         end
     end
     if progress !== :none                    # clean 100% line after the parallel region
@@ -895,7 +1026,16 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
     if collect_stats
         allstats = reduce(vcat, statparts; init=BlockMetricStats[])
         sort!(allstats; by = s -> (s.block, s.k))
-        append!(metricstats, allstats)
+        append!(metricstats.blocks, allstats)
+        # Sum each task's per-k histograms into one merged histogram per k.
+        for k in statks
+            merged = histparts[1][k]
+            for t in 2:nt
+                _hist_merge!(merged, histparts[t][k])
+            end
+            push!(metricstats.hists, merged)
+        end
+        sort!(metricstats.hists; by = h -> h.k)
     end
 
     cands = reduce(vcat, results; init=Candidate[])
