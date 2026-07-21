@@ -245,6 +245,52 @@ The takeaway: with decimation as the default, **detection-metric cost scales wit
 `maxdecim` while interpolation is amortised**, so metric optimisation is the
 highest-leverage work — the opposite of the pre-decimation conclusion.
 
+### Metric optimisations landed (2026-07-21) — 68.6 s → 45.5 s (1.51×)
+
+Both metric levers above were implemented, each validated by the full test suite
+and a byte-identical candidate-file diff:
+
+1. **Vectorised the boxcar width×phase scan.** Restructured `_profile_boxcar`'s
+   inner loop to a per-width max-reduction over the strided prefix-sum difference
+   `psum[p+w]−psum[p]` (the monotone `invsw` lifts out: `max_p(dₚ·invsw) =
+   (max_p dₚ)·invsw`). **Plain `@simd` + `max` auto-vectorises** (verified IR:
+   `vector.body`, `<N×double>` loads, vectorised `fmax` reduce) — **no
+   `LoopVectorization` dependency**, so start-up/precompile cost is unchanged.
+   Result-preserving to the bit. Bucket 24.9% → 18.5%, ~5% end-to-end.
+2. **Made the per-profile median mostly disappear.** Two parts:
+   - **Sorting-network median for short profiles.** A Batcher odd-even mergesort
+     network (branch-free `min`/`max` compare-exchanges) beats quickselect for the
+     small `nbins` decimation produces — measured ~2.0× at n=20, ~1.75× at n=30,
+     ~1.28× at n=60, crossing to a loss by n=120 — so it is used for `nbins ≤
+     _MED_NET_MAX (=64)` and quickselect for the base pass. A full sort's two
+     central order statistics are identical to quickselect's, so the value is
+     bit-for-bit unchanged.
+   - **Adaptive zero-baseline gate (the big one).** The profile spectrum's DC bin
+     is held at zero, so **every profile's mean is exactly 0** (verified `|mean|/σ
+     ≈ 5e-17`). The median only departs from 0 when a real pulse skews the profile,
+     and the baseline error propagates into the metric as `−δ·√w/σ` — negligible
+     for the narrow pulses we target, largest for wide boxcars. So `_profile_boxcar`
+     first scans against a **zero** baseline (no median); because a positive pulse
+     has median ≤ 0, that `m₀` is a lower bound on the true metric, with the gap
+     bounded by `|med|·√wₘₐₓ/σ` (empirically ≤ 1.23). Only if `m₀ ≥ threshold −
+     boxcar_medmargin` (default 2.0) does it pay for the exact median and rescan.
+     On real data this computes the median for only ~1% of trials (the rest are
+     pure noise, safely below threshold) while keeping every candidate exact. The
+     metricstats/normalize/reference paths force the exact median (`medcut = −∞`).
+   Together: **median-select 31.2% → 5.5%** (≈20.4 s → 2.5 s, ~8×), full run
+   **65.3 s → 45.5 s**.
+
+**New split (5–30 Hz, single-thread, 45.5 s):** FFTW **49.7%**, boxcar-metric
+23.6%, interp 10.1%, median-select 5.5%, decim 4.9%, uniform 3.7%, block-σ 1.9%.
+Grouped: interp/FFT ≈ 68%, metric ≈ 31% — the balance has **flipped back**, and
+**FFTW is now unambiguously the top cost.** The next lever is therefore the
+`ComplexF32` interpolation (§3), which Scott notes is precision-safe (PRESTO
+interpolates at `ComplexF32`), so the work there is re-pinning tests, not a
+numerical risk. *Caveat on the gate:* `boxcar_medmargin` is the safety dial — it
+must exceed `|med|·√wₘₐₓ/σ` for every threshold-crossing trial; 2.0 clears the
+observed 1.23 with headroom, but widen it if broader real-data validation ever
+shows a near-threshold broad-signal miss.
+
 ---
 
 ## 3. Next steps
