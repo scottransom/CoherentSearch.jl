@@ -267,10 +267,13 @@ highest-leverage work — the opposite of the pre-decimation conclusion.
 - **`ComplexF32` interpolation (FFT-side lever; 32.5%).** The `.fft` amplitudes
   are already `ComplexF32`; the interpolation pipeline widens to `ComplexF64`.
   Keeping it `ComplexF32` would ~halve the bandwidth of the FFTW and `spec.*coeffs`
-  buckets. It breaks the `Float64` oracle pins (~1e-7 vs ~1e-15), so it needs a
-  deliberate precision-mode design and fresh validation against injected fake
-  pulsars — a separate effort, not a drop-in. Still the biggest *single* bucket,
-  but no longer the top lever now that the metric outweighs it.
+  buckets. **Precision is expected to be fine physically** — PRESTO does much of
+  its Fourier interpolation at `ComplexF32` — so the real work is *not* proving the
+  science holds but *re-pinning the tests*: the `~1e-15` `Float64` oracle pins would
+  drop to `~1e-7`, so we need a parallel reduced-tolerance pin (and an
+  injected-fake-pulsar validation to confirm detection/S/N are unaffected) rather
+  than a risky numerical unknown. Still the biggest *single* bucket, but below the
+  metric-side levers in priority.
 - **Rethink FFT-correlation vs. direct interpolation.** The FFT computes ~16k
   fine-grid points per harmonic to then linear-interp only the ~`Nprof` we need; a
   cached-coefficient *direct* `O(m)` interpolation of just those points is ~7×
@@ -282,6 +285,18 @@ highest-leverage work — the opposite of the pre-decimation conclusion.
   smaller overlapping transforms only matters if a future capped `fftlen` is
   forced (e.g. a memory-constrained `ComplexF32` mode); `fill_harmonic_row!`
   leaves room for the tile loop, but it is not a throughput win on its own.
+- **Start-up latency: persist FFTW wisdom (to investigate).** A short search
+  spends a disproportionate share of wall-time *before* the hot loop: Julia's own
+  load/precompile plus the `FFTW.MEASURE` planning of every distinct `fftlen`
+  (built single-threaded up front — the more so if a future mode uses `PATIENT`).
+  `MEASURE` re-times the transforms on *every* process start. FFTW's plan cache is
+  serialisable: run a one-time (optionally `PATIENT`) planning pass and
+  `FFTW.export_wisdom(path)`, then `FFTW.import_wisdom(path)` at start-up so
+  planning collapses to a wisdom lookup. Store per-host (wisdom is CPU-specific);
+  keep `MEASURE` as the fallback when no wisdom covers a size. This attacks the
+  FFTW share of start-up specifically; the residual Julia load/precompile latency
+  is a separate, heavier question (sysimage / `PackageCompiler`) worth a look only
+  if the wisdom cache doesn't move the needle enough.
 - **Candidate de-duplication (implemented).** `remove_duplicates` (wired to the
   default; `--noremove` now disables it) collapses the run of adjacent trial
   fundamentals a single signal lights up down to its strongest member: sort by

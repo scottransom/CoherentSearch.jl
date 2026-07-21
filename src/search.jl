@@ -370,13 +370,20 @@ the identical value, and neither `ngoodbins` nor the `scale` factor is needed.
         psum[i + 1] = psum[i] + (col[idx] - med)
     end
 
+    # Per width, the peak boxcar S/N is `(max_p boxsum) * invsw` because `invsw > 0`
+    # is monotone — so the phase scan is a pure max-reduction over the strided
+    # prefix-sum difference `psum[p+w] - psum[p]` (two contiguous, `w`-shifted
+    # loads), which `@simd` vectorises; pulling `invsw` out of the inner loop
+    # returns the identical `Float64` (same winning `d`, same single multiply).
     best = -Inf
     @inbounds for w in widths
         invsw = invsigma / sqrt(float(w))
-        for p in 1:nbins
-            snr = (psum[p + w] - psum[p]) * invsw
-            snr > best && (best = snr)
+        m = psum[1 + w] - psum[1]                  # finite seed (no -Inf in the reduction)
+        @simd for p in 2:nbins
+            m = max(m, psum[p + w] - psum[p])
         end
+        cand = m * invsw
+        cand > best && (best = cand)
     end
     return best
 end
