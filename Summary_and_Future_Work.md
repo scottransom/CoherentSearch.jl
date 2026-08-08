@@ -549,6 +549,74 @@ oversampling at high harmonics became visible in the first place.
   - *`fftlen` sizing* — reopened, re-measured in situ, and re-rejected; `:pow2`
     stays the default but for different reasons than originally recorded. See §2.
     Tiling a chunk into smaller overlapping transforms remains unmotivated.
+
+- **Kadane's algorithm as a fast (approximate) boxcar metric — to investigate.**
+  The boxcar width×phase scan is now the single largest bucket (44.6%), and it is
+  an `O(nbins × nwidths)` search over a *fixed, a-priori* width bank (9 widths at
+  `nbins=120`, falling to 5 at `nbins=20` under decimation). The [`loki`
+  code](/home/sransom/git/loki) — a new Fast Folding Algorithm implementation
+  that has the same "score a huge batch of folded profiles with boxcars" problem
+  — replaces that scan with a **maximum-subarray (Kadane) sweep**, which finds the
+  best contiguous run of bins in a *single* `O(nbins)` pass with no prefix sum.
+  Worth understanding and probably worth trying. Its mechanics
+  (`lib/kadane.cpp`, `include/loki/detection/kadane.hpp`):
+
+  - **Bias-subtracted Kadane.** Plain max-subarray always prefers longer runs,
+    because the `1/√w` normalisation is not inside the recurrence. Running Kadane
+    on `x_j − mean − b` instead makes the constant `b` a per-bin length penalty,
+    so the maximising window is a proxy for the best `w`. A small bank of biases
+    then spans a range of characteristic widths — loki ships **three**
+    (`1.42, 0.76, 0.41`, `lib/configs.cpp`), all updated in one pass over the
+    bins, versus our 5–9 widths.
+  - **Wrapped pulses come free from a simultaneous min-subarray.** The complement
+    of the minimum-sum window is the maximum-sum *circular* window, so tracking
+    both in the same sweep handles a pulse straddling phase 0 — which our scan
+    handles by phase-tiling the prefix sum instead.
+  - **Different normalisation.** loki scores
+    `sum · √(nbins / (w·(nbins−w)))` rather than our `sum/(σ·√w)`; that is the
+    right factor when the baseline is estimated from the *same* profile, and it
+    is worth adopting (or at least understanding) independently of Kadane.
+  - **Vectorised across profiles, not within one.** loki transposes a batch of
+    profiles and runs the sweep SIMD-wide over the batch. **This may matter more
+    than Kadane itself for us:** our scan vectorises along phase *within* one
+    profile, and under decimation `nbins` falls to 20, where the inner loops are
+    far too short to fill a vector. We already hold `Nprof = 2048` profiles in a
+    contiguous `(nbins, Nprof)` array, so the batch axis is right there.
+
+  **The catch, and the reason this is an "approximation".** The window width
+  Kadane selects is *data-dependent*, whereas the entire justification for the
+  `:boxcar` metric (§2) is that its widths are fixed a priori, making each
+  (phase, width) trial exactly `N(0,1)` with an analytic, `nbins`-flat trials
+  factor. A data-selected width reintroduces precisely the selection bias that
+  made `:non`'s noise floor scale as `√nbins` — so a Kadane-scored metric would
+  need its own threshold calibration, and the flat-across-decimations property
+  that `:boxcar` was adopted for cannot be assumed to survive. Also, with a finite
+  bias bank the recovered window is not guaranteed optimal, so the score is a
+  *lower bound* on the true best-boxcar S/N.
+
+  **That lower-bound property is exactly what makes it attractive here, though,**
+  because `_profile_boxcar` already has a two-tier structure built for it: the
+  adaptive zero-baseline gate computes a cheap lower bound and only pays for the
+  exact version when the trial comes within `boxcar_medmargin` of threshold. A
+  Kadane sweep could slot in as (or ahead of) that cheap stage, with the exact
+  fixed-width scan run only on survivors — **which keeps the reported metric, its
+  calibration and every candidate exactly as they are today**, and confines
+  Kadane to deciding what not to bother scoring properly. That framing avoids the
+  calibration problem entirely and is how I would try it first; a
+  `--metric kadane` that reports the Kadane score directly is the more invasive
+  option and should wait on a `--metricstats` study of its noise distribution.
+
+  Concretely, in order: (1) port the bias-subtracted sweep (plus min-subarray for
+  wrapping) and check on real data how often its score brackets the exact metric,
+  and how tight the bound is — the gate needs a *guaranteed* margin, as
+  `boxcar_medmargin` does; (2) microbenchmark it against `_profile_boxcar` at
+  `nbins ∈ {20, 30, 60, 120}`, both as-is and vectorised across profiles, since
+  the operation count only falls ~2–3× and the per-bin work is higher (several
+  compare/selects per bias versus one subtract-and-max), so the win is not
+  obvious on paper; (3) separately, try the cross-profile SIMD transpose on the
+  *existing* exact scan — it may capture much of the benefit with no
+  approximation and no calibration risk at all.
+
 - **Start-up latency: persist FFTW wisdom (implemented, 2026-07-21).** A short
   search spent several seconds *before* the hot loop planning every distinct
   transform with `FFTW.MEASURE`, re-timed on every process start (building all
