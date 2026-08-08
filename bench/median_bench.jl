@@ -20,7 +20,10 @@ lodr  = params.hidr / params.nharms
 rstart = 10.0 * ft.T
 hplans = CS.build_harmonic_plans(params, Nprof)
 ws     = CS.Workspace(params, hplans, Nprof)
-CS.fill_chunk_profiles!(ws, hplans, ft, params, rstart, lodr, Nprof)  # real profiles
+# `:direct` (the default interpolator) needs the per-harmonic phase tables and a
+# *global* trial index; this bench treats `rstart` as global trial 0.
+dplans = params.interp === :direct ? CS.build_direct_plans(params, rstart) : nothing
+CS.fill_chunk_profiles!(ws, hplans, ft, params, rstart, lodr, Nprof; dplans=dplans, t0=0)  # real profiles
 
 # --- median strategies (all return the mean of the two central order stats) ---
 

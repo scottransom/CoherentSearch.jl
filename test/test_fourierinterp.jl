@@ -69,6 +69,62 @@ end
     @test_throws ArgumentError next_pow_of_2(0)
 end
 
+@testset "is_smooth / next_smooth" begin
+    @test is_smooth(1) && is_smooth(2) && is_smooth(2 * 3 * 5 * 7)
+    @test !is_smooth(11) && !is_smooth(2 * 11) && !is_smooth(13)
+    @test next_smooth(1000) == 1000        # 2^3 * 5^3 is already smooth
+    @test next_smooth(1001) == 1008        # 1001 = 7*11*13 -> 2^4 * 3^2 * 7
+    @test next_smooth(1024) == 1024        # powers of two are smooth
+    @test next_smooth(16928) == 17010      # the top harmonic's need in the default plan
+    @test is_smooth(next_smooth(12345))
+    @test next_smooth(12345) >= 12345
+    @test_throws ArgumentError next_smooth(0)
+    # Smooth padding is a *lot* tighter than power-of-two padding.
+    needs = [2618, 4140, 6240, 8464, 12016, 16928]
+    @test all(next_smooth(n) / n < 1.02 for n in needs)
+    @test maximum(next_pow_of_2(n) / n for n in needs) > 1.9
+end
+
+@testset "finterp_fft is independent of the padded length" begin
+    # The FFT-correlation is a *circular* correlation, so any fftlen >= the
+    # points it needs gives the same answer.  This is what licenses smooth
+    # sizing over the Python original's power-of-two rule.
+    N = 32768
+    r = 12400.0
+    signal = cos.(2π * r .* (0:N-1) ./ N .+ π / 4)
+    ft = rfft(signal)
+    m = 16
+    nb = 8
+    numbins = 4
+    need = (numbins + m) * nb
+    v_p2 = finterp_fft(12400, numbins, nb, ft, m; fftlen=next_pow_of_2(need))
+    v_sm = finterp_fft(12400, numbins, nb, ft, m; fftlen=next_smooth(need))
+    @test next_smooth(need) != next_pow_of_2(need)     # genuinely different lengths
+    @test maximum(abs.(v_p2 .- v_sm)) / maximum(abs.(v_p2)) < 1e-13
+    @test_throws ArgumentError finterp_fft(12400, numbins, nb, ft, m; fftlen=need - 1)
+end
+
+@testset "finterp_direct == fourier_interp (exact kernel, factored)" begin
+    N = 32768
+    r = 12400.0
+    signal = cos.(2π * r .* (0:N-1) ./ N .+ π / 4)
+    ft = rfft(signal)
+    for m in (8, 16, 32)
+        r0 = 12395.137
+        step = 0.25
+        n = 41
+        got = finterp_direct(r0, n, step, ft, m)
+        want = [fourier_interp(r0 + (k - 1) * step, ft, m) for k in 1:n]
+        @test maximum(abs.(got .- want)) / maximum(abs.(want)) < 1e-13
+    end
+    # A trial landing exactly on a Fourier bin: the kernel degenerates to a
+    # delta there (A -> 0 while 1/(dr-j) -> Inf), so it must be special-cased.
+    exact = finterp_direct(12400.0, 1, 1.0, ft, 16)
+    @test isfinite(real(exact[1])) && isfinite(imag(exact[1]))
+    @test exact[1] ≈ fourier_interp(12400.0, ft, 16) rtol = 1e-12
+    @test_throws ArgumentError finterp_direct(12400.0, 4, 0.25, ft, 15)
+end
+
 @testset "irfft convention matches numpy (DC/Nyquist handling)" begin
     # The coherent fold relies on irfft of (nharms+1) complex amplitudes whose
     # Nyquist term generally has a nonzero imaginary part.  numpy's irfft and

@@ -78,9 +78,19 @@ function parse_cmdline(argv)
             arg_type = Float64
             default = 0.5
         "--numbetween"
-            help = "Minimum points to interpolate between Fourier bins"
+            help = "Minimum points to interpolate between Fourier bins (--interp fft only)"
             arg_type = Int
             default = 16
+        "--interp"
+            help = "Fourier interpolator: 'direct' (exact O(m) summation, default) or 'fft' (FFT-correlation onto a fine grid + linear interpolation; the Python original's method, ~3x slower and ~1e-2 accurate)"
+            arg_type = String
+            default = "direct"
+            range_tester = x -> x in ("direct", "fft")
+        "--fftsizing"
+            help = "Padded transform length for --interp fft: 'pow2' (next power of two, the Python original's rule; default) or 'smooth' (next 2*3*5*7-smooth — less padding, but measured no faster in situ)"
+            arg_type = String
+            default = "pow2"
+            range_tester = x -> x in ("smooth", "pow2")
         "--xsignal"
             help = "Peak fraction bounding the on-pulse signal sum in the S/N metric"
             arg_type = Float64
@@ -125,6 +135,9 @@ function parse_cmdline(argv)
         "--noprogress"
             help = "Do not print a progress meter"
             action = :store_true
+        "--verbose", "-v"
+            help = "Report the per-harmonic interpolation plan (numbetween, m, FFT length and padding, whether linear interpolation is needed) before searching"
+            action = :store_true
         "--metricstats"
             help = "Report per-block, per-decimation metric stats (min/median/mean/std/max) to help set --threshold; writes a full per-block table to <stem>_metricstats.txt"
             action = :store_true
@@ -168,15 +181,18 @@ function main(argv)
     params = SearchParams(
         nharms = nharms,
         numbetween = a["numbetween"],
+        hidr = a["hidr"],
         threshold = a["threshold"],
         align = !a["noalign"],
         xsignal = a["xsignal"],
         metric = Symbol(a["metric"]),
         pexp = a["pexp"],
         decimations = decimations,
+        interp = Symbol(a["interp"]),
+        fftsizing = Symbol(a["fftsizing"]),
     )
 
-    @info "Searching" file=a["fftfile"] T=ft.T nharms=params.nharms decimations=decimations threads=nthreads()
+    @info "Searching" file=a["fftfile"] T=ft.T nharms=params.nharms decimations=decimations interp=params.interp threads=nthreads()
 
     progress = a["noprogress"] ? :none : (a["progressbar"] ? :bar : :text)
     mstats = a["metricstats"] ? MetricStats() : nothing
@@ -186,7 +202,7 @@ function main(argv)
                    remove = !a["noremove"], dr_tol = a["drtol"],
                    harm_remove = !a["noharmremove"], numharm = a["numharm"],
                    progress = progress, metricstats = mstats,
-                   normalize = a["normalize"],
+                   normalize = a["normalize"], verbose = a["verbose"],
                    wisdom = !a["nowisdom"],
                    wisdom_file = isempty(a["wisdomfile"]) ? nothing : a["wisdomfile"])
 

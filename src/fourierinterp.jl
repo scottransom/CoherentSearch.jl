@@ -107,15 +107,60 @@ function next_pow_of_2(n::Integer)
 end
 
 """
+    is_smooth(n) -> Bool
+
+Whether `n` factorises entirely into 2, 3, 5 and 7 — the radices FFTW has
+dedicated codelets for, and hence the lengths it transforms most efficiently.
+"""
+function is_smooth(n::Integer)
+    n > 0 || return false
+    for f in (2, 3, 5, 7)
+        while n % f == 0
+            n ÷= f
+        end
+    end
+    return n == 1
+end
+
+"""
+    next_smooth(n) -> Int
+
+Smallest `2·3·5·7`-smooth number ≥ `n`.
+
+The FFT-correlation interpolator is free to pad its transform to *any* length ≥
+the `numbetween*(numbins+m)` points it actually needs, so the padded length is
+ours to choose.  `next_pow_of_2` is the simplest choice but a poor one: the
+needed lengths land wherever they land, so rounding up to a power of two costs a
+mean ~1.38× (worst 1.98×) in transform length across the harmonic schedule.
+Smooth lengths are dense enough that the padding is a few percent, and FFTW
+handles them with mixed-radix codelets at close to power-of-two per-point cost.
+
+Gaps between smooth numbers are small in the range of interest, so the naive
+upward scan is cheap; this runs once per harmonic at plan time.
+"""
+function next_smooth(n::Integer)
+    n > 0 || throw(ArgumentError("n must be a positive integer"))
+    n <= 4 && return Int(n)
+    k = Int(n)
+    while !is_smooth(k)
+        k += 1
+    end
+    return k
+end
+
+"""
     finterp_fft_coeffs(numbetween, m, fftlen) -> Vector{ComplexF64}
 
 Precompute the FFT'd interpolation kernel used by the FFT-correlation method.
 Mirrors `get_finterp_FFT_coeffs`.
+
+`fftlen` need only be ≥ `numbetween*m`: the method is a *circular* correlation,
+so any padded length works and the power-of-two restriction the Python original
+imposed is not an algorithmic requirement (see [`next_smooth`](@ref)).
 """
 function finterp_fft_coeffs(numbetween::Integer, m::Integer, fftlen::Integer)
     iseven(m) || throw(ArgumentError("m must be even"))
     fftlen >= numbetween * m || throw(ArgumentError("fftlen must be >= numbetween * m"))
-    fftlen == next_pow_of_2(fftlen) || throw(ArgumentError("fftlen must be a power of 2"))
     coeffarr = zeros(ComplexF64, fftlen)
     n = (numbetween * m) ÷ 2
     # Python: offsets = np.arange(numbetween*m//2) / numbetween
@@ -137,12 +182,17 @@ bin `lobin` using FFT-based correlation.  The returned frequencies are
 
 `lobin` is a 0-based Fourier bin number (matching PRESTO / the Python code);
 `ft` is the 1-based Julia amplitude vector.
+
+`fftlen` defaults to the power-of-two padding the Python original used, keeping
+this function byte-identical to the oracle; pass [`next_smooth`](@ref) of
+`numftbins` for the cheaper padding the production path uses.
 """
 function finterp_fft(lobin::Integer, numbins::Integer, numbetween::Integer,
-                     ft::AbstractVector, m::Integer; coeffs=nothing)
+                     ft::AbstractVector, m::Integer; coeffs=nothing,
+                     fftlen::Integer=next_pow_of_2((numbins + m) * numbetween))
     m2 = m ÷ 2
     numftbins = (numbins + m) * numbetween
-    fftlen = next_pow_of_2(numftbins)
+    fftlen >= numftbins || throw(ArgumentError("fftlen must be >= (numbins+m)*numbetween"))
     if coeffs === nothing
         coeffs = finterp_fft_coeffs(numbetween, m, fftlen)
     else

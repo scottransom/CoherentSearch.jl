@@ -24,36 +24,58 @@ rstart = 10.0 * ft.T
 
 hplans = CS.build_harmonic_plans(params, Nprof)
 ws     = CS.Workspace(params, hplans, Nprof)
+# `:direct` (the default interpolator) needs the per-harmonic phase tables and a
+# *global* trial index; this bench treats `rstart` as global trial 0.
+dplans = params.interp === :direct ? CS.build_direct_plans(params, rstart) : nothing
+
+# The `:fft` interpolator kept alongside, so the FFT-path buckets below (which
+# poke at `interp_tile!` / `ws.scratch`, neither of which the direct path has)
+# still measure something, and so the two interpolators can be compared directly.
+params_fft = SearchParams(nharms=nharms, threshold=6.0, metric=:boxcar,
+                          decimations=decimation_set(nharms, 6), interp=:fft)
+hplans_fft = CS.build_harmonic_plans(params_fft, Nprof)
+ws_fft     = CS.Workspace(params_fft, hplans_fft, Nprof)
 
 println("File: ", FILE, "   T=", round(ft.T; digits=3), " s")
 println("nharms=", nharms, "  Nprof=", Nprof, "  rstart=", round(rstart; digits=1), " bins")
-println("distinct harmonic fftlens: ", sort(unique(hp.fftlen for hp in hplans)))
+println("interp=", params.interp, "   distinct :fft harmonic fftlens: ",
+        sort(unique(hp.fftlen for hp in hplans_fft)))
 println("harmonic nb schedule (h=>nb): ", [(hp.h, hp.nb) for hp in hplans[[1,2,4,8,16,32,60]]])
 println("="^70)
 
 # --- Bucket 1: whole-chunk fill (all harmonic interps + batched brfft) --------
-b_chunk = @benchmark CS.fill_chunk_profiles!($ws, $hplans, $ft, $params, $rstart, $lodr, $Nprof)
+b_chunk = @benchmark CS.fill_chunk_profiles!($ws, $hplans, $ft, $params, $rstart, $lodr, $Nprof; dplans=$dplans, t0=0)
 println("fill_chunk_profiles!  (60 harmonic interps + batched brfft, one chunk):")
 show(stdout, MIME"text/plain"(), b_chunk); println("\n", "-"^70)
 
 # Prime ws.profs for the metric benchmarks below.
-CS.fill_chunk_profiles!(ws, hplans, ft, params, rstart, lodr, Nprof)
+CS.fill_chunk_profiles!(ws, hplans, ft, params, rstart, lodr, Nprof; dplans=dplans, t0=0)
+
+# --- Bucket 0: whole-chunk fill under the *other* interpolator ----------------
+b_chunk_fft = @benchmark CS.fill_chunk_profiles!($ws_fft, $hplans_fft, $ft, $params_fft, $rstart, $lodr, $Nprof)
+println("fill_chunk_profiles!  same chunk under interp=:fft:")
+show(stdout, MIME"text/plain"(), b_chunk_fft); println()
+println("  => :direct is ", round(minimum(b_chunk_fft).time / minimum(b_chunk).time; digits=2),
+        "x faster on the chunk fill")
+println("-"^70)
 
 # --- Bucket 1a: a single harmonic row, low vs high harmonic -------------------
 for h in (1, 60)
-    hp = hplans[h]
+    hp = hplans_fft[h]
     r0 = hp.h * rstart
-    b = @benchmark CS.fill_harmonic_row!($ws, $hp, $ft, $params, $r0, $Nprof)
-    println("fill_harmonic_row!  h=$h  (nb=$(hp.nb) fftlen=$(hp.fftlen)):  ",
-            BenchmarkTools.prettytime(minimum(b).time),
-            "  (", BenchmarkTools.prettymemory(minimum(b).memory), ")")
+    b = @benchmark CS.fill_harmonic_row!($ws_fft, $hp, $ft, $params_fft, $r0, $Nprof)
+    d = @benchmark CS.fill_harmonic_row_direct!($ws, $(dplans[h]), $ft, $params, 0, $Nprof)
+    println("harmonic row  h=$h  (nb=$(hp.nb) fftlen=$(hp.fftlen)):  fft ",
+            BenchmarkTools.prettytime(minimum(b).time), "  direct ",
+            BenchmarkTools.prettytime(minimum(d).time), "  (",
+            round(minimum(b).time / minimum(d).time; digits=2), "x)")
 end
 println("-"^70)
 
 # --- Bucket 1b: interp_tile! in isolation, low vs high harmonic ---------------
 for h in (1, 60)
-    hp = hplans[h]
-    sc = ws.scratch[hp.fftlen]
+    hp = hplans_fft[h]
+    sc = ws_fft.scratch[hp.fftlen]
     lobin = floor(Int, hp.h * rstart)
     rlast = hp.h * rstart + (Nprof - 1) * (params.hidr * hp.h / params.nharms)
     numbins = floor(Int, rlast) - lobin + 2
@@ -65,8 +87,8 @@ end
 println("-"^70)
 
 # --- Bucket 2: uniform_linear_interp, the ~1.5e9-call inner interp ------------
-let hp = hplans[1]
-    sc = ws.scratch[hp.fftlen]
+let hp = hplans_fft[1]
+    sc = ws_fft.scratch[hp.fftlen]
     lobin = floor(Int, hp.h * rstart)
     rlast = hp.h * rstart + (Nprof - 1) * (params.hidr * hp.h / params.nharms)
     numbins = floor(Int, rlast) - lobin + 2

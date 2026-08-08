@@ -159,7 +159,11 @@ if isfile(EXAMPLE_FFT)
         # With a fixed numbetween and one chunk, the production path uses the
         # same grids as block_metrics, so it should match to ~machine precision.
         # Pinned on :non, the oracle-validated (Python-pinned) reference metric.
-        params = SearchParams(nharms=32, m=32, numbetween=16, align=false, metric=:non)
+        # interp=:fft + fftsizing=:pow2 is what `block_metrics` itself does, so
+        # this stays the strict equivalence gate; the default :direct path is a
+        # *different* (exact) interpolator and is pinned separately below.
+        params = SearchParams(nharms=32, m=32, numbetween=16, align=false, metric=:non,
+                              interp=:fft, fftsizing=:pow2)
         lodr = params.hidr / params.nharms
         rstart = 10010.0
         n = 256
@@ -179,7 +183,8 @@ if isfile(EXAMPLE_FFT)
         # Same equivalence pin as above, for :boxcar.  The metric is scale-free,
         # so the unnormalised brfft (chunk_metrics) and the normalised irfft
         # (block_metrics) must agree to ~machine precision on identical grids.
-        params = SearchParams(nharms=32, m=32, numbetween=16, align=false, metric=:boxcar)
+        params = SearchParams(nharms=32, m=32, numbetween=16, align=false, metric=:boxcar,
+                              interp=:fft, fftsizing=:pow2)
         lodr = params.hidr / params.nharms
         rstart = 10010.0
         n = 256
@@ -190,6 +195,102 @@ if isfile(EXAMPLE_FFT)
         relerr = maximum(abs.(opt .- ref)) / maximum(abs.(ref))
         @info "boxcar align=false reference agreement" relerr
         @test relerr < 1e-8
+    end
+
+    @testset "direct interpolation is the exact kernel" begin
+        # The strong pin for the default path.  `fourier_interp` is Eqn. 30
+        # evaluated point by point and is itself pinned to the Python oracle at
+        # ~3e-16, so agreeing with it *is* agreeing with the oracle — a stronger
+        # statement than the FFT path's equivalence, which inherits that path's
+        # linear-interpolation error.
+        nharms = 60
+        params = SearchParams(nharms=nharms, m=32, metric=:boxcar, interp=:direct)
+        lodr = params.hidr / nharms
+        # Low enough that harmonic 60 stays inside the (small) bundled test FFT,
+        # so the per-point reference can be evaluated for every harmonic.
+        rstart = 5000.0
+        n = 256
+        hplans = build_harmonic_plans(params, n)
+        ws = CoherentSearch.Workspace(params, hplans, n)
+        dplans = build_direct_plans(params, rstart)
+        CoherentSearch.fill_chunk_profiles!(ws, hplans, ft, params, rstart, lodr, n;
+                                            dplans=dplans, t0=0)
+        worst = 0.0
+        for h in (1, 2, 7, 15, 30, 59, 60), j in (1, 2, 97, n)
+            r = h * (rstart + (j - 1) * lodr)
+            v = fourier_interp(r, ft.amps, params.m)
+            worst = max(worst, abs(ws.ftprofs[h + 1, j] - v) / abs(v))
+        end
+        @info "direct interpolation vs exact fourier_interp" worst
+        @test worst < 1e-7        # relative, and largest where |amp| ~ 0
+
+        # ... and the FFT path is *much* further from exact, which is the
+        # accuracy the direct path buys (not a defect of this test).
+        pf = SearchParams(nharms=nharms, m=32, metric=:boxcar, interp=:fft)
+        hf = build_harmonic_plans(pf, n)
+        wf = CoherentSearch.Workspace(pf, hf, n)
+        CoherentSearch.fill_chunk_profiles!(wf, hf, ft, pf, rstart, lodr, n)
+        wfft = maximum(abs(wf.ftprofs[h + 1, j] -
+                           fourier_interp(h * (rstart + (j - 1) * lodr), ft.amps, pf.m)) /
+                       abs(fourier_interp(h * (rstart + (j - 1) * lodr), ft.amps, pf.m))
+                       for h in (8, 30, 60), j in (1, 97, n))
+        @info "fft+linear interpolation vs exact fourier_interp" wfft
+        # How large the linear-interpolation error is depends on the data and the
+        # frequency (it reaches ~5e-2 on a long real observation, ~6e-4 here), so
+        # the portable statement is the *ratio*: the FFT path's error is a
+        # data-dependent approximation, the direct path's is rounding.
+        @test wfft > 1e-5
+        @test worst < wfft / 1e4  # direct is orders of magnitude closer to exact
+    end
+
+    @testset "direct interpolation is invariant to chunking" begin
+        # The phase/bin bookkeeping keys off a *global* trial index, so a chunk
+        # starting at global trial t0 must reproduce what one long chunk gives at
+        # the same trials.  This is the property that a naive float-accumulated
+        # `rstart` would drift on.
+        nharms = 32
+        params = SearchParams(nharms=nharms, m=32, metric=:boxcar, interp=:direct)
+        lodr = params.hidr / nharms
+        r_lo = 10010.0
+        dplans = build_direct_plans(params, r_lo)
+        nbig = 384
+        hb = build_harmonic_plans(params, nbig)
+        wb = CoherentSearch.Workspace(params, hb, nbig)
+        CoherentSearch.fill_chunk_profiles!(wb, hb, ft, params, r_lo, lodr, nbig;
+                                            dplans=dplans, t0=0)
+        nsm = 128
+        hs = build_harmonic_plans(params, nsm)
+        ws2 = CoherentSearch.Workspace(params, hs, nsm)
+        worst = 0.0
+        for c in 0:2
+            t0 = c * nsm
+            CoherentSearch.fill_chunk_profiles!(ws2, hs, ft, params, r_lo + t0 * lodr,
+                                                lodr, nsm; dplans=dplans, t0=t0)
+            for h in (1, 5, 32), j in 1:nsm
+                a = ws2.ftprofs[h + 1, j]
+                b = wb.ftprofs[h + 1, t0 + j]
+                worst = max(worst, abs(a - b) / abs(b))
+            end
+        end
+        @info "direct interpolation chunk invariance" worst
+        @test worst == 0.0        # identical arithmetic, not merely close
+    end
+
+    @testset "the two interpolators agree on the detection metric" begin
+        # They are different algorithms (one approximate), so they cannot be
+        # bit-identical — but the metric they produce must track closely, and the
+        # candidate they find must be the same one.
+        params_d = SearchParams(nharms=32, m=32, metric=:boxcar, interp=:direct)
+        params_f = SearchParams(nharms=32, m=32, metric=:boxcar, interp=:fft)
+        lodr = params_d.hidr / params_d.nharms
+        rstart = 10010.0
+        n = 256
+        md = chunk_metrics(ft, params_d, rstart, n; lodr=lodr)
+        mf = chunk_metrics(ft, params_f, rstart, n; lodr=lodr)
+        rel = maximum(abs.(md .- mf)) / maximum(abs.(mf))
+        @info "direct vs fft metric agreement" rel
+        @test rel < 0.05
+        @test argmax(md) == argmax(mf)
     end
 
     @testset "boxcar metric detects the 10.0123 Hz pulsar" begin
@@ -269,14 +370,16 @@ if isfile(EXAMPLE_FFT)
             nharms = 60
             Hk = fld(nharms, k)
             params = SearchParams(nharms=nharms, m=32, numbetween=16, align=false,
-                                  decimations=[1, k], metric=:non)
+                                  decimations=[1, k], metric=:non,
+                                  interp=:fft, fftsizing=:pow2)
             lodr = params.hidr / nharms
             rstart = 5000.0
             n = 64
             rfund = rstart .+ (0:n-1) .* lodr
 
             # Native reduced-harmonic fold at the multiplied frequencies.
-            pnat = SearchParams(nharms=Hk, m=32, numbetween=16, align=false, metric=:non)
+            pnat = SearchParams(nharms=Hk, m=32, numbetween=16, align=false, metric=:non,
+                                interp=:fft, fftsizing=:pow2)
             ref = block_metrics(ft, k .* rfund, pnat)
 
             # Decimated fold via the production path.

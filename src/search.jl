@@ -26,15 +26,29 @@
 using FFTW
 using Base.Threads: @spawn, nthreads, Atomic, atomic_add!
 using LinearAlgebra: mul!
+using Printf: @printf
 
 """
     SearchParams
 
 Tunable search parameters (defaults match the Python CLI).
 
-`numbetween` is the *floor* on the interpolation oversampling; with `align`
-set, low harmonics use a finer `numbetween` matched to their finer `deltar_h`
-(see [`harmonic_numbetween`](@ref)).
+`interp` selects the interpolator:
+
+- `:direct` (default) evaluates the exact Eqn.-30 kernel at each trial frequency
+  in `O(m)` real-weighted multiply-adds (see `directinterp.jl`).  `numbetween`,
+  `align` and `fftsizing` do not apply to it.
+- `:fft` is the FFT-correlation path ported from the Python original: a uniform
+  fine grid of `numbetween` points per bin, linearly interpolated at the trial
+  frequencies.  Kept because it is what the Python oracle and the
+  machine-precision equivalence tests are pinned to, and as a fallback.
+
+`numbetween` is the *floor* on the interpolation oversampling for `:fft`; with
+`align` set, low harmonics use a finer `numbetween` matched to their finer
+`deltar_h` (see [`harmonic_numbetween`](@ref)).  Note that `:fft` + linear
+interpolation is an *approximation*: at the default `numbetween = 16` the
+interpolated amplitudes depart from the exact kernel by up to ~5% at high
+harmonics, which is what `:direct` removes.
 """
 Base.@kwdef struct SearchParams
     nharms::Int = 32        # number of harmonics to coherently sum
@@ -52,6 +66,8 @@ Base.@kwdef struct SearchParams
                                      # when the 0-baseline metric is within this of `threshold`
                                      # (mean≡0 since DC=0; see `_profile_boxcar`)
     decimations::Vector{Int} = [1]  # harmonic-decimation factors k (see decimation_design.md)
+    interp::Symbol = :direct  # :direct (exact O(m) summation) or :fft (FFT-correlation + linear interp)
+    fftsizing::Symbol = :pow2  # :fft interpolation length rounding — :pow2 or :smooth (2·3·5·7)
 end
 
 """
@@ -654,6 +670,36 @@ struct HarmonicPlan
 end
 
 """
+    FFTLEN_MERGE_TOL
+
+How much extra padding [`build_harmonic_plans`](@ref) will accept to make two
+harmonics *share* a transform length.
+
+Smooth sizing pads each harmonic to within ~1% of what it needs, but the needs
+are all different, so it would produce one distinct `fftlen` — and hence one
+[`FFTScratch`](@ref) of three `fftlen`-point buffers, *per workspace, per thread*
+— for nearly every harmonic.  Rounding lengths that are within this factor of
+each other up to their common maximum trades a little padding for a much smaller
+plan and buffer count (~50 lengths → ~20 for the default schedule), which matters
+on a many-core node where the workspaces are replicated per task.
+"""
+const FFTLEN_MERGE_TOL = 1.10
+
+# Round each length in `lens` up to the largest member of its "within `tol`"
+# group, walking downward so a group is always represented by its own maximum.
+function _merge_fftlens(lens::Vector{Int}; tol::Real=FFTLEN_MERGE_TOL)
+    isempty(lens) && return lens
+    uniq = sort(unique(lens); rev=true)
+    rep = Dict{Int,Int}()
+    cur = uniq[1]
+    for l in uniq
+        l * tol < cur && (cur = l)
+        rep[l] = cur
+    end
+    return [rep[l] for l in lens]
+end
+
+"""
     build_harmonic_plans(params, Nprof) -> Vector{HarmonicPlan}
 
 Size each harmonic's `numbetween` and `fftlen` for chunks of `Nprof` trial
@@ -661,9 +707,26 @@ fundamentals, and precompute its FFT'd interpolation kernel.  When
 `params.align` is false every harmonic uses `params.numbetween` (the fixed grid
 of the reference path), which makes the production path reproduce
 [`block_metrics`](@ref) to machine precision — used by the test suite.
+
+`params.fftsizing` picks the padded transform length: `:smooth` rounds up to the
+next `2·3·5·7`-smooth number and then merges nearby lengths (the default; see
+[`next_smooth`](@ref) and [`FFTLEN_MERGE_TOL`](@ref)), `:pow2` to the next power
+of two (the Python original's rule, and what the machine-precision equivalence
+tests pin against).
+
+With `params.interp === :direct` there is no fine grid and these plans carry no
+kernel: the production path uses [`DirectPlan`](@ref) instead.  They are still
+built (cheaply, with `nb`/`fftlen` filled in) so `--verbose` can report what the
+FFT path *would* have done and so the two paths stay switchable.
 """
 function build_harmonic_plans(params::SearchParams, Nprof::Integer)
-    plans = HarmonicPlan[]
+    params.fftsizing in (:smooth, :pow2) ||
+        throw(ArgumentError("fftsizing must be :smooth or :pow2, got :$(params.fftsizing)"))
+    smooth = params.fftsizing === :smooth
+    round_up = smooth ? next_smooth : next_pow_of_2
+    direct = params.interp === :direct
+    nbs = Int[]
+    lens = Int[]
     for h in 1:params.nharms
         nb = params.align ?
              harmonic_numbetween(h, params.nharms, params.hidr, params.numbetween) :
@@ -671,13 +734,110 @@ function build_harmonic_plans(params::SearchParams, Nprof::Integer)
         dh = params.hidr * h / params.nharms             # deltar_h (bins/trial)
         span_max = (Nprof - 1) * dh                       # widest a chunk can span
         numbins_max = ceil(Int, span_max) + 2             # +2: linear-interp slack
-        fftlen = next_pow_of_2((numbins_max + params.m) * nb)
+        push!(nbs, nb)
+        push!(lens, round_up((numbins_max + params.m) * nb))
+    end
+    # `:pow2` already collapses to a handful of lengths; only `:smooth` needs it.
+    smooth && (lens = _merge_fftlens(lens))
+    plans = HarmonicPlan[]
+    for h in 1:params.nharms
+        nb = nbs[h]
+        fftlen = lens[h]
+        if direct
+            # No kernel, no FFT scratch: the direct interpolator needs neither.
+            push!(plans, HarmonicPlan(h, nb, fftlen, ComplexF64[]))
+            continue
+        end
         # Fold the inverse-FFT 1/fftlen normalisation into the kernel so the
         # hot loop can use plain (unnormalised) bfft via mul!.
         coeffs = finterp_fft_coeffs(nb, params.m, fftlen) ./ fftlen
         push!(plans, HarmonicPlan(h, nb, fftlen, coeffs))
     end
     return plans
+end
+
+"""
+    harmonic_plan_report([io], params, hplans, Nprof)
+
+Print the per-harmonic interpolation recipe — the `--verbose` diagnostic.
+
+One row per harmonic: the oversampling `nb` ([`harmonic_numbetween`](@ref)), the
+kernel half-width `m`, the trial step `deltar_h` in Fourier bins, the number of
+raw input bins the chunk spans, the fine-grid length the FFT-correlation
+actually needs (`numftbins = (numbins + m)*nb`), the `fftlen` chosen for it, and
+the padding factor `fftlen/numftbins` that the length rounding costs.
+
+The last two columns are about the *linear* interpolation the FFT path performs
+on its way from the fine grid to the trial frequencies:
+
+- `grid/trial` is `nb*deltar_h`, the number of fine-grid points per trial step.
+  It is also the fine grid's *oversampling* relative to what is actually
+  consumed: only one point in `grid/trial` is ever read.
+- `linterp` is whether [`uniform_linear_interp`](@ref) is needed at all.  `no`
+  means the direct interpolator is in use and there is no grid; `yes(fixed)`
+  means the step is commensurate with the grid (`nb*deltar_h` an integer), so
+  every trial shares one fractional grid offset and the linear weights are a
+  single constant pair; `yes` is the general case, a fresh weight pair per trial.
+
+The summary that follows totals the fine-grid points computed per chunk against
+the trials actually wanted, which is the FFT path's headline inefficiency.
+"""
+harmonic_plan_report(params::SearchParams, hplans::Vector{HarmonicPlan}, Nprof::Integer) =
+    harmonic_plan_report(stderr, params, hplans, Nprof)
+
+function harmonic_plan_report(io::IO, params::SearchParams,
+                              hplans::Vector{HarmonicPlan}, Nprof::Integer)
+    direct = params.interp === :direct
+    println(io, "─"^96)
+    println(io, "Interpolation plan: interp=:$(params.interp)  m=$(params.m)  ",
+                "numbetween(floor)=$(params.numbetween)  align=$(params.align)  ",
+                "fftsizing=:$(params.fftsizing)  Nprof=$(Nprof)")
+    println(io, "─"^96)
+    @printf(io, "%4s %6s %5s %11s %8s %10s %9s %7s %10s %-11s\n",
+            "h", "nb", "m", "deltar_h", "numbins", "numftbins", "fftlen",
+            "pad", "grid/trial", "linterp")
+    totgrid = 0
+    totneed = 0
+    for hp in hplans
+        h = hp.h
+        dh = params.hidr * h / params.nharms
+        numbins = ceil(Int, (Nprof - 1) * dh) + 2
+        numftbins = (numbins + params.m) * hp.nb
+        gpt = hp.nb * dh
+        commensurate = abs(gpt - round(gpt)) < 1e-9
+        lint = direct ? "no" : (commensurate ? "yes(fixed)" : "yes")
+        totgrid += direct ? 0 : numbins * hp.nb
+        totneed += numftbins
+        @printf(io, "%4d %6d %5d %11.6f %8d %10d %9d %7.2f %10.3f %-11s\n",
+                h, hp.nb, params.m, dh, numbins, numftbins, hp.fftlen,
+                hp.fftlen / numftbins, gpt, lint)
+    end
+    println(io, "─"^96)
+    if direct
+        println(io, "Direct interpolation: no fine grid, no linear interpolation, no FFT.")
+        @printf(io, "  work per chunk: %d harmonics x %d trials x m=%d = %.2f M weighted bin reads\n",
+                length(hplans), Nprof, params.m,
+                length(hplans) * Nprof * params.m / 1e6)
+    else
+        sizes = sort(unique(hp.fftlen for hp in hplans))
+        @printf(io, "Distinct fftlens: %d (2 transforms each per harmonic per chunk; one FFTScratch per length per thread)\n",
+                length(sizes))
+        for fl in sizes
+            n = count(hp -> hp.fftlen == fl, hplans)
+            @printf(io, "    %8d  x %2d harmonics\n", fl, n)
+        end
+        @printf(io, "  FFTScratch memory: %.1f MB per workspace (3 x 16 B x sum of distinct lengths)\n",
+                3 * 16 * sum(sizes) / 2^20)
+        @printf(io, "  transform points per chunk: %.2f M (2 x sum(fftlen))\n",
+                2 * sum(hp.fftlen for hp in hplans) / 1e6)
+        @printf(io, "  fine-grid points computed:  %.2f M   trials wanted: %.3f M   oversampling: %.1fx\n",
+                totgrid / 1e6, length(hplans) * Nprof / 1e6,
+                totgrid / (length(hplans) * Nprof))
+        @printf(io, "  length padding overhead:    %.2f%% (sum fftlen / sum numftbins)\n",
+                100 * (sum(hp.fftlen for hp in hplans) / totneed - 1))
+    end
+    println(io, "─"^96)
+    return nothing
 end
 
 # FFTW planning rigor used by every plan constructor below.  A mutable ref (not a
@@ -774,13 +934,25 @@ struct Workspace{S<:FFTScratch, B, D<:DecimBuf}
     bcsig::Vector{Float64}         # :boxcar per-block σ subsample scratch
     medpairs::Vector{Tuple{Int,Int}}  # sorting-network median pairs (empty ⇒ quickselect; nbins=120 default)
     decims::Vector{D}              # one per decimation factor k > 1
+    # :direct — the chunk's bin window, de-interleaved into real/imaginary planes.
+    # Kept at `Float32`, the storage type of the `.fft` file: widening on load is
+    # exact, so the accumulated sum is bit-identical to holding `Float64` planes,
+    # while halving the traffic through the inner loop (~1.1x measured).
+    re::Vector{Float32}
+    im::Vector{Float32}            # (both empty under :fft)
 end
 
 function Workspace(params::SearchParams, hplans::Vector{HarmonicPlan}, Nprof::Integer)
     nh = params.nharms
     # Build the Dict from concrete pairs so it infers Dict{Int,FFTScratch{P,Q}}
     # (a concrete value type) rather than the abstract Dict{Int,FFTScratch}.
-    scratch = Dict(fl => FFTScratch(fl) for fl in unique(hp.fftlen for hp in hplans))
+    # Under `:direct` there is no FFT-correlation and hence nothing to plan; the
+    # Dict must still carry the concrete value type for `Workspace`'s `S`, which
+    # a throwaway minimum-size scratch supplies without hardcoding FFTW's plan
+    # types here.
+    scratch = params.interp === :direct ?
+        Dict{Int,typeof(FFTScratch(8))}() :
+        Dict(fl => FFTScratch(fl) for fl in unique(hp.fftlen for hp in hplans))
     ftprofs = zeros(ComplexF64, nh + 1, Nprof)
     profs   = Matrix{Float64}(undef, 2nh, Nprof)
     medbuf  = Vector{Float64}(undef, 2nh)
@@ -794,7 +966,11 @@ function Workspace(params::SearchParams, hplans::Vector{HarmonicPlan}, Nprof::In
     # `DecimBuf[...]` comprehension) keeps the element type the concrete
     # `DecimBuf{B}` even when empty, so `Workspace`'s `D<:DecimBuf` stays concrete.
     decims = map(k -> DecimBuf(k, nh, Nprof, params), filter(>(1), params.decimations))
-    return Workspace(scratch, ftprofs, profs, medbuf, brfftplan, bcwidths, bcpsum, bcsig, medpairs, decims)
+    nw = params.interp === :direct ? direct_window_size(params, Nprof) : 0
+    re = Vector{Float32}(undef, nw)
+    im = Vector{Float32}(undef, nw)
+    return Workspace(scratch, ftprofs, profs, medbuf, brfftplan, bcwidths, bcpsum,
+                     bcsig, medpairs, decims, re, im)
 end
 
 """
@@ -858,18 +1034,34 @@ function fill_harmonic_row!(ws::Workspace, hp::HarmonicPlan, ft::FFTFile,
 end
 
 """
-    fill_chunk_profiles!(ws, hplans, ft, params, rstart, lodr, n)
+    fill_chunk_profiles!(ws, hplans, ft, params, rstart, lodr, n; dplans=nothing, t0=0)
 
 Fill `ws.ftprofs` (zeroed first) and inverse-FFT it into `ws.profs` for a chunk
 of `n` trial fundamentals starting at fundamental Fourier frequency `rstart`,
 stepping by `lodr` bins.  After this call `ws.profs[:, 1:n]` holds the real
 coherent-fold profiles.
+
+Under `params.interp === :direct` the harmonic rows come from `dplans` (built by
+[`build_direct_plans`](@ref) against the search's global `r_lo`) and `t0` is the
+chunk's *global* trial index, which is what the exact phase bookkeeping keys off;
+`rstart` is then unused for interpolation and only carried for the callers that
+report it.  Under `:fft` the `hplans` FFT-correlation path runs as before.
 """
 function fill_chunk_profiles!(ws::Workspace, hplans::Vector{HarmonicPlan}, ft::FFTFile,
-                              params::SearchParams, rstart::Real, lodr::Real, n::Integer)
+                              params::SearchParams, rstart::Real, lodr::Real, n::Integer;
+                              dplans::Union{Nothing,AbstractVector}=nothing,
+                              t0::Integer=0)
     fill!(ws.ftprofs, 0)
-    for hp in hplans
-        fill_harmonic_row!(ws, hp, ft, params, hp.h * rstart, n)
+    if params.interp === :direct
+        dplans === nothing &&
+            throw(ArgumentError("interp=:direct needs `dplans` from build_direct_plans"))
+        for dp in dplans
+            fill_harmonic_row_direct!(ws, dp, ft, params, t0, n)
+        end
+    else
+        for hp in hplans
+            fill_harmonic_row!(ws, hp, ft, params, hp.h * rstart, n)
+        end
     end
     # One batched complex→real transform for all Nprof profiles at once.  This
     # is an unnormalised `brfft` (= Nbins × a true irfft); the S/N metric folds
@@ -1310,9 +1502,14 @@ end
 
 Single-threaded convenience that runs the optimised path over one chunk of `n`
 trial fundamentals starting at `rstart` and returns the S/N metric for each.
-With `params.align = false` this reproduces [`block_metrics`](@ref) to machine
-precision; it is the bridge the test suite uses to pin the optimised path to the
-oracle-validated reference.
+
+With `params.interp = :fft`, `params.fftsizing = :pow2` and `params.align =
+false` this reproduces [`block_metrics`](@ref) to machine precision — the same
+grids, the same padding — and that is the bridge the test suite uses to pin the
+optimised path to the oracle-validated reference.  Under the default
+`interp = :direct` it instead computes the *exact* interpolation, so it differs
+from `block_metrics` by that path's linear-interpolation error (~1e-2 in the
+amplitudes, ~1% in the metric) rather than by rounding.
 """
 function chunk_metrics(ft::FFTFile, params::SearchParams, rstart::Real, n::Integer;
                        lodr::Real = params.hidr / params.nharms)
@@ -1320,7 +1517,10 @@ function chunk_metrics(ft::FFTFile, params::SearchParams, rstart::Real, n::Integ
     nbins = 2nh
     hplans = build_harmonic_plans(params, n)
     ws = Workspace(params, hplans, n)
-    fill_chunk_profiles!(ws, hplans, ft, params, rstart, lodr, n)
+    # This chunk *is* the whole "search", so its global trial index starts at 0
+    # and the direct plans are built against `rstart` as `r_lo`.
+    dplans = params.interp === :direct ? build_direct_plans(params, rstart) : nothing
+    fill_chunk_profiles!(ws, hplans, ft, params, rstart, lodr, n; dplans=dplans, t0=0)
     if params.metric === :boxcar
         sigma = _block_sigma(ws.profs, nbins, n, ws.bcsig)
         invsigma = sigma > 0 ? 1.0 / sigma : 0.0
@@ -1347,7 +1547,8 @@ function _search_region!(ft::FFTFile, params::SearchParams, hplans::Vector{Harmo
                          r_lo::Real, r_hi::Real, lodr::Real, total::Integer,
                          Nprof::Integer, nchunks::Integer, nt::Integer;
                          threshold::Real, norm::Union{Nothing,MetricNorm},
-                         metricstats::Union{Nothing,MetricStats}, progress::Symbol)
+                         metricstats::Union{Nothing,MetricStats}, progress::Symbol,
+                         dplans::Union{Nothing,AbstractVector}=nothing)
     collect_stats = metricstats !== nothing
     # :boxcar fast path: skip the exact-median baseline for trials whose zero-baseline
     # metric is > `boxcar_medmargin` below `threshold` (see `_profile_boxcar`).  Forced
@@ -1385,7 +1586,8 @@ function _search_region!(ft::FFTFile, params::SearchParams, hplans::Vector{Harmo
                 i0 = (c - 1) * Nprof
                 n = min(Nprof, total - i0)
                 rstart = r_lo + i0 * lodr
-                fill_chunk_profiles!(ws, hplans, ft, params, rstart, lodr, n)
+                fill_chunk_profiles!(ws, hplans, ft, params, rstart, lodr, n;
+                                     dplans=dplans, t0=i0)
                 rmean = rstart + (n - 1) * lodr / 2
                 ngood = chunk_ngoodbins(ft, params.nharms, rmean)
                 invrms = sqrt(2 * ngood + 1)
@@ -1509,10 +1711,12 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
                 harm_remove::Bool=true, numharm::Integer=16, harm_tol::Real=1.0,
                 progress::Symbol=:none,
                 metricstats::Union{Nothing,MetricStats}=nothing,
-                normalize::Bool=false,
+                normalize::Bool=false, verbose::Bool=false,
                 wisdom::Bool=true, wisdom_file::Union{Nothing,AbstractString}=nothing)
     progress in (:none, :text, :bar) ||
         throw(ArgumentError("progress must be :none, :text or :bar, got :$progress"))
+    params.interp in (:direct, :fft) ||
+        throw(ArgumentError("interp must be :direct or :fft, got :$(params.interp)"))
     FFTW.set_num_threads(1)   # parallelise at the Julia-task level, not inside FFTW
     lodr = params.hidr / params.nharms
     nbins = 2 * params.nharms
@@ -1535,11 +1739,32 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
     wisdom && import_wisdom!(wpath)
 
     hplans = build_harmonic_plans(params, Nprof)
+    # The direct interpolator's phase tables key off the *global* trial index, so
+    # they are built once here against `r_lo` and shared read-only by every task.
+    dplans = params.interp === :direct ? build_direct_plans(params, r_lo) : nothing
     nt = max(1, min(nthreads(), nchunks))
     # Planning is not thread-safe: build all workspaces serially, here.
     workspaces = [Workspace(params, hplans, Nprof) for _ in 1:nt]
 
     wisdom && export_wisdom!(wpath)
+
+    if verbose
+        harmonic_plan_report(stderr, params, hplans, Nprof)
+        @printf(stderr, "Search: %d trials in %d chunks of %d over r = %.1f … %.1f bins (%.4f … %.4f Hz), %d thread(s)\n",
+                total, nchunks, Nprof, r_lo, r_hi, r_lo / ft.T, r_hi / ft.T, nt)
+        if dplans !== nothing
+            nofb = count(dp -> dp.P == 0, dplans)
+            if nofb > 0
+                @printf(stderr, "  NOTE: %d harmonic(s) fell back to per-trial coefficients (hidr=%g is not a simple rational)\n",
+                        nofb, params.hidr)
+            else
+                @printf(stderr, "  phase-cycle lengths P: min %d, max %d (of q = %d)\n",
+                        minimum(dp.P for dp in dplans), maximum(dp.P for dp in dplans),
+                        dplans[1].q)
+            end
+        end
+        println(stderr, "─"^96)
+    end
 
     norm = nothing
     if normalize
@@ -1550,7 +1775,8 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
         @info "Normalising: measuring per-(k,frequency) noise (pass 1/2)"
         _search_region!(ft, params, hplans, workspaces, nbins, r_lo, r_hi, lodr,
                         total, Nprof, nchunks, nt;
-                        threshold=Inf, norm=nothing, metricstats=normstats, progress=progress)
+                        threshold=Inf, norm=nothing, metricstats=normstats, progress=progress,
+                        dplans=dplans)
         norm = build_metricnorm(normstats)
         @info "Built in-situ normalisation model; searching (pass 2/2)" windows=normstats.nwin
     end
@@ -1560,7 +1786,8 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
     cands = _search_region!(ft, params, hplans, workspaces, nbins, r_lo, r_hi, lodr,
                             total, Nprof, nchunks, nt;
                             threshold=threshold, norm=norm,
-                            metricstats=(normalize ? nothing : metricstats), progress=progress)
+                            metricstats=(normalize ? nothing : metricstats), progress=progress,
+                            dplans=dplans)
 
     ntotal = length(cands)
     @info "Search complete; post-processing candidates" total_above_threshold=ntotal

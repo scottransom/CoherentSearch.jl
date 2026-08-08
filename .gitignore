@@ -21,3 +21,6 @@ oracle.json
 # Benchmark sub-env manifest (regenerated) and profiler HTML output
 /bench/Manifest.toml
 /bench/statprof/
+# interp_bench.jl output (regenerate with `julia --project=bench bench/interp_bench.jl`)
+/bench/interp_bench_*.png
+/bench/interp_bench.csv

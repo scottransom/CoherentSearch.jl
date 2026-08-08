@@ -211,6 +211,30 @@ disables it, `--drtol` sets the tolerance), and harmonically-related candidates
 decimation (`--maxdecim`) re-uses the interpolated harmonics to fold at integer
 multiples of each fundamental, pinned by a test that every decimation pass
 reproduces the native reduced-harmonic fold. A progress meter prints to stderr
-(`--progressbar`, `--noprogress`). Next: a throughput sweep to tune per-harmonic
-`fftlen`/`numbetween`. See `Summary_and_Future_Work.md` and
-`decimation_design.md` for details.
+(`--progressbar`, `--noprogress`).
+
+### Interpolation (`--interp`)
+
+Two interpolators are available and produce the same physics by different means:
+
+- **`--interp direct` (default)** evaluates the Eqn.-30 kernel *exactly* at each
+  trial frequency. Factoring the coefficients as `A(dr)/(dr-j)` makes the weights
+  real, so a point costs `m` real multiply-adds and reads only `m` consecutive
+  bins; the handful of distinct `dr` values a search visits are tabulated once.
+  There is no fine grid, no `numbetween`, and no linear interpolation.
+- **`--interp fft`** is the FFT-correlation method ported from the Python
+  original: build a uniform fine grid of `numbetween` points per Fourier bin with
+  two transforms, then linearly interpolate it at the trial frequencies. It is
+  what the Python oracle and the machine-precision equivalence tests are pinned
+  to. Its padded transform length is chosen by `--fftsizing`: `pow2` (the
+  default, reproducing the original exactly) or `smooth` (next `2·3·5·7`-smooth —
+  much less padding, but measured no faster in an actual search).
+
+The direct path is both faster and far more accurate: the linear interpolation
+in the FFT path is an approximation worth up to ~5% in amplitude at high
+harmonics with the default `numbetween=16`, which the direct path removes
+entirely. `--verbose` prints the per-harmonic plan (`numbetween`, `m`, transform
+length and padding, fine-grid oversampling, whether linear interpolation is
+needed), and `bench/interp_bench.jl` compares the two on throughput and accuracy.
+
+See `Summary_and_Future_Work.md` and `decimation_design.md` for details.

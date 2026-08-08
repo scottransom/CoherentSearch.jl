@@ -291,6 +291,236 @@ must exceed `|med|·√wₘₐₓ/σ` for every threshold-crossing trial; 2.0 cl
 observed 1.23 with headroom, but widen it if broader real-data validation ever
 shows a near-threshold broad-signal miss.
 
+### Direct `O(m)` interpolation replaces the FFT correlation (2026-08-08)
+
+The 2026-07-21 re-baseline left **FFTW at 49.7%** and named `ComplexF32`
+interpolation as the next lever. Profiling the FFT bucket properly first turned
+up something better, and it retires three earlier conclusions at once.
+
+**Where the FFT time actually goes.** Of `fill_chunk_profiles!` (9.9 ms per
+2048-trial chunk, `nharms=60`, single thread), the 60 per-harmonic interpolation
+transforms are **76%** and the base batched profile `brfft` only **4%** (the
+other six `brfft`s, one per decimation pass, run outside the chunk fill). So the
+transform cost is overwhelmingly interpolation, not folding — which is why
+attacking the interpolation is what moves the FFTW bucket.
+
+**The kernel's coefficients are a real vector times a complex scalar.** With
+`offsets = dr - j` and integer `j`, the `(-1)^j` in `sin(pi(dr-j))` cancels the
+one in `cispi(dr-j)`, so Eqn. 30's coefficients collapse to
+
+    coeff_j = sinc(dr-j)*cispi(dr-j) = A(dr)/(dr - j),   A = sin(pi dr) cispi(dr)/pi
+
+and since `fourier_interp` forms `sum conj(coeff_j) bin_j` with `1/(dr-j)` real,
+
+    amp(r) = conj(A(dr)) * sum_j  bin_j / (dr - j)
+
+One point is `m` **real**-times-complex FMAs (4 flops), not complex ones (8), it
+reads only `m` consecutive bins (L1-resident), and it vectorises cleanly on
+de-interleaved real/imaginary planes. Verified against `fourier_interp` at
+4e-16.
+
+**Only `q = 2*nharms` distinct `dr` values occur in a whole search.** Global
+trial `t` sits at `r_t = r_lo + t*pnum/q` for `lodr = pnum/q` (exactly `1/120` at
+the defaults), so harmonic `h` sees `frac(h*r_lo) + i/q` and nothing else — for
+every chunk, forever. The `m` reciprocals and `A(dr)` are therefore tabulated
+**once per harmonic at plan time** and indexed by an integer residue that
+advances by a fixed step per trial. The inner loop has no transcendentals, no
+divisions, and no `mod`. Both the residue and the integer bin index are carried
+in exact integer arithmetic, so there is no drift across a long search and the
+"trial lands exactly on a bin" corner is handled explicitly rather than by
+`floor(r + 1e-15)`.
+
+**Measured** (`PM0063…red.fft`, `nharms=60`, `Nprof=2048`, single thread), summed
+over the 60 harmonic rows of one chunk: FFT-correlation + linear interpolation
+**7.77 ms** → direct with the phase table **1.32 ms**, i.e. **~5.9x**.
+`bench/interp_bench.jl` measures the two as pure throughput: at the production
+settings **57–74 M points/s** for direct+table against **6–7.3 M points/s** for
+FFT+linear, ~9x.
+
+**End to end** (5–30 Hz, `--maxdecim 6`, `:boxcar`, `--threshold 6`, single
+thread, warm wisdom, wall clock including ~2 s of Julia start-up):
+
+| interpolator | wall | candidates |
+|---|---|---|
+| `--interp fft` | 70.1 s | 159 above threshold → 22 after dedup |
+| `--interp direct` | **42.7 s** | 159 above threshold → 22 after dedup |
+
+**1.64x** overall (1.68x excluding start-up). The candidate lists match: the same
+22 survivors at the same frequencies and harmonic counts, metrics differing by
+~1% (the linear-interpolation error being removed), with only a couple of
+rank swaps among near-ties.
+
+**Was the `N log N` intuition wrong?  No — it just never applies here.**
+`bench/interp_bench.jl` separates the two effects. Counting only the points the
+FFT actually produces, FFT correlation **beats** direct summation, and by more as
+the kernel widens — exactly the reasoning the FFT-correlation design was built
+on:
+
+| m | FFT, per *grid* point | direct+table, per point | |
+|---|---|---|---|
+| 8 | 82.0 | 69.3 | FFT 1.18x |
+| 16 | 82.7 | 69.0 | FFT 1.20x |
+| 32 | 79.9 | 53.4 | FFT 1.50x |
+| 64 | 66.1 | 48.0 | FFT 1.38x |
+| 128 | 68.2 | 25.3 | FFT 2.69x |
+
+(M points/s, `N=2048`, single thread.) What the search cannot do is *use* those
+points. The fine grid has to be `numbetween` times finer than the trial spacing
+so the linear interpolation that follows is accurate — not merely fine enough to
+contain the trials — so at the production settings **7 of every 8 grid points are
+computed and discarded**, and the linear interpolation that reads the eighth is
+itself not free. Counted per point actually wanted:
+
+| m | FFT+linear | direct+table | |
+|---|---|---|---|
+| 8 | 6.9 | 53.0 | direct 7.7x |
+| 16 | 7.3 | 80.8 | direct 11.0x |
+| 32 | 6.5 | 60.3 | direct 9.3x |
+| 64 | 5.9 | 41.4 | direct 7.1x |
+| 128 | 5.7 | 26.4 | direct 4.6x |
+
+The oversampling is not a tuning mistake that could be dialled away, either: the
+fine grid is anchored to integer Fourier bins while the trials sit at an
+arbitrary sub-bin offset `frac(r0)`, so the two only coincide if the kernel is
+rebuilt per chunk to absorb that offset — a third transform per harmonic per
+chunk, which costs more than it saves. Direct summation has no grid to align.
+
+**And it removes an approximation that was costing real sensitivity.** The FFT
+path's final linear interpolation between fine-grid points is wrong by
+
+| h | nb | max rel. amplitude error vs the exact kernel |
+|---|----|---------------------------------------------|
+| 1 | 120 | 8.4e-4 |
+| 8 | 16 | 2.7e-2 |
+| 30 | 16 | 6.1e-2 |
+| 60 | 16 | 5.0e-2 |
+
+so the coherent sum has been adding 60 harmonics whose amplitudes are up to ~5%
+off. The direct path matches the exact kernel at ~1e-10 (1e-15 where `dr` is
+exactly representable). This is the "wart" the `numbetween`/`align` machinery
+was managing rather than removing.
+
+**What this retires.**
+
+- **The `ComplexF32` interpolation item is moot, and this was measured, not
+  assumed.** Its purpose was to halve the bandwidth of transforms that no longer
+  run. The direct path already reads the mmap's `ComplexF32` bins natively, so
+  the only remaining question was whether to carry the *weights* and the
+  *accumulator* in `Float32` too. Measured over the 60 harmonic rows:
+
+  | inner loop | time | vs `Float64` | error vs `Float64` |
+  |---|---|---|---|
+  | `Float64` planes + weights | 1.32 ms | — | — |
+  | `Float32` planes, `Float64` weights/accumulator | 1.20 ms | 1.11x | **0** (bit-identical) |
+  | `Float32` throughout | 0.98 ms | 1.35x | 2.1e-7 |
+
+  The middle row is free — `Float32 → Float64` is exact, so the sum is
+  bit-identical while reading half the bytes — and is now what the `Workspace`
+  planes use. Full `Float32` buys only a further 1.2x on ~20% of runtime (~3%
+  end-to-end) in exchange for giving up 9 digits, because the loop is
+  FMA-throughput-bound rather than bandwidth-bound. **Not worth it; not
+  implemented.** That closes the "biggest remaining lever" item as a
+  measurement rather than a project.
+- **HPK (and the `fft_tests/HPK_JULIA_HANDOFF.md` investigation) drops in
+  priority.** Its §7 prerequisite #1 was "profile the FFT length histogram and
+  the true FFT fraction"; done, and FFTW falls from **49.7% to 12.9%** — what is
+  left is the batched profile `brfft`, once per decimation pass, on short
+  (`2·Hₖ`-point) transforms with a 2048-wide batch. A 1.5x there is ~4%
+  end-to-end, which does not justify a proprietary binary-only dependency, a C++
+  shim, the GPL-vs-no-redistribution tension, or the AUI/NRAO legal review — and
+  batched short real transforms are not the ground HPK's published wins are on
+  (§4 of the handoff is 1-D complex, batch 1). Keep the handoff document; revisit
+  only if the direct path is ever backed out. KFR stays ruled out on speed.
+- **"`fftlen` sizing is settled — do not revisit" was wrong**, and is fixed
+  below.
+
+### Smooth `fftlen` sizing (2026-08-08) — reopened, measured in situ, re-rejected
+
+The §2 note above rejected smooth `2·3·5·7` lengths on two grounds: a "~3%"
+ceiling, and `MEASURE` planning ~60 lengths at 0.7 s each. The second ground is
+genuinely dead — the wisdom persistence landed later the same month means those
+plans are measured once, ever. The first deserved re-measuring, because the real
+argument for smooth sizing was never "mixed-radix beats radix-2 per point": it is
+that **we choose the length**, and `next_pow_of_2` throws away a **mean 1.38x
+(worst 1.98x)** in transform length across the harmonic schedule, which is pure
+loss.
+
+**Per-transform, that argument holds.** Re-measured in Julia at `ComplexF64` with
+`MEASURE`, summed over the distinct lengths the search asks for, smooth is
+**1.26x** faster.
+
+**In the actual search, it does not.** Same band and config as the table above,
+`--interp fft`, single thread, wall clock:
+
+| sizing | distinct lengths | mean padding | wall |
+|---|---|---|---|
+| `:pow2` | 4 | 1.382 | **66.6 s** |
+| `:smooth`, merge tol 1.25 | 8 | 1.115 | 66.2 s |
+| `:smooth`, merge tol 1.10 | 16 | 1.047 | 67.8 s |
+| `:smooth`, merge tol 1.60 | 4 | 1.259 | 71.6 s |
+| `:smooth`, merge tol 2.50 | 2 | 1.582 | 76.6 s |
+
+So the best smooth configuration is within noise of `:pow2` and the rest are
+worse — a **wash at best**, against a claimed 1.26x. **`:pow2` stays the
+default.** Two reasons the isolated benchmark overstates the case, both of which
+it is structurally unable to see:
+
+- **Smooth lengths are not uniformly good.** Compare rows 1 and 4: the *same*
+  number of distinct lengths and *less* padding, yet 7.5% slower. Per-size ratios
+  against the power of two ranged from **0.69x to 2.25x** in the isolated
+  measurement — the `3^k`-heavy lengths (6561, 13122, 15309) are markedly *worse*
+  than padding to a power of two — and "the smallest smooth number ≥ what I need"
+  sometimes lands on exactly those. Summing over distinct sizes hides that a bad
+  pick can be assigned to a harmonic that runs every chunk.
+- **It times transforms whose buffers are already resident.** In the search they
+  are not: `:pow2` gives 60 harmonics only **4** `FFTScratch` buffer sets that
+  stay warm across a chunk, while a tight smooth schedule spreads them over 8–16
+  sets and 6 MB. Padding and buffer reuse pull against each other, which is why
+  the sweep is not monotonic in either.
+
+**The old verdict was right; its stated reasons were not.** That distinction is
+worth keeping, because the reason it gave ("`next_pow_of_2` + `MEASURE` is
+already ≈ FFTW's best case") is false — the padding really is wasted — and would
+have discouraged the measurement that produced the useful finding.
+
+`SearchParams.fftsizing` keeps `:smooth` available (`--fftsizing smooth`), with
+lengths within `FFTLEN_MERGE_TOL` (1.10) merged upward so it cannot explode the
+plan and buffer count on a many-core node. It only affects `--interp fft`.
+
+### New profile (2026-08-08, `:direct` default)
+
+Same warm single-thread sampling profile as the 2026-07-21 baseline (5–30 Hz,
+`nharms=60`, six decimations, `:boxcar`), with a bucket for the direct
+interpolator added to `bench/profile_search.jl`:
+
+| bucket | self-time |
+|--------|-----------|
+| boxcar-metric (prefix-sum + width×phase scan) | 44.6% |
+| interp (direct `O(m)`) | 18.7% |
+| FFTW (the batched profile `brfft`s only) | 12.9% |
+| median-select | 10.1% |
+| decim (gather + short brfft) | 9.1% |
+| block-sigma | 3.7% |
+| fill-chunk (other) / other | 0.8% |
+
+Grouped: **detection metric ≈ 58%, interpolation/FFT pipeline ≈ 41%** — the
+balance has flipped back to the metric, as it was before the 2026-07-21 metric
+work, and for the same structural reason: **metric cost scales with `maxdecim`
+while interpolation is amortised across the decimations.** The next lever is
+therefore the boxcar width×phase scan again (44.6%, already `@simd`-vectorised
+once), not anything on the FFT side.
+
+### `--verbose`: the interpolation plan is now inspectable
+
+`harmonic_plan_report` (CLI `--verbose`) prints, per harmonic: `nb`, `m`,
+`deltar_h`, the input bins the chunk spans, the fine-grid length actually needed,
+the `fftlen` chosen and its padding factor, the fine-grid oversampling
+`nb*deltar_h`, and whether linear interpolation is required (`no` under
+`:direct`; `yes(fixed)` when the trial step is commensurate with the grid so one
+constant weight pair serves every trial; `yes` otherwise). The summary totals
+fine-grid points computed against trials wanted — which is how the 8x
+oversampling at high harmonics became visible in the first place.
+
 ---
 
 ## 3. Next steps
@@ -303,34 +533,22 @@ shows a near-threshold broad-signal miss.
 > and acting on what it finds. The throughput-tuning and tiling items below are
 > the concrete starting points for that work.
 
-- **Metric cost now dominates (see the 2026-07-21 re-baseline in §2).** Under the
-  `:boxcar` default + `--maxdecim 6`, the detection metric is ~55% of runtime and
-  the interp/FFT pipeline ~45% — inverting the ordering these bullets were written
-  against. The two highest-leverage items are now **(1) `@turbo` the boxcar
-  width×phase max-reduction (24.9%, exact, low-risk)** and **(2) reducing the
-  per-profile baseline median (28.4%)**; both scale with `maxdecim`. Do these
-  before the FFT-side levers below.
-- **`ComplexF32` interpolation (FFT-side lever; 32.5%).** The `.fft` amplitudes
-  are already `ComplexF32`; the interpolation pipeline widens to `ComplexF64`.
-  Keeping it `ComplexF32` would ~halve the bandwidth of the FFTW and `spec.*coeffs`
-  buckets. **Precision is expected to be fine physically** — PRESTO does much of
-  its Fourier interpolation at `ComplexF32` — so the real work is *not* proving the
-  science holds but *re-pinning the tests*: the `~1e-15` `Float64` oracle pins would
-  drop to `~1e-7`, so we need a parallel reduced-tolerance pin (and an
-  injected-fake-pulsar validation to confirm detection/S/N are unaffected) rather
-  than a risky numerical unknown. Still the biggest *single* bucket, but below the
-  metric-side levers in priority.
-- **Rethink FFT-correlation vs. direct interpolation.** The FFT computes ~16k
-  fine-grid points per harmonic to then linear-interp only the ~`Nprof` we need; a
-  cached-coefficient *direct* `O(m)` interpolation of just those points is ~7×
-  fewer arithmetic ops in principle. An architectural change to `interp_tile!` /
-  `fill_harmonic_row!` — higher risk, potentially a large win. Profile first.
-- **`fftlen` sizing is settled (do not revisit).** Sweeping `fftlen`/`numbetween`
-  or smooth (`2·3·5·7`) sizes was investigated (see §2) and rejected:
-  `next_pow_of_2` + `MEASURE` is already ≈ FFTW's best case. Tiling a chunk into
-  smaller overlapping transforms only matters if a future capped `fftlen` is
-  forced (e.g. a memory-constrained `ComplexF32` mode); `fill_harmonic_row!`
-  leaves room for the tile loop, but it is not a throughput win on its own.
+- **Metric cost dominates again — 58% (see the 2026-08-08 profile in §2).** With
+  the direct interpolator in, the split is boxcar-metric 44.6%, direct interp
+  18.7%, FFTW 12.9%, median-select 10.1%, decim 9.1%, block-σ 3.7%. The
+  highest-leverage item is the **boxcar width×phase scan (44.6%)**, which has
+  already had one `@simd` pass; it scales with `maxdecim` while interpolation is
+  amortised, so it will keep growing relative to everything else. The three
+  FFT-side bullets that used to live here are done or closed:
+  - *`ComplexF32` interpolation* — **closed by measurement, not implemented.**
+    The direct path reads `ComplexF32` bins natively and its planes are now
+    `Float32` (bit-identically); carrying the weights and accumulator in
+    `Float32` too buys 1.2x on ~19% of runtime for 9 digits. See §2.
+  - *Rethink FFT-correlation vs. direct interpolation* — **done**, and it was the
+    large win the bullet hoped for (1.64x end-to-end). See §2.
+  - *`fftlen` sizing* — reopened, re-measured in situ, and re-rejected; `:pow2`
+    stays the default but for different reasons than originally recorded. See §2.
+    Tiling a chunk into smaller overlapping transforms remains unmotivated.
 - **Start-up latency: persist FFTW wisdom (implemented, 2026-07-21).** A short
   search spent several seconds *before* the hot loop planning every distinct
   transform with `FFTW.MEASURE`, re-timed on every process start (building all

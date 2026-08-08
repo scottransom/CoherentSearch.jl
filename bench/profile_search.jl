@@ -96,6 +96,8 @@ function classify(sf)
     (fn == "pow_body" || fn == "^")                    && return "pow(w^pexp)"
     fn == "_profile_snr"                               && return "profile_snr-body"
     (fn == "interp_tile!" || fn == "fill_harmonic_row!") && return "interp (fft-correlate)"
+    (fn == "fill_harmonic_row_direct!" ||
+     fn == "_fill_row_direct_slow!")                   && return "interp (direct O(m))"
     fn == "decim_pass!"                                && return "decim (gather+brfft)"
     fn == "fill_chunk_profiles!"                       && return "fill-chunk (other)"
     fn == "uniform_linear_interp"                      && return "uniform_linear_interp"
