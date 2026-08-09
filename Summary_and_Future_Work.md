@@ -510,6 +510,126 @@ while interpolation is amortised across the decimations.** The next lever is
 therefore the boxcar width×phase scan again (44.6%, already `@simd`-vectorised
 once), not anything on the FFT side.
 
+### Cross-profile SIMD on the boxcar gate (2026-08-09) — 1.26x end-to-end
+
+The 44.6% boxcar bucket above was `@simd`-vectorised along **phase**, which is
+the wrong axis. Phase is `nbins` long, and `nbins = 120` only for the base pass:
+under decimation it falls to 20, where the prefix sum is a serial add chain, the
+max-reduction cannot fill a vector, and the horizontal reduce at the end of each
+of the 5–9 width iterations costs more than the reduction it closes. The **batch**
+axis is the one that is always long — a chunk holds `Nprof = 2048` profiles,
+already sitting contiguously as the columns of `profs`.
+
+So `_boxcar_gate!` transposes a tile of `B` profiles into a `(B, nbins)` buffer
+and runs the identical recurrence with `b` innermost. Every lane is a different
+profile: the prefix sum's serial dependency becomes `B`-wide, and the phase scan
+becomes a plain element-wise `max` with no horizontal reduce at all. Measured per
+2048-profile chunk, summed over the six decimations (`bench/boxcar_bench.jl`):
+
+| gate kernel | total | vs current |
+|---|---|---|
+| scalar per column, phase-SIMD, `Float64` (was) | 3457 µs | 1.00x |
+| batched cross-profile, `Float64`, `B=32` | 1248 µs | 2.77x |
+| batched cross-profile, `Float32`, `B=64` | 855 µs | 4.05x |
+
+End to end (5–30 Hz, `nharms=60`, `maxdecim 6`, single thread, median of 3
+alternating runs against a `HEAD` worktree): **41.7 s → 33.1 s, 1.26x**, with a
+**byte-identical candidate file**.
+
+**Two things this measurement establishes, both non-obvious:**
+
+- **`B` must be a compile-time constant.** With `B` an ordinary runtime `Int` the
+  inner loops do not unroll and batching is *slower than the scalar path* it
+  replaces — 2119 µs vs 1179 µs at `nbins=120, B=4`. Only passing `Val(B)` turns
+  it into a win. `bench/boxcar_bench.jl` keeps the runtime-`B` variant in the
+  table specifically so this cannot be "simplified" away unnoticed.
+- **The win is concentrated exactly where it should be.** It is smallest at the
+  base `nbins=120` (2.2x), where phase-SIMD already worked, and largest at the
+  decimated `nbins=20–30` (3.3–4.0x), where it never did. Since metric cost
+  scales with `maxdecim` while interpolation is amortised, this grows with the
+  standard config rather than shrinking.
+
+**`Float32`, applied only where it is provably free.** The tile is `Float32`
+while `profs` stays `Float64` — the conversion rides along in the transpose that
+must happen anyway, and it doubles the AVX lane count over the whole gate. This
+is sound *because it is a gate*: `_boxcar_gate!` computes the zero-baseline lower
+bound that ~99% of trials return from, and any trial reaching `medcut` is
+re-scored by the unchanged exact `Float64` path. Measured on real profiles the
+`Float32` bound differs from the `Float64` one by at most **~3e-6** in metric
+units (6e-7 on `PM0063…red.fft`, at `nbins` 120 and 20 alike; 2e-6 on the bundled
+test file), against the `boxcar_medmargin = 2.0` slack the rescue already
+reserves — a factor of ~1e6. It therefore cannot change which
+trials get scored exactly, hence cannot change the candidate list, which the
+byte-identical candidate file confirms. It does rely on the profile mean being 0
+(DC is held at zero), which keeps the prefix sum from drifting away from the
+boxcar sums it must resolve.
+
+**The gate had no test; it does now.** The adaptive zero-baseline gate landed
+without an equivalence pin, so nothing was checking the property the whole
+optimisation rests on. `test/test_search.jl` adds two: a full `search` against
+one with `boxcar_medmargin = Inf` (which forces `medcut = -Inf`, i.e. the exact
+median path for every trial) must produce byte-identical candidates; and the
+batched gate is compared directly to the scalar gate on real profiles, with the
+error required to stay three orders under `boxcar_medmargin`. Both cover the old
+gate and the new batching.
+
+**New profile, and it moves the target off the metric entirely.** Same warm
+single-thread sampling profile (5–30 Hz, `nharms=60`, six decimations, 34k
+samples):
+
+| bucket | self-time | was (2026-08-08) |
+|--------|-----------|------------------|
+| interp (direct `O(m)`) | 22.5% | 18.7% |
+| **boxcar-gate (batched)** | **20.0%** | — |
+| FFTW (batched profile `brfft`s) | 19.8% | 12.9% |
+| median-select | 15.6% | 10.1% |
+| decim (gather + short brfft) | 13.0% | 9.1% |
+| block-sigma | 5.7% | 3.7% |
+| boxcar-metric (exact rescue only) | 1.2% | 44.6% (whole metric) |
+| fill-chunk (other) / other | 2.3% | 0.8% |
+
+The metric fell from 44.6% to **21.2%** (gate 20.0 + rescue 1.2) and everything
+else rose proportionally. The 1.2% rescue bucket independently confirms the gate
+is working: only **98 of 12288 trials per chunk (0.8%)** ever reach `medcut` and
+pay for a median.
+
+**But `median-select` at 15.6% is not the metric — it is `_block_sigma`, and that
+is now the largest metric-side cost.** `_median!` has two callers, and the
+profiler's nearest-leaf classifier charges both to `median-select`; with the
+rescue down at 1.2%, almost all of it must be the two MAD passes in
+`_block_sigma`. Measured directly rather than inferred, per chunk summed over the
+six decimations:
+
+| | µs / chunk |
+|---|---|
+| `_block_sigma` (robust σ̂) | **949** |
+| `boxcar_metrics!` (gate + rescue) | 1064 |
+| — of which the batched gate | 912 |
+| — of which the exact rescue | 152 |
+
+So the noise-scale estimate now costs **0.89x the entire detection metric it
+normalises**, ~20% of the whole search. Worse, it is *worst where the profiles
+are cheapest*: at `nbins=20` (k=6) it is **213 µs against the gate's 60 µs**, 3.5x
+the metric, because `_BOXCAR_SIGMA_SAMPLES = 8192` is a flat cap independent of
+`nbins` and the strided subsample gather gets more expensive as the columns get
+shorter. This was invisible before — at 3.7% + a share of a 10.1% bucket it read
+as noise next to a 44.6% metric. **It is the next target, ahead of Kadane**, and
+it looks cheap: the estimate only needs sub-percent accuracy (that was the whole
+argument for pooling it per block), so a smaller subsample, a stride that is
+friendlier at small `nbins`, or reusing one σ̂ across decimations are all on the
+table. None of it touches the candidate list's definition, only the accuracy of a
+scale factor that is already deliberately approximate.
+
+**What is deliberately *not* done: a fully `Float32` profile stage.** Carrying
+`ftprofs` as `ComplexF32` and folding with a single-precision `brfft` is the
+remaining 1.46x on the metric kernel (855 µs vs 1248 µs) and would also cut the
+12.9% FFTW bucket, so it is the largest single item left. But unlike the gate it
+changes *reported* results, at ~3e-7 relative — physically irrelevant against a
+metric quoted to three digits, yet it would force the `align=false` equivalence
+pins down from machine precision to ~1e-6. That is a weakening of the stated
+correctness discipline, not a free win, and it is a judgement call rather than a
+measurement. Left open on purpose.
+
 ### `--verbose`: the interpolation plan is now inspectable
 
 `harmonic_plan_report` (CLI `--verbose`) prints, per harmonic: `nb`, `m`,
@@ -536,10 +656,24 @@ oversampling at high harmonics became visible in the first place.
 - **Metric cost dominates again — 58% (see the 2026-08-08 profile in §2).** With
   the direct interpolator in, the split is boxcar-metric 44.6%, direct interp
   18.7%, FFTW 12.9%, median-select 10.1%, decim 9.1%, block-σ 3.7%. The
-  highest-leverage item is the **boxcar width×phase scan (44.6%)**, which has
-  already had one `@simd` pass; it scales with `maxdecim` while interpolation is
-  amortised, so it will keep growing relative to everything else. The three
-  FFT-side bullets that used to live here are done or closed:
+  highest-leverage item was the **boxcar width×phase scan (44.6%)**, and it has
+  now had its second pass: **cross-profile SIMD batching (2026-08-09) took the
+  gate 2.77x and the whole search 1.26x** with a byte-identical candidate file
+  (see §2). What that leaves on the metric side, in order:
+  - *Fully `Float32` profile stage* — a further 1.46x on the metric kernel plus a
+    cut to the 12.9% FFTW bucket, at the price of moving reported metrics by
+    ~3e-7 and loosening the `align=false` pins from machine precision to ~1e-6.
+    Measured, deliberately not taken; see §2.
+  - ***`_block_sigma` is the new top metric-side target, ~20%*** — it now costs
+    0.89x the entire metric it normalises, and 3.5x it at `nbins=20`. See §2; it
+    looks like the cheapest remaining win in the search.
+  - *Kadane* (below) is now a smaller target than it looked: it competes against
+    a gate that is 2.77x faster than the one the bullet was written against, and
+    its own §3 step (3) — "try the cross-profile SIMD transpose on the existing
+    exact scan first, it may capture much of the benefit with no approximation
+    and no calibration risk" — **is what was just done, and it did.**
+
+  The three FFT-side bullets that used to live here are done or closed:
   - *`ComplexF32` interpolation* — **closed by measurement, not implemented.**
     The direct path reads `ComplexF32` bins natively and its planes are now
     `Float32` (bit-identically); carrying the weights and accumulator in

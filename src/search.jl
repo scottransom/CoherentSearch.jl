@@ -451,6 +451,189 @@ end
     return best
 end
 
+# ---------------------------------------------------------------------------
+# Cross-profile (batched) boxcar gate
+#
+# `_boxcar_scan` vectorises along *phase*, which is the wrong axis: it is
+# `nbins` long, and `nbins` is 120 only for the base pass — under decimation it
+# falls to 20, where neither the prefix sum (a serial add chain) nor the max
+# reduction can fill a vector, and the horizontal reduce at the end of every
+# (width) iteration costs more than the reduction itself.  The *batch* axis is
+# the one that is always long: a chunk holds `Nprof = 2048` profiles, sitting
+# contiguously as the columns of `profs`.
+#
+# So transpose a tile of `B` profiles into a `(B, nbins)` buffer and run the
+# identical recurrence with `b` innermost.  Every lane is then a different
+# profile: the prefix sum's serial dependency becomes `B`-wide, and the phase
+# scan becomes a plain element-wise `max` with no horizontal reduce at all.
+# `B` is a compile-time constant (`Val`) — with a runtime `B` the inner loops do
+# not unroll and the batched version is *slower* than the scalar one (measured).
+#
+# This runs the **gate** only — the zero-baseline lower bound that ~99% of trials
+# return from (see `_profile_boxcar`).  Any trial that clears `medcut` is
+# re-scored by the unchanged exact scalar path, so the reported metric of every
+# candidate is bit-for-bit what it was before.
+#
+# The tile is `Float32` (`_BC_TILE`) while `profs` stays `Float64`: the
+# conversion rides along in the transpose that has to happen anyway, and it
+# doubles the AVX lane count over the whole gate.  That is sound *because it is
+# a gate*: measured on real profiles it moves the bound by at most ~3e-6 in
+# metric units (6e-7 on `PM0063…red.fft` at `nbins` 120 and 20 alike, 2e-6 on the
+# bundled test file), which is ~6 orders under the
+# `boxcar_medmargin = 2.0` slack the exact-median rescue already reserves — so
+# it cannot change which trials get scored exactly, hence cannot change the
+# candidate list.  It relies on the profile mean being 0 (DC is held at zero),
+# which keeps the prefix sum from drifting away from the boxcar sums it must
+# resolve.  `test/test_search.jl` pins both properties.
+# ---------------------------------------------------------------------------
+
+const _BC_TILE = Float32          # gate tile/accumulator type (see above)
+const _BC_BATCH = 32              # profiles per SIMD tile; see bench/boxcar_bench.jl
+
+"""
+    BoxcarBatch{T}
+
+Scratch for the batched `:boxcar` gate over `_BC_BATCH` profiles at a time.
+`tile` and `psT` are flat vectors with a *static* row stride `B = _BC_BATCH`, so
+element `(b, i)` lives at `[(i-1)*B + b]` and the `b` loops compile to plain
+contiguous vector ops.  `mvals` holds one metric per trial of the chunk.
+"""
+struct BoxcarBatch{T}
+    tile::Vector{T}          # (B, nbins)               transposed profile tile
+    psT::Vector{T}           # (B, nbins + wmax + 1)    transposed prefix sums
+    res::Vector{T}           # (B,)  running best over widths
+    mbuf::Vector{T}          # (B,)  running best over phase, one width
+    mvals::Vector{Float64}   # (Nprof,) per-trial metric
+end
+
+function BoxcarBatch(nbins::Integer, wmax::Integer, Nprof::Integer,
+                     ::Type{T}=_BC_TILE, B::Integer=_BC_BATCH) where {T}
+    return BoxcarBatch{T}(Vector{T}(undef, B * nbins),
+                          Vector{T}(undef, B * (nbins + wmax + 1)),
+                          Vector{T}(undef, B), Vector{T}(undef, B),
+                          Vector{Float64}(undef, Nprof))
+end
+
+# Transpose profile columns `j0+1 .. j0+B` into `tile` as (B, nbins), converting
+# to the tile's eltype.  The read is column-contiguous and the tile is tens of KB
+# (15 KB at B=32, nbins=120), so it is still L1/L2-resident for the scan that
+# follows.  ~20% of the batched gate, and the price of admission for the rest.
+@inline function _bc_transpose!(tile::Vector{T}, profs::AbstractMatrix{Float64},
+                                j0::Int, nbins::Int, ::Val{B}) where {T,B}
+    @inbounds for i in 1:nbins
+        o = (i - 1) * B
+        for b in 1:B
+            tile[o + b] = T(profs[i, j0 + b])
+        end
+    end
+end
+
+# The zero-baseline `_boxcar_psum!` + `_boxcar_scan` of `B` profiles at once,
+# leaving each profile's peak matched-filter S/N in `res[1:B]`.  Same recurrence
+# and same operation order per profile as the scalar pair; only the axis the
+# vectoriser sees is different.
+@inline function _bc_scan_batch!(bb::BoxcarBatch{T}, widths::Vector{Int},
+                                 nbins::Int, invsigma::T, ::Val{B}) where {T,B}
+    tile = bb.tile; psT = bb.psT; res = bb.res; mbuf = bb.mbuf
+    wmax = widths[end]
+    @inbounds for b in 1:B
+        psT[b] = zero(T)
+    end
+    @inbounds for i in 1:(nbins + wmax)
+        idx = i > nbins ? i - nbins : i        # wrap: a boxcar may straddle phase 0
+        o = (i - 1) * B
+        t = (idx - 1) * B
+        @simd for b in 1:B
+            psT[o + B + b] = psT[o + b] + tile[t + b]
+        end
+    end
+    @inbounds for b in 1:B
+        res[b] = T(-Inf)
+    end
+    @inbounds for w in widths
+        invsw = invsigma / sqrt(T(w))
+        wo = w * B
+        @simd for b in 1:B                     # finite seed, as in `_boxcar_scan`
+            mbuf[b] = psT[wo + b] - psT[b]
+        end
+        for p in 2:nbins
+            o = (p - 1) * B
+            @simd for b in 1:B
+                d = psT[o + wo + b] - psT[o + b]
+                mbuf[b] = ifelse(d > mbuf[b], d, mbuf[b])
+            end
+        end
+        @simd for b in 1:B
+            c = mbuf[b] * invsw
+            res[b] = ifelse(c > res[b], c, res[b])
+        end
+    end
+end
+
+# Zero-baseline gate for every column `1:n`, into `bb.mvals`.  Full `B`-tiles go
+# through the batched kernel; the `< B` leftover columns take the scalar one
+# (both are valid lower bounds, which is all the gate needs).
+function _boxcar_gate!(bb::BoxcarBatch{T}, profs::AbstractMatrix{Float64}, n::Int,
+                       psum::Vector{Float64}, widths::Vector{Int}, nbins::Int,
+                       invsigma::Float64) where {T}
+    B = _BC_BATCH
+    vb = Val(B)
+    invsig_t = T(invsigma)
+    mvals = bb.mvals
+    j0 = 0
+    @inbounds while j0 + B <= n
+        _bc_transpose!(bb.tile, profs, j0, nbins, vb)
+        _bc_scan_batch!(bb, widths, nbins, invsig_t, vb)
+        for b in 1:B
+            mvals[j0 + b] = Float64(bb.res[b])
+        end
+        j0 += B
+    end
+    wmax = widths[end]
+    @inbounds for j in (j0 + 1):n
+        col = @view profs[:, j]
+        _boxcar_psum!(psum, col, nbins, wmax, 0.0)
+        mvals[j] = _boxcar_scan(psum, widths, nbins, invsigma)
+    end
+    return mvals
+end
+
+"""
+    boxcar_metrics!(bb, profs, n, medbuf, psum, widths, nbins, invsigma, medpairs, medcut)
+
+Peak boxcar matched-filter S/N of every profile column `1:n`, into `bb.mvals`.
+
+With `medcut > -∞` this is the two-phase production path: one *batched* pass
+computes the cheap zero-baseline lower bound for all `n` trials
+([`_boxcar_gate!`](@ref)), then only the trials that reach `medcut` are re-scored
+exactly by [`_profile_boxcar`](@ref) — which is where the median is paid.  With
+`medcut = -∞` every trial needs the exact median anyway, so the gate would be
+pure overhead and the scalar path runs directly.
+
+Identical results to a per-column `_profile_boxcar` loop for every trial that can
+become a candidate; see the section comment above for why the `Float32` gate
+cannot move that set.
+"""
+function boxcar_metrics!(bb::BoxcarBatch, profs::AbstractMatrix{Float64}, n::Int,
+                         medbuf::Vector{Float64}, psum::Vector{Float64},
+                         widths::Vector{Int}, nbins::Int, invsigma::Float64,
+                         medpairs::Vector{Tuple{Int,Int}}, medcut::Float64)
+    mvals = bb.mvals
+    if medcut == -Inf || invsigma <= 0
+        @inbounds for j in 1:n
+            mvals[j] = _profile_boxcar(profs, j, medbuf, psum, widths, nbins,
+                                       invsigma, medpairs)
+        end
+        return mvals
+    end
+    _boxcar_gate!(bb, profs, n, psum, widths, nbins, invsigma)
+    @inbounds for j in 1:n
+        mvals[j] < medcut && continue         # cannot reach threshold: keep the bound
+        mvals[j] = _boxcar_exact(profs, j, medbuf, psum, widths, nbins, invsigma, medpairs)
+    end
+    return mvals
+end
+
 """
     _profile_boxcar(profs, j, medbuf, psum, widths, nbins, invsigma[, medpairs, medcut]) -> Float64
 
@@ -487,18 +670,28 @@ computes the exact median.
                                  medpairs::Vector{Tuple{Int,Int}}=_NO_MEDPAIRS,
                                  medcut::Float64=-Inf)
     invsigma > 0 || return 0.0                    # degenerate (flat block): no detection
-    col = @view profs[:, j]
-    wmax = widths[end]
     if medcut > -Inf                              # fast gate: cheap zero-baseline scan first
-        _boxcar_psum!(psum, col, nbins, wmax, 0.0)
+        col = @view profs[:, j]
+        _boxcar_psum!(psum, col, nbins, widths[end], 0.0)
         m0 = _boxcar_scan(psum, widths, nbins, invsigma)
         m0 < medcut && return m0                  # can't reach threshold — skip the median
     end
+    return _boxcar_exact(profs, j, medbuf, psum, widths, nbins, invsigma, medpairs)
+end
+
+# The exact (median-baseline) half of `_profile_boxcar`, split out so the batched
+# gate in `boxcar_metrics!` can rescue a trial without redoing the zero-baseline
+# scan.  Assumes `invsigma > 0`.
+@inline function _boxcar_exact(profs::AbstractMatrix{Float64}, j::Integer,
+                               medbuf::Vector{Float64}, psum::Vector{Float64},
+                               widths::Vector{Int}, nbins::Int, invsigma::Float64,
+                               medpairs::Vector{Tuple{Int,Int}})
+    col = @view profs[:, j]
     @inbounds for i in 1:nbins
         medbuf[i] = col[i]
     end
     med = _baseline_median!(medbuf, nbins, medpairs)   # network (short) or quickselect
-    _boxcar_psum!(psum, col, nbins, wmax, med)
+    _boxcar_psum!(psum, col, nbins, widths[end], med)
     return _boxcar_scan(psum, widths, nbins, invsigma)
 end
 
@@ -903,6 +1096,7 @@ struct DecimBuf{B}
     bcpsum::Vector{Float64}        # :boxcar prefix-sum scratch (2*Hk + wmax + 1)
     bcsig::Vector{Float64}         # :boxcar per-block σ subsample scratch
     medpairs::Vector{Tuple{Int,Int}}  # sorting-network median pairs (empty ⇒ quickselect)
+    bcbatch::BoxcarBatch{_BC_TILE}    # :boxcar cross-profile SIMD gate scratch + metrics
 end
 
 function DecimBuf(k::Integer, nharms::Integer, Nprof::Integer, params::SearchParams)
@@ -916,7 +1110,9 @@ function DecimBuf(k::Integer, nharms::Integer, Nprof::Integer, params::SearchPar
     bcpsum   = Vector{Float64}(undef, 2Hk + bcwidths[end] + 1)
     bcsig    = Vector{Float64}(undef, min(2Hk * Nprof, _BOXCAR_SIGMA_SAMPLES))
     medpairs = 2Hk <= _MED_NET_MAX ? _batcher_pairs(2Hk) : _NO_MEDPAIRS
-    return DecimBuf(Int(k), Hk, dftprofs, dprofs, medbuf, brfftplan, bcwidths, bcpsum, bcsig, medpairs)
+    bcbatch  = BoxcarBatch(2Hk, bcwidths[end], Nprof)
+    return DecimBuf(Int(k), Hk, dftprofs, dprofs, medbuf, brfftplan, bcwidths, bcpsum,
+                    bcsig, medpairs, bcbatch)
 end
 
 """
@@ -944,6 +1140,7 @@ struct Workspace{S<:FFTScratch, B, D<:DecimBuf}
     bcpsum::Vector{Float64}        # :boxcar prefix-sum scratch (2*nharms + wmax + 1)
     bcsig::Vector{Float64}         # :boxcar per-block σ subsample scratch
     medpairs::Vector{Tuple{Int,Int}}  # sorting-network median pairs (empty ⇒ quickselect; nbins=120 default)
+    bcbatch::BoxcarBatch{_BC_TILE}    # :boxcar cross-profile SIMD gate scratch + metrics
     decims::Vector{D}              # one per decimation factor k > 1
     # :direct — the chunk's bin window, de-interleaved into real/imaginary planes.
     # Kept at `Float32`, the storage type of the `.fft` file: widening on load is
@@ -973,6 +1170,7 @@ function Workspace(params::SearchParams, hplans::Vector{HarmonicPlan}, Nprof::In
     bcpsum   = Vector{Float64}(undef, 2nh + bcwidths[end] + 1)
     bcsig    = Vector{Float64}(undef, min(2nh * Nprof, _BOXCAR_SIGMA_SAMPLES))
     medpairs = 2nh <= _MED_NET_MAX ? _batcher_pairs(2nh) : _NO_MEDPAIRS
+    bcbatch  = BoxcarBatch(2nh, bcwidths[end], Nprof)
     # A DecimBuf per k > 1 (k = 1 is the base ftprofs/profs above).  `map` (not a
     # `DecimBuf[...]` comprehension) keeps the element type the concrete
     # `DecimBuf{B}` even when empty, so `Workspace`'s `D<:DecimBuf` stays concrete.
@@ -981,7 +1179,7 @@ function Workspace(params::SearchParams, hplans::Vector{HarmonicPlan}, Nprof::In
     re = Vector{Float32}(undef, nw)
     im = Vector{Float32}(undef, nw)
     return Workspace(scratch, ftprofs, profs, medbuf, brfftplan, bcwidths, bcpsum,
-                     bcsig, medpairs, decims, re, im)
+                     bcsig, medpairs, bcbatch, decims, re, im)
 end
 
 """
@@ -1480,13 +1678,16 @@ function decim_pass!(out::Vector{Candidate}, ws::Workspace, db::DecimBuf, ft::FF
     if params.metric === :boxcar
         sig = _block_sigma(db.dprofs, nbins, nvalid, db.bcsig)
         invsigma = sig > 0 ? 1.0 / sig : 0.0
+        # Only the valid prefix is scored; past-Nyquist columns are skipped below.
+        boxcar_metrics!(db.bcbatch, db.dprofs, nvalid, db.medbuf, db.bcpsum,
+                        db.bcwidths, nbins, invsigma, db.medpairs, Float64(medcut))
     end
     mbuf = stats === nothing ? nothing : Float64[]     # gather metrics if requested
     @inbounds for j in 1:n
         r_dec = k * (rstart + (j - 1) * lodr)
         r_dec < nyq || continue                       # fundamental past Nyquist
         mval = params.metric === :boxcar ?
-            _profile_boxcar(db.dprofs, j, db.medbuf, db.bcpsum, db.bcwidths, nbins, invsigma, db.medpairs, Float64(medcut)) :
+            db.bcbatch.mvals[j] :
             _profile_snr(db.dprofs, j, db.medbuf, nbins, invrms,
                          1.0 / nbins, params.xsignal, params.metric, params.pexp)
         if mbuf !== nothing
@@ -1606,13 +1807,17 @@ function _search_region!(ft::FFTFile, params::SearchParams, hplans::Vector{Harmo
                 if params.metric === :boxcar
                     sig = _block_sigma(ws.profs, nbins, n, ws.bcsig)   # one robust σ per block
                     invsigma = sig > 0 ? 1.0 / sig : 0.0
+                    # All n trials at once: batched zero-baseline gate, then the
+                    # exact median rescan only for those that reach `medcut`.
+                    boxcar_metrics!(ws.bcbatch, ws.profs, n, ws.medbuf, ws.bcpsum,
+                                    ws.bcwidths, nbins, invsigma, ws.medpairs, medcut)
                 end
                 # Whole (narrow) block → one window, keyed by its centre freq.
                 basehist = collect_stats ?
                     hists[1][_window_index(wedges[1], rmean / ft.T)] : nothing
                 for j in 1:n
                     metric = params.metric === :boxcar ?
-                        _profile_boxcar(ws.profs, j, ws.medbuf, ws.bcpsum, ws.bcwidths, nbins, invsigma, ws.medpairs, medcut) :
+                        ws.bcbatch.mvals[j] :
                         _profile_snr(ws.profs, j, ws.medbuf, nbins, invrms, 1.0 / nbins, params.xsignal, params.metric, params.pexp)
                     if collect_stats
                         mbuf[j] = metric

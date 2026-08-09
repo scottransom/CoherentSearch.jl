@@ -302,6 +302,62 @@ if isfile(EXAMPLE_FFT)
         @test isapprox(best.freq, 10.0123; atol=1e-2)
     end
 
+    @testset "boxcar fast gate does not change the candidate list" begin
+        # The production :boxcar path scores ~99% of trials with only a cheap
+        # zero-baseline *lower bound* (batched across profiles, in Float32), and
+        # pays for the exact median baseline only when that bound comes within
+        # `boxcar_medmargin` of `threshold`.  `boxcar_medmargin = Inf` forces
+        # `medcut = -Inf`, i.e. the exact scalar path for every trial — so the
+        # two runs must produce byte-identical candidates.  This is the pin for
+        # both the gate itself and the cross-profile SIMD batching behind it.
+        gated = SearchParams(nharms=60, m=32, metric=:boxcar,
+                             decimations=decimation_set(60, 4))
+        exact = SearchParams(nharms=60, m=32, metric=:boxcar,
+                             decimations=decimation_set(60, 4),
+                             boxcar_medmargin=Inf)
+        kw = (lofreq=9.5, hifreq=10.5, threshold=6.0, blocksize=512)
+        cg = search(ft, gated; kw...)
+        ce = search(ft, exact; kw...)
+        @info "boxcar gate vs exact" ngated=length(cg) nexact=length(ce)
+        @test length(cg) == length(ce)
+        @test all(a.freq == b.freq && a.nharm == b.nharm for (a, b) in zip(cg, ce))
+        # Candidates come from the exact path in both runs, so even the metric
+        # is bit-for-bit equal — the Float32 gate only decides *what* to score.
+        @test all(a.metric == b.metric for (a, b) in zip(cg, ce))
+    end
+
+    @testset "batched boxcar gate matches the scalar gate" begin
+        # Directly: the cross-profile SIMD gate against the per-column scalar
+        # one it replaces, on real profiles.  Float32 tiles make this close, not
+        # exact; the bound that matters is that it stays far under
+        # `boxcar_medmargin` (2.0), which is the slack the rescue reserves.
+        CS = CoherentSearch
+        params = SearchParams(nharms=60, m=32, metric=:boxcar)
+        nbins = 2params.nharms
+        Nprof = 500          # deliberately not a multiple of _BC_BATCH (tail path)
+        lodr = params.hidr / params.nharms
+        rstart = 10010.0
+        hplans = CS.build_harmonic_plans(params, Nprof)
+        ws = CS.Workspace(params, hplans, Nprof)
+        dplans = CS.build_direct_plans(params, rstart)
+        CS.fill_chunk_profiles!(ws, hplans, ft, params, rstart, lodr, Nprof;
+                                dplans=dplans, t0=0)
+        sigma = CS._block_sigma(ws.profs, nbins, Nprof, ws.bcsig)
+        invsigma = 1.0 / sigma
+
+        CS._boxcar_gate!(ws.bcbatch, ws.profs, Nprof, ws.bcpsum, ws.bcwidths,
+                         nbins, invsigma)
+        got = copy(ws.bcbatch.mvals[1:Nprof])
+        want = [CS._profile_boxcar(ws.profs, j, ws.medbuf, ws.bcpsum, ws.bcwidths,
+                                   nbins, invsigma, ws.medpairs, Inf) for j in 1:Nprof]
+        err = maximum(abs.(got .- want))
+        @info "batched vs scalar boxcar gate" maxabs=err medmargin=params.boxcar_medmargin
+        @test err < 1e-3 * params.boxcar_medmargin
+        # The `< _BC_BATCH` tail columns take the scalar kernel, so they are exact.
+        ntail = Nprof - (Nprof ÷ CS._BC_BATCH) * CS._BC_BATCH
+        @test all(got[j] == want[j] for j in (Nprof - ntail + 1):Nprof)
+    end
+
     @testset "per-harmonic alignment is more accurate at low harmonics" begin
         # The whole point of per-harmonic numbetween: low harmonics, whose
         # finterp grid is coarse relative to their curvature at a fixed
