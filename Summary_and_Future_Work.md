@@ -666,15 +666,64 @@ with an order-of-magnitude estimate that *matches the measured total* is still
 not evidence. Splitting the function into its four phases took one benchmark and
 overturned the diagnosis.
 
-**What is deliberately *not* done: a fully `Float32` profile stage.** Carrying
-`ftprofs` as `ComplexF32` and folding with a single-precision `brfft` is the
-remaining 1.46x on the metric kernel (855 µs vs 1248 µs) and would also cut the
-12.9% FFTW bucket, so it is the largest single item left. But unlike the gate it
-changes *reported* results, at ~3e-7 relative — physically irrelevant against a
-metric quoted to three digits, yet it would force the `align=false` equivalence
-pins down from machine precision to ~1e-6. That is a weakening of the stated
-correctness discipline, not a free win, and it is a judgement call rather than a
-measurement. Left open on purpose.
+### Fully `Float32` profile stage — implemented on a branch, **measured, do not merge**
+
+Branch `float32-profiles` (kept unmerged). `ftprofs`/`dftprofs` become
+`ComplexF32`, `profs`/`dprofs` and the metric scratch become `Float32`, and the
+batched inverse transforms become single-precision. Interpolation still
+accumulates in `Float64` and only *stores* narrowed, so the loss is one rounding
+per harmonic amplitude rather than an accumulated one. A `ProfT`/`CProfT` alias
+pair at the top of `search.jl` is the only thing selecting the precision; set
+them back to `Float64`/`ComplexF64` and the branch is master exactly.
+
+| configuration | end-to-end (median of 3, 1 thread) | candidate file |
+|---|---|---|
+| master (`Float64` profiles) | 30.2 s | — |
+| + `Float32` profile stage | 28.9 s (**1.05x**) | **byte-identical** |
+| + `Float32` interpolation as well | 32.4 s (**0.93x**) | **byte-identical** |
+
+**The accuracy question is settled and the answer is reassuring: precision was
+never the binding constraint.** The candidate file is byte-identical to master at
+the printed precision over the full 5–30 Hz band in *both* configurations, and
+the batched gate becomes bit-identical to the scalar gate (its tile conversion is
+now a no-op). The `.fft` bins are `ComplexF32` on disk, so the input never
+carried the digits the `Float64` pipeline was computing. What moves is only pin
+strength: the `align=false` pins go from machine precision to ~1e-7, and a fully
+`Float32` interpolation additionally pushes the `:direct` oracle pin from <1e-7
+to 4.6e-7.
+
+**The speed question is where it fails, and the second row is genuinely
+surprising.** 1.05x is inside this workload's ~9% run-to-run scatter, and making
+the *interpolation* `Float32` as well is **7% slower than master**. That last
+result contradicts the standard expectation (more SIMD lanes + less bandwidth
+ought to win) and it is **not fully explained**. Plausible mechanisms, none
+verified: the `@simd` reduction's horizontal collapse costs more at 8 lanes than
+4 while `m=16` gives it half as many iterations to amortise over; the `re[b+i]`
+loads are unaligned at a `b` that shifts every trial, which bites harder at
+32-byte loads; or LLVM is simply not vectorising the `Float32` form comparably.
+Settling it needs `@code_native` on the inner loop plus an `m` sweep — **do that
+before trusting any story about it, including this one.**
+
+**Two stale figures caused the bad projections, and both went stale the same
+way** — a default moved out from under a recorded measurement:
+
+- The *1.46x* projected for a `Float32` metric kernel was measured against a
+  `Float64` gate. The gate committed in `3d385e1` already uses a `Float32` tile,
+  so that win had **already been banked** where it cost nothing (a gate's error
+  budget is `boxcar_medmargin = 2.0`, not `eps`).
+- The *1.35x* recorded in §2 for a fully-`Float32` direct inner loop was measured
+  at `m=32`, before the default halved to 16.
+
+**Worth revisiting, and specifically on GPU.** The calculus inverts there:
+`Float64` runs at 1/32–1/64 rate on consumer NVIDIA, and parallelising across
+*trials* rather than within the `m`-sum removes the horizontal-reduce cost that
+may be exactly what is biting on CPU. **This negative result is CPU-specific and
+`m=16`-specific; it is not an argument against `Float32` on a GPU port.**
+
+Kept from the experiment regardless: `PIN_TOL` in `test/test_search.jl` now
+derives the equivalence tolerance from `ProfT` rather than hardcoding it, so the
+pins tighten and loosen with the precision instead of being relaxed by hand.
+318/318 tests pass on the branch.
 
 ### `--verbose`: the interpolation plan is now inspectable
 

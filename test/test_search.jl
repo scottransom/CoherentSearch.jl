@@ -9,6 +9,15 @@ using Random
 const EXAMPLE_FFT = joinpath(@__DIR__, "..", "..", "coherent_search",
                              "examples", "harmonics_hi.fft")
 
+# Tolerance for the optimised-vs-reference equivalence pins.  These are
+# machine-precision pins when the profile stage is Float64; on the
+# `float32-profiles` branch the narrowed profile stage puts them at ~1e-7, so the
+# bound is derived from `ProfT` rather than relaxed by hand — flipping the alias
+# back to Float64 restores the strict pin automatically, and a real regression is
+# orders of magnitude larger than either bound.
+const PIN_TOL = CoherentSearch.ProfT === Float32 ? 1e-6 : 1e-8
+
+
 @testset "harmonic_numbetween schedule" begin
     nh, hidr, minnb = 32, 0.5, 16
     # Never below the floor; finer at the low harmonics; matched to deltar_h.
@@ -176,7 +185,7 @@ if isfile(EXAMPLE_FFT)
         @info "align=false reference agreement" relerr
         # Both paths compute identical profiles to ~1e-10; the snr metric is a
         # continuous function of them except at the (rare) half-max threshold tie.
-        @test relerr < 1e-8
+        @test relerr < PIN_TOL
     end
 
     @testset "boxcar metric: optimised path reproduces the reference (align=false)" begin
@@ -194,7 +203,7 @@ if isfile(EXAMPLE_FFT)
         opt = chunk_metrics(ft, params, rstart, n; lodr=lodr)
         relerr = maximum(abs.(opt .- ref)) / maximum(abs.(ref))
         @info "boxcar align=false reference agreement" relerr
-        @test relerr < 1e-8
+        @test relerr < PIN_TOL
     end
 
     @testset "direct interpolation is the exact kernel" begin
@@ -343,13 +352,13 @@ if isfile(EXAMPLE_FFT)
         CS.fill_chunk_profiles!(ws, hplans, ft, params, rstart, lodr, Nprof;
                                 dplans=dplans, t0=0)
         sigma = CS._block_sigma(ws.profs, nbins, Nprof, ws.bcsig)
-        invsigma = 1.0 / sigma
+        invsigma = one(CS.ProfT) / sigma
 
         CS._boxcar_gate!(ws.bcbatch, ws.profs, Nprof, ws.bcpsum, ws.bcwidths,
-                         nbins, invsigma)
+                         nbins, CS.ProfT(invsigma))
         got = copy(ws.bcbatch.mvals[1:Nprof])
-        want = [CS._profile_boxcar(ws.profs, j, ws.medbuf, ws.bcpsum, ws.bcwidths,
-                                   nbins, invsigma, ws.medpairs, Inf) for j in 1:Nprof]
+        want = [Float64(CS._profile_boxcar(ws.profs, j, ws.medbuf, ws.bcpsum, ws.bcwidths,
+                                           nbins, invsigma, ws.medpairs, Inf)) for j in 1:Nprof]
         err = maximum(abs.(got .- want))
         @info "batched vs scalar boxcar gate" maxabs=err medmargin=params.boxcar_medmargin
         @test err < 1e-3 * params.boxcar_medmargin
@@ -450,7 +459,7 @@ if isfile(EXAMPLE_FFT)
             got = [c.metric for c in out]             # emitted in ascending-r (j) order
             relerr = maximum(abs.(got .- ref)) / maximum(abs.(ref))
             @info "decimation k native-fold agreement" k relerr
-            @test relerr < 1e-8
+            @test relerr < PIN_TOL
             @test all(c.nharm == Hk for c in out)
         end
     end
