@@ -95,6 +95,21 @@ the hot loop. See `Summary_and_Future_Work.md` (§3) for the roadmap.
   correlation (`src/directinterp.jl`, `--interp direct`, now the default). The
   interp FFTs — 76% of the chunk fill, ~50% of runtime — are gone; **1.64×
   end-to-end** and ~1e-10 accuracy where the FFT path had ~1e-2.
+- **Done (2026-08-09): default `m` 32 → 16, plus a `--m` flag.** Justified by the
+  Monte Carlo in `../coherent_search/examples/interp_accuracy_vs_m.md`: the
+  recovered signal-power fraction is `S_m = Σ sinc²(dr−k)`, so the loss is
+  `≈ 0.203/m` averaged over sub-bin offset — 1.27% at `m=16` vs 0.63% at `m=32`,
+  against the ~6.5% the `hidr=0.5` grid already costs at the top harmonic.
+  Confirmed end to end: the 7.1185 Hz pulsar's metric moves 12.034 → 12.001
+  (−0.27%, predicted ≈0.3%); at `m=8` it is 11.894 (−1.16%, predicted ≈0.95%).
+  **`m` is not where the remaining time is.** The interp bucket is 18.8% at
+  `m=32` → 15.0% at `m=16`, i.e. **~3.6% end-to-end** — halving `m` cuts interp
+  time only ~19%, not 50%, because the direct interpolator is dominated by fixed
+  per-point cost rather than the `m`-term sum (`bench/interp_bench.csv`
+  `m_sweep`: 1.49e-4 s at `m=8` → 4.44e-4 s at `m=128` for 2048 points, i.e.
+  `t ≈ 1.47e-4 + 2.4e-7·m`). Below `m=16` the accuracy cost rises faster than the
+  time falls, so 16 is the knee. **Next target is the boxcar metric at ~45%.**
+  Note end-to-end wall-clock cannot resolve this: run-to-run scatter is ~9%.
 - **Smooth `fftlen` sizing: re-examined, still rejected — but measure in situ,
   not per size.** Per transform it really is 1.26× (`next_pow_of_2` wastes a mean
   1.38× in length, and we choose the length). In a real search it is a wash to

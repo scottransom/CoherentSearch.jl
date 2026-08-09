@@ -43,6 +43,17 @@ Tunable search parameters (defaults match the Python CLI).
   frequencies.  Kept because it is what the Python oracle and the
   machine-precision equivalence tests are pinned to, and as a fallback.
 
+`m` is the number of Fourier bins summed by the interpolation kernel (must be
+even).  With `:direct` the cost is linear in `m`, so it is worth keeping small.
+The fraction of signal power recovered is `S_m(dr) = Σ sinc²(dr − k)`, so the
+loss is `1 − S_m ≈ 4·sin²(π·dr)/(π²·m)` — 0.2/m averaged over `dr`, 0.4/m worst
+case: 1.27% at the default `m = 16`, 0.63% at `m = 32`.  That sits well under the
+~6.5% mean loss the `hidr = 0.5` trial grid already costs at the highest
+harmonic, which is why 16 rather than 32 is the default.  Note the truncation
+weight `S_m` is *real and positive*, so small `m` costs amplitude but introduces
+**no** phase error and cannot degrade the coherence of the harmonic sum.  Full
+analysis: `../coherent_search/examples/interp_accuracy_vs_m.md`.
+
 `numbetween` is the *floor* on the interpolation oversampling for `:fft`; with
 `align` set, low harmonics use a finer `numbetween` matched to their finer
 `deltar_h` (see [`harmonic_numbetween`](@ref)).  Note that `:fft` + linear
@@ -52,7 +63,7 @@ harmonics, which is what `:direct` removes.
 """
 Base.@kwdef struct SearchParams
     nharms::Int = 32        # number of harmonics to coherently sum
-    m::Int = 32             # Fourier bins in the interpolation kernel (even)
+    m::Int = 16             # Fourier bins in the interpolation kernel (even)
     numbetween::Int = 16    # *minimum* interpolated points between Fourier bins
     hidr::Float64 = 0.5     # Fourier-bin step at the highest harmonic
     threshold::Float64 = 8.0

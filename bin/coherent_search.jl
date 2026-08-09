@@ -77,6 +77,11 @@ function parse_cmdline(argv)
             help = "Fourier bin resolution at highest harmonic"
             arg_type = Float64
             default = 0.5
+        "--m"
+            help = "Fourier bins summed by the interpolation kernel (even). Cost is linear in m for --interp direct; the signal-power loss is ~0.2/m averaged over sub-bin offset (1.3% at m=16), against ~6.5% already lost to the --hidr trial grid"
+            arg_type = Int
+            default = 16
+            range_tester = x -> x > 0 && iseven(x)
         "--numbetween"
             help = "Minimum points to interpolate between Fourier bins (--interp fft only)"
             arg_type = Int
@@ -180,6 +185,7 @@ function main(argv)
     decimations = decimation_set(nharms, maxdecim)
     params = SearchParams(
         nharms = nharms,
+        m = a["m"],
         numbetween = a["numbetween"],
         hidr = a["hidr"],
         threshold = a["threshold"],
