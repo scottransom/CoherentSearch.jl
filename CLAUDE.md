@@ -140,7 +140,20 @@ the hot loop. See `Summary_and_Future_Work.md` (§3) for the roadmap.
   which is why `_block_sigma` read as 3.7% while really being ~20%.
 - **Next target: Kadane** — whose own first-listed step (cross-profile SIMD on
   the exact scan) is now done, so it is a smaller prize than the write-up assumes.
-  The fully-`Float32` profile stage is the other open item (own branch).
+  The fully-`Float32` profile stage was tried on the `float32-profiles` branch
+  and measured at **1.05x** (byte-identical candidates) — left unmerged; making
+  the *interpolation* `Float32` too was 7% *slower* than master and is not
+  understood. Both are CPU/`m=16`-specific and worth revisiting for a GPU port.
+- **Measurements in these docs are pinned to the config current when taken —
+  re-check before reusing one.** Three projections have now been wrong because a
+  default moved out from under a recorded number: the `1.35x` for a fully-`Float32`
+  direct inner loop (measured at `m=32`, default is now 16), the `1.46x` for a
+  `Float32` metric kernel (measured against a `Float64` gate, but the shipped gate
+  already uses a `Float32` tile), and the smooth-`fftlen` ceiling. When quoting a
+  figure from `Summary_and_Future_Work.md`, check what `m`, `nharms`, `maxdecim`,
+  metric and interpolator it was taken under, and re-measure if any have moved.
+  The same staleness applies to instructions that name a version or model — say
+  what the thing *is* ("the model that wrote the commit"), not today's value.
 - **Twice now, a plausible mechanism with an order-of-magnitude estimate that
   *matched the measured total* has been wrong** (smooth `fftlen`; `_block_sigma`'s
   `idiv`). Split the function and measure the phases before optimising one.
