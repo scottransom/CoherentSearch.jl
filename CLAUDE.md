@@ -126,12 +126,24 @@ the hot loop. See `Summary_and_Future_Work.md` (§3) for the roadmap.
   `boxcar_medmargin=2.0` slack, so it cannot move which trials get scored
   exactly). `bench/boxcar_bench.jl` re-measures both axes; two new pins in
   `test/test_search.jl` cover the gate, which previously had none.
-- **Next target: `_block_sigma`, ~20%** (2026-08-09 profile). It now costs 0.89x
-  the whole metric it normalises, and 3.5x it at `nbins=20`, because
-  `_BOXCAR_SIGMA_SAMPLES=8192` is flat in `nbins`. Note the profiler charges its
-  `_median!` calls to the `median-select` bucket, which is why it read as small.
-  The σ̂ only needs sub-percent accuracy, so this looks cheap. **Then** Kadane —
-  whose own first-listed step (cross-profile SIMD on the exact scan) is now done.
+- **Done (2026-08-09): `_block_sigma` 839 → 289 µs/chunk (2.90x), 1.08x
+  end-to-end**, bit-identical σ̂. (a) The strided gather recomputed `(i,j)` from a
+  linear index the array already had — `size(M,1)==nbins`, so `M[i,j]` *is*
+  `M[t]`; a guard now enforces that. Worth only 1.12x. (b) The real cost was
+  **branch misprediction in `_select!`**: two 8192-sample quickselects were 93%+
+  of the function, and a branchless Lomuto (`i += (x <= pivot)`, unconditional
+  swap) is 3.62x at n=8192. It is **size-gated at `_SELECT_BRANCHLESS_MIN=256`**
+  because it is 0.94x at n=120 — the `:non`/`:sd2` per-trial median that runs
+  ~1e8 times. Selection returns a unique order statistic, so all medians are
+  bit-identical (verified vs the old partition on tied/all-equal/sorted inputs).
+  **Note the profiler charges `_median!` to `median-select` regardless of caller**,
+  which is why `_block_sigma` read as 3.7% while really being ~20%.
+- **Next target: Kadane** — whose own first-listed step (cross-profile SIMD on
+  the exact scan) is now done, so it is a smaller prize than the write-up assumes.
+  The fully-`Float32` profile stage is the other open item (own branch).
+- **Twice now, a plausible mechanism with an order-of-magnitude estimate that
+  *matched the measured total* has been wrong** (smooth `fftlen`; `_block_sigma`'s
+  `idiv`). Split the function and measure the phases before optimising one.
 - **Smooth `fftlen` sizing: re-examined, still rejected — but measure in situ,
   not per size.** Per transform it really is 1.26× (`next_pow_of_2` wastes a mean
   1.38× in length, and we choose the length). In a real search it is a wash to

@@ -159,6 +159,15 @@ Matches `min(ft.N/2/rstosearch.mean(), args.nharms)` in the Python code.
 
 @inline _swap!(v, a, b) = (@inbounds t = v[a]; @inbounds v[a] = v[b]; @inbounds v[b] = t; nothing)
 
+# Range length at or above which the *branchless* Lomuto partition wins.  It
+# trades two extra stores per element for a mispredicting branch, so it pays only
+# once the range is long enough for misprediction to dominate: measured on random
+# doubles, **3.62x at n=8192** (`_block_sigma`'s 8192-sample MAD) but **0.94x at
+# n=120** (the per-trial profile median of `:non`/`:sd2`, which runs ~1e8 times).
+# Both partitions select the same order statistic, so the gate cannot change a
+# result — it only picks the faster route.
+const _SELECT_BRANCHLESS_MIN = 256
+
 # Place the k-th smallest of v[lo:hi] at v[k] (with v[lo:k-1] all ≤ it); Lomuto
 # partition, median-of-3 pivot, insertion-sort cutoff for small ranges.
 @inline function _select!(v::AbstractVector, lo::Int, hi::Int, k::Int)
@@ -178,14 +187,37 @@ Matches `min(ft.N/2/rstosearch.mean(), args.nharms)` in the Python code.
         v[hi]  < v[lo] && _swap!(v, hi, lo)
         v[mid] < v[hi] && _swap!(v, mid, hi)
         pivot = v[hi]
-        i = lo - 1
-        for jj in lo:hi-1
-            if v[jj] <= pivot
-                i += 1; _swap!(v, i, jj)
+        # Two partitions, chosen by range length (see `_SELECT_BRANCHLESS_MIN`).
+        local p::Int
+        if hi - lo >= _SELECT_BRANCHLESS_MIN
+            # Branchless Lomuto.  The textbook form below has a data-dependent
+            # branch that mispredicts ~50% of the time on the noise-like data this
+            # runs on, at ~15-20 cycles a miss — which dominated the partition.
+            # Swapping *unconditionally* and advancing `i` only when the element
+            # belonged left is branch-free (the compare becomes `setcc`+`add`): it
+            # costs two extra stores per element and saves the misprediction.  The
+            # invariant is unchanged — `v[lo:i-1] <= pivot`, `v[i:jj] > pivot` —
+            # because when `x > pivot` the swap exchanges two elements that are
+            # *both* already `> pivot`, merely permuting that run.
+            i = lo
+            for jj in lo:hi-1
+                x = v[jj]
+                v[jj] = v[i]
+                v[i] = x
+                i += (x <= pivot)
             end
+            _swap!(v, i, hi)
+            p = i
+        else
+            i = lo - 1
+            for jj in lo:hi-1
+                if v[jj] <= pivot
+                    i += 1; _swap!(v, i, jj)
+                end
+            end
+            _swap!(v, i+1, hi)
+            p = i + 1
         end
-        _swap!(v, i+1, hi)
-        p = i + 1
         p == k && return
         p < k ? (lo = p + 1) : (hi = p - 1)
     end
@@ -395,21 +427,32 @@ ratio the caller forms (`excess/σ`), so the unnormalised `brfft` and normalised
 `irfft` paths yield the identical scale-free S/N (the `align=false` pin holds).
 """
 function _block_sigma(M::AbstractMatrix{Float64}, nbins::Int, n::Int, buf::Vector{Float64})
+    # The linear indexing below is only the intended (i, j) if the profile axis is
+    # exactly `M`'s first dimension — cheap to check once per block, and a silent
+    # wrong σ̂ (hence a silently wrong metric everywhere) if it ever stops holding.
+    size(M, 1) == nbins ||
+        throw(DimensionMismatch("_block_sigma: size(M,1)=$(size(M,1)) != nbins=$nbins"))
     N = nbins * n
     N == 0 && return 0.0
     cap = length(buf)
     ns = 0
+    # `M` is column-major with `size(M, 1) == nbins`, so the (i, j) this used to
+    # reconstruct from `t` — `i = (t-1) % nbins + 1`, `j = (t-1) ÷ nbins + 1` — is
+    # *exactly* linear index `t`.  Indexing linearly gathers the identical samples
+    # in the identical order (so σ̂, and every metric, is bit-for-bit unchanged)
+    # while dropping two hardware integer divisions per sample.  At the 8192-sample
+    # cap that was ~16k `idiv`s at ~26 cycles apiece — ~140 µs per call, which was
+    # essentially the whole cost of this function.
     if N <= cap
-        @inbounds for j in 1:n, i in 1:nbins
-            ns += 1; buf[ns] = M[i, j]
+        @inbounds for t in 1:N
+            buf[t] = M[t]
         end
+        ns = N
     else
         s = N ÷ cap                               # stride ≥ 1; not a multiple of nbins in general
         @inbounds for t in 1:s:N
             ns == cap && break
-            j = (t - 1) ÷ nbins + 1
-            i = (t - 1) % nbins + 1
-            ns += 1; buf[ns] = M[i, j]
+            ns += 1; buf[ns] = M[t]
         end
     end
     med = _median!(buf, ns)                       # destroys buf order (values preserved)

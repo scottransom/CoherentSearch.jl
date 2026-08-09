@@ -620,6 +620,52 @@ friendlier at small `nbins`, or reusing one σ̂ across decimations are all on t
 table. None of it touches the candidate list's definition, only the accuracy of a
 scale factor that is already deliberately approximate.
 
+### `_block_sigma` (2026-08-09) — 2.90x, and a corrected diagnosis
+
+Acting on the item above: **839 → 289 µs per chunk, bit-identical σ̂ at every
+decimation**, and **1.08x end-to-end** on top of the batched gate (candidate file
+byte-identical). Two changes, and the interesting part is that the obvious
+suspect was the smaller one.
+
+- **The gather was reconstructing an index the array already had (1.12x).** It
+  walked a strided subsample computing `i = (t-1) % nbins + 1`,
+  `j = (t-1) ÷ nbins + 1` — but `M` is column-major with `size(M,1) == nbins`, so
+  that `(i, j)` *is* linear index `t`. Indexing linearly gathers the identical
+  samples in the identical order while dropping two hardware integer divisions
+  per sample. I predicted this was ~all of the cost (16k `idiv`s × ~26 cycles ≈
+  140 µs, which matched the measured total almost exactly). **It was ~12%.** The
+  latency figure was the wrong one to reason from: the divisions are independent
+  across iterations, so they pipeline at throughput, not latency. A
+  `size(M,1) == nbins` guard now enforces the assumption the linear indexing
+  rests on, since violating it would silently corrupt σ̂ and hence every metric.
+- **The real cost was branch misprediction in `_select!` (2.58x).** Splitting the
+  function showed the two 8192-sample quickselects were **93%+** of it (gather
+  7–10 µs, abs pass 1.5 µs, medians 115–160 µs). ~65–80 µs to select from 8192
+  doubles is ~12 cycles/element — the Lomuto partition's `if v[jj] <= pivot`
+  mispredicts ~50% of the time on noise. Swapping *unconditionally* and advancing
+  the pivot index by the comparison (`i += (x <= pivot)`) is branch-free; it
+  costs two extra stores per element and saves the miss. Selection returns an
+  order statistic, which is unique, so every median is bit-for-bit unchanged —
+  verified against the old partition across continuous, heavily-tied, all-equal
+  (Lomuto's worst case) and pre-sorted inputs at ten sizes.
+
+**The branchless partition is size-gated (`_SELECT_BRANCHLESS_MIN = 256`)**,
+because it is *not* a uniform win: **3.62x at n=8192** but **0.94x at n=120**, the
+per-trial profile median of `:non`/`:sd2` that runs ~1e8 times. The extra stores
+only pay once the range is long enough for misprediction to dominate. With the
+gate, n=120 measures 1.32x rather than a 6% regression, so both metrics improve.
+
+| | µs / chunk |
+|---|---|
+| `_block_sigma`, as committed at `3d385e1` | 839 |
+| + linear-index gather | 747 |
+| + branchless partition (both) | **289** |
+
+**Lesson, and it is the second time on this function:** a plausible mechanism
+with an order-of-magnitude estimate that *matches the measured total* is still
+not evidence. Splitting the function into its four phases took one benchmark and
+overturned the diagnosis.
+
 **What is deliberately *not* done: a fully `Float32` profile stage.** Carrying
 `ftprofs` as `ComplexF32` and folding with a single-precision `brfft` is the
 remaining 1.46x on the metric kernel (855 µs vs 1248 µs) and would also cut the
@@ -664,9 +710,9 @@ oversampling at high harmonics became visible in the first place.
     cut to the 12.9% FFTW bucket, at the price of moving reported metrics by
     ~3e-7 and loosening the `align=false` pins from machine precision to ~1e-6.
     Measured, deliberately not taken; see §2.
-  - ***`_block_sigma` is the new top metric-side target, ~20%*** — it now costs
-    0.89x the entire metric it normalises, and 3.5x it at `nbins=20`. See §2; it
-    looks like the cheapest remaining win in the search.
+  - ***`_block_sigma`* — done (2026-08-09), 2.90x (839 → 289 µs/chunk), 1.08x
+    end-to-end, bit-identical. Almost all of it was branch misprediction in the
+    quickselect, not the integer division the first diagnosis blamed. See §2.
   - *Kadane* (below) is now a smaller target than it looked: it competes against
     a gate that is 2.77x faster than the one the bullet was written against, and
     its own §3 step (3) — "try the cross-profile SIMD transpose on the existing
