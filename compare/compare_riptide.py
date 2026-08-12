@@ -8,20 +8,33 @@ lists by frequency, and prints a side-by-side table.
 
 The two searches are different algorithms, so "matched" needs stating precisely:
 
-  * **Frequency band.** ``rseek`` searches periods ``[Pmin, Pmax]``, i.e.
-    frequencies ``[1/Pmax, 1/Pmin]``.  We search *fundamentals* over that same
-    range.  With ``--maxdecim k > 1`` we additionally detect signals at ``2f``
-    … ``kf``, so our coverage EXTENDS above ``1/Pmin`` at reduced harmonic
-    depth.  That is extra science, but it is also extra work, so the timing
-    comparison is not in our favour -- see the coverage line in the report.
+  * **Both codes obey the same bins-vs-period limit, and both use the same
+    trick to live with it.**  riptide requires ``P >= tsamp * bins``, and
+    downsamples to keep the fold between ``bmin`` and ``bmax`` bins.  Our
+    equivalent: a ``k``-decimated fold of ``Hk = nharms/k`` harmonics at
+    frequency ``f`` needs ``f * Hk < 1/(2*tsamp)``, i.e. ``P > tsamp * nbins``
+    for ``nbins = 2*Hk`` -- the identical constraint, from the identical
+    sampling limit.  Both therefore reach high frequency by folding into fewer
+    bins: riptide by downsampling, us by harmonic decimation.
 
-  * **Harmonic depth.** ``rseek``'s ``--bmin/--bmax`` bound the number of phase
-    bins it folds into (it uses more bins at longer periods).  Our fold uses
-    ``2*nharms`` bins at ``k=1``, falling to ``2*nharms/k`` under decimation.
-    So ``nharms = bmax/2`` and ``maxdecim = bmax/bmin`` line the two up: with
-    ``--bmin 30 --bmax 120`` that is ``--nharms 60 --maxdecim 4``, spanning
-    120…30 bins exactly as riptide spans 120…30.  ``--maxdecim 6`` (as in
-    ``timed_runs.sh``) searches deeper than riptide does, down to 20 bins.
+    So the honest comparison matches the **total frequency coverage** and lets
+    each side degrade its own way:
+
+        nharms   = bmax / 2                 (bins at the deep end)
+        maxdecim = bmax / bmin              (bins span, bmax..bmin)
+        fmax     = 1 / Pmin                 (top of the searched band)
+        hifreq   = fmax / maxdecim          (our FUNDAMENTAL range tops out here;
+                                             decimation carries it up to fmax)
+
+    With ``--bmin 20 --bmax 120`` that is ``--nharms 60 --maxdecim 6``, both
+    covering 0.1-200 Hz in 120…20 bins.  Setting our ``hifreq`` to ``1/Pmin``
+    instead -- the obvious-looking choice -- would have us search 6x the band
+    riptide does and lose the timing comparison for no reason.
+
+  * **Pushing to the sampling limit.** ``Pmin`` defaults to ``tsamp * bmin``,
+    riptide's own floor, so both searches run the widest band the data support
+    at the chosen bin range.  Lowering ``bmin`` (raising ``maxdecim``) buys both
+    sides more high-frequency reach at shallower depth.
 
   * **Threads.** riptide's C extension is built without OpenMP (see its
     ``setup.py``) and its Python driver is serial, so ``rseek`` is
@@ -30,7 +43,11 @@ The two searches are different algorithms, so "matched" needs stating precisely:
     rather than as the headline number.
 
   * **Wall-clock.** Both numbers are whole-process wall time, which includes
-    each language's interpreter start-up.  ``--repeat`` runs each search
+    each language's interpreter start-up.  On a thermally-limited machine the
+    MULTI-THREADED number is the least reliable one here: back-to-back heavy
+    runs heat the CPU and it clocks down, so the threaded figure drifts between
+    invocations far more than the single-threaded one.  Treat ``-t 1`` as the
+    result and the threaded row as indicative.  ``--repeat`` runs each search
     several times and reports the minimum (least contaminated by other load)
     alongside the median.  A first ``rseek`` run in a fresh shell also pays
     Python import cost; warm-up is done once before timing.
@@ -41,9 +58,14 @@ summed Fourier fold.  They are on similar scales and worth comparing, but a
 difference of a few tenths is not meaningful.  The duty cycles, however, are
 defined identically (best boxcar width / profile bins) and are comparable.
 
+This is an OCCASIONAL benchmark, not a development-loop tool: the default
+``bench`` preset takes ~5 minutes at ``--repeat 3``.  Run it when something has
+changed that could plausibly move the ratio, not on every commit.
+
 Usage:
 
-    python3 compare/compare_riptide.py PM0063_034C1_DM445.0_red.fft
+    python3 compare/compare_riptide.py FILE.fft                      # bench preset
+    python3 compare/compare_riptide.py --preset quick FILE.fft       # ~1 min sanity check
     python3 compare/compare_riptide.py --repeat 3 --threads 4 FILE.fft
 """
 
@@ -228,16 +250,45 @@ def crossmatch(a, b, T, tol_bins):
 
 
 # ---------------------------------------------------------------------------
+# Presets
+#
+# A comparison is only as good as the fraction of it that is actual searching.
+# `quick` spends ~1 s per side on interpreter start-up out of ~5 s, so it
+# flatters whichever side starts faster; use it to check the harness runs.
+# `bench` is ~4x the work -- start-up falls to <3% of our runtime and ~6% of
+# rseek's -- and is the configuration to quote.  Measured 2026-08-11 on
+# PM0063_034C1_DM445.0_red.fft (T=2097 s, 4-core i7-10510U): the two presets
+# agree on the ratio (2.11x vs 2.27x), which is the point of having both.
+#
+# This is an occasional benchmark, not a development-loop tool: `bench` takes
+# ~5 minutes at --repeat 3.
+# ---------------------------------------------------------------------------
+PRESETS = {
+    # ~5 s/side.  Sanity check only; Pmin is raised well above the sampling
+    # limit to keep it quick, which also makes it a narrow-band test.
+    "quick": dict(Pmin=0.05, Pmax=10.0, bmin=30, bmax=120),
+    # The one to quote: the widest band the data support at 120..20 bins
+    # (Pmin defaults to tsamp*bmin).  ~24 s (rseek) / ~32 s (us, -t 1) on the
+    # reference observation -- compute-dominated, start-up under 4% either side.
+    "bench": dict(Pmin=None, Pmax=10.0, bmin=20, bmax=120),
+}
+
+
+# ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("fftfile", help="PRESTO .fft file (its .inf and .dat must sit beside it)")
-    ap.add_argument("--Pmin", type=float, default=0.05, help="rseek min trial period (s)")
-    ap.add_argument("--Pmax", type=float, default=10.0, help="rseek max trial period (s)")
-    ap.add_argument("--bmin", type=int, default=30, help="rseek min phase bins")
-    ap.add_argument("--bmax", type=int, default=120, help="rseek max phase bins")
+    ap.add_argument("--preset", choices=sorted(PRESETS), default="bench",
+                    help="search-range preset; 'bench' is compute-dominated and is "
+                         "the one to quote, 'quick' is a fast sanity check whose "
+                         "ratio is diluted by both interpreters' start-up")
+    ap.add_argument("--Pmin", type=float, default=None, help="rseek min trial period (s)")
+    ap.add_argument("--Pmax", type=float, default=None, help="rseek max trial period (s)")
+    ap.add_argument("--bmin", type=int, default=None, help="rseek min phase bins")
+    ap.add_argument("--bmax", type=int, default=None, help="rseek max phase bins")
     ap.add_argument("--smin", type=float, default=7.0, help="rseek S/N floor")
     ap.add_argument("--threshold", type=float, default=None,
                     help="coherent_search S/N floor (default: same as --smin)")
@@ -263,6 +314,9 @@ def main(argv=None):
                          "does not do, for a like-for-like candidate count")
     ap.add_argument("--keep", action="store_true", help="keep the .cohout output")
     args = ap.parse_args(argv)
+    for key, val in PRESETS[args.preset].items():      # explicit flags win
+        if getattr(args, key) is None:
+            setattr(args, key, val)
 
     fft = os.path.abspath(args.fftfile)
     stem = fft[:-4] if fft.endswith(".fft") else fft
@@ -271,6 +325,21 @@ def main(argv=None):
         if not os.path.isfile(p):
             raise SystemExit(f"missing input: {p}")
     N, dt, T, dm = read_inf(inf)
+
+    # Pmin defaults to riptide's own floor, tsamp*bmin: the shortest period the
+    # data support at this bin count, for both codes (see the module docstring).
+    if args.Pmin is None:
+        args.Pmin = dt * args.bmin
+
+    # riptide raises "Must have: period_min >= tsamp * bins_min" from deep inside
+    # its C extension; catch it here, where we can say what to do about it.  (A
+    # failing rseek run would otherwise look like a suspiciously fast one.)
+    if args.Pmin < dt * args.bmin:
+        raise SystemExit(
+            f"riptide requires Pmin >= tsamp * bmin: with tsamp={dt:g} s and "
+            f"bmin={args.bmin} that is Pmin >= {dt * args.bmin:g} s "
+            f"(you asked for {args.Pmin:g}).  Raise --Pmin, or lower --bmin to "
+            f"at most {int(args.Pmin / dt)}.")
 
     rseek = args.rseek or shutil.which("rseek") or (
         "/home/sransom/python_venvs/pixiPSR/.pixi/envs/default/bin/rseek")
@@ -281,7 +350,10 @@ def main(argv=None):
     nharms = args.nharms if args.nharms else args.bmax // 2
     maxdecim = args.maxdecim if args.maxdecim else max(1, args.bmax // args.bmin)
     threshold = args.threshold if args.threshold is not None else args.smin
-    lofreq, hifreq = 1.0 / args.Pmax, 1.0 / args.Pmin
+    # Our FUNDAMENTAL range stops at fmax/maxdecim; decimation carries coverage
+    # the rest of the way to fmax, so the two searches span the same band.
+    fmax = 1.0 / args.Pmin
+    lofreq, hifreq = 1.0 / args.Pmax, fmax / maxdecim
 
     print("=" * 78)
     print("CoherentSearch.jl  vs  riptide (rseek)")
@@ -294,14 +366,20 @@ def main(argv=None):
     print(f"coherent    : --lofreq {lofreq:.6g} --hifreq {hifreq:.6g} "
           f"--nharms {nharms} --maxdecim {maxdecim} --threshold {threshold}")
     nbins_hi, nbins_lo = 2 * nharms, 2 * (nharms // maxdecim)
-    print(f"              fundamentals {lofreq:.4g}-{hifreq:.4g} Hz, "
-          f"{nbins_lo}-{nbins_hi} profile bins")
-    if maxdecim > 1:
-        print(f"              NOTE: decimation also covers up to {maxdecim * hifreq:.4g} Hz "
-              f"({maxdecim}x), beyond rseek's band -- extra coverage AND extra work")
+    print(f"              fundamentals {lofreq:.4g}-{hifreq:.4g} Hz; decimation to k="
+          f"{maxdecim} covers {lofreq:.4g}-{maxdecim * hifreq:.4g} Hz, "
+          f"{nbins_hi} down to {nbins_lo} profile bins")
+    cov = maxdecim * hifreq
+    if abs(cov - fmax) / fmax > 0.01:
+        print(f"              NOTE: our coverage tops out at {cov:.4g} Hz vs rseek's "
+              f"{fmax:.4g} Hz -- bands are NOT matched")
+    else:
+        print(f"              coverage matched: both search up to {fmax:.4g} Hz")
     if nbins_lo != args.bmin or nbins_hi != args.bmax:
         print(f"              NOTE: bin span {nbins_lo}-{nbins_hi} != rseek's "
               f"{args.bmin}-{args.bmax}; depth is not exactly matched")
+    print(f"              (both codes are limited to nbins <= P/tsamp = "
+          f"{args.Pmin / dt:.0f} bins at the top of the band)")
     print()
 
     # --- rseek -------------------------------------------------------------
@@ -359,9 +437,9 @@ def main(argv=None):
     verdict = f"{faster:.2f}x FASTER" if faster >= 1 else f"{1 / faster:.2f}x SLOWER"
     print(f"\n  like-for-like (-t 1): coherent_search is {verdict} than rseek")
     if mt:
-        print(f"  with {args.threads} threads:  {rt.min / mt.min:.2f}x rseek wall clock "
-              f"(riptide's C extension is built without OpenMP, so rseek cannot")
-        print(f"  {'':<15}use them -- this axis is ours alone, not a like-for-like win)")
+        print(f"  with {args.threads} threads:  {rt.min / mt.min:.2f}x rseek wall clock -- "
+              f"riptide's C extension has no OpenMP,")
+        print("                        so this axis is ours alone, not a like-for-like win")
     if args.rseek_threads > 0:
         print(f"\n  rseek's BLAS/OMP pools were pinned to {args.rseek_threads} thread(s).")
     else:

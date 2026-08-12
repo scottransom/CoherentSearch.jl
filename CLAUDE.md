@@ -94,158 +94,41 @@ python3 compare/compare_riptide.py --repeat 3 --threads 4 FILE.fft
 ## The riptide bar (read this before optimising)
 
 **The point of the performance work is to beat riptide's FFA** (`rseek`, cloned
-at `../riptide`), not the Python original. Measured 2026-08-11 on
-`PM0063_034C1_DM445.0_red.fft`, 0.1–20 Hz, 120 profile bins, 4-core i7-10510U:
+at `../riptide`), not the Python original. Run
+`python3 compare/compare_riptide.py FILE.fft` — it is an *occasional* benchmark
+(~5 min at `--preset bench --repeat 3`), not a dev-loop tool.
+
+Measured 2026-08-11 on `PM0063_034C1_DM445.0_red.fft`, `--preset bench`, both
+covering **0.1–200 Hz in 120…20 bins**, 4-core i7-10510U:
 
 | | wall (s) | cores |
 |---|---|---|
-| `rseek` | 4.65 | 1.15 |
-| ours `-t 1` | 9.82 | 1.04 |
-| ours `-t 4` | 6.18 | 2.96 |
+| `rseek` | 24.4 | 1.02 |
+| ours `-t 1` | 29.3 | 1.01 |
+| ours `-t 4` | 22.3 | 3.23 |
 
-**We are ~2.1x SLOWER single-threaded.** Detection quality is comparable: both
-find the 7.1185 Hz pulsar (S/N 11.9 vs 12.3) at a consistent duty cycle, and
-riptide's two extra candidates are its `f/2` and `2f`, which it does not filter
-and we collapse. So the gap to close is speed, not sensitivity.
+**~1.2–1.4x slower single-threaded, but we detect more strongly**: the 7.1185 Hz
+pulsar at S/N 12.97 vs riptide's 11.80, plus two candidates it does not report.
+riptide's two extra entries are the `f/2` and `2f` of the pulsar, which it does
+not filter and we collapse.
 
-- `compare/compare_riptide.py` derives matched settings (`nharms = bmax/2`,
-  `maxdecim = bmax/bmin`), measures **cores used** on both sides rather than
-  assuming, and flags harmonic relations so riptide's unfiltered family does not
-  read as detections we missed.
-- **riptide's BLAS threading was checked and is a red herring**: pinning every
-  thread pool to 1 moved its median wall clock 4.68 → 4.54 s over 6 interleaved
-  pairs (nothing, against ~8% scatter) while dropping CPU 114% → 99%. Left
-  enabled by default so riptide gets any benefit going.
-- Two axes are ours alone, and must not be quoted as like-for-like wins:
-  threading (riptide has no OpenMP), and decimation coverage (4x the band for
-  1.65x the time — 16.1 s at `-t 1` for 0.1–80 Hz).
-- This laptop throttles (`scaling MHz: 67%`) and run-to-run scatter is ~8%;
-  compare ratios from interleaved runs, not absolute seconds across sessions.
-
-## Performance work (current focus)
-
-The project is feature-complete; the active focus is profiling and speeding up
-the hot loop. See `Summary_and_Future_Work.md` (§3) for the roadmap.
-
-- **Bench harness lives in `bench/`** (own env, dev-deps only):
-  `microbench.jl` (per-bucket timings, both interpolators), `profile_search.jl`
-  (warm sampling profile with a bucket-aggregated self-time table),
-  `median_bench.jl`, `interp_bench.jl` (interpolator throughput in points/sec vs
-  `m`, grid oversampling and request size, + plots). Run single-threaded (`-t 1`)
-  for clean profile attribution; warm up before timing to exclude JIT. Example
-  FFT for longer runs: `PM0063_034C1_DM445.0_red.fft`.
-- **Done (2026-07):** quickselect median in `_profile_snr` (was 41% of runtime →
-  7.5%) and a type-stable `Workspace{S,B,D}` (killed hot-loop dynamic `mul!`
-  dispatch) — together ~1.6× warm single-thread, results unchanged. See §2 of
-  `Summary_and_Future_Work.md`.
-- **Done (2026-08-08):** direct `O(m)` interpolation replacing the FFT
-  correlation (`src/directinterp.jl`, `--interp direct`, now the default). The
-  interp FFTs — 76% of the chunk fill, ~50% of runtime — are gone; **1.64×
-  end-to-end** and ~1e-10 accuracy where the FFT path had ~1e-2.
-- **Done (2026-08-09): default `m` 32 → 16, plus a `--m` flag.** Justified by the
-  Monte Carlo in `../coherent_search/examples/interp_accuracy_vs_m.md`: the
-  recovered signal-power fraction is `S_m = Σ sinc²(dr−k)`, so the loss is
-  `≈ 0.203/m` averaged over sub-bin offset — 1.27% at `m=16` vs 0.63% at `m=32`,
-  against the ~6.5% the `hidr=0.5` grid already costs at the top harmonic.
-  Confirmed end to end: the 7.1185 Hz pulsar's metric moves 12.034 → 12.001
-  (−0.27%, predicted ≈0.3%); at `m=8` it is 11.894 (−1.16%, predicted ≈0.95%).
-  **`m` is not where the remaining time is.** The interp bucket is 18.8% at
-  `m=32` → 15.0% at `m=16`, i.e. **~3.6% end-to-end** — halving `m` cuts interp
-  time only ~19%, not 50%, because the direct interpolator is dominated by fixed
-  per-point cost rather than the `m`-term sum (`bench/interp_bench.csv`
-  `m_sweep`: 1.49e-4 s at `m=8` → 4.44e-4 s at `m=128` for 2048 points, i.e.
-  `t ≈ 1.47e-4 + 2.4e-7·m`). Below `m=16` the accuracy cost rises faster than the
-  time falls, so 16 is the knee.
-  Note end-to-end wall-clock cannot resolve this: run-to-run scatter is ~9%.
-- **Done (2026-08-09): cross-profile SIMD on the `:boxcar` gate — 1.26x
-  end-to-end**, byte-identical candidates. The width×phase scan vectorised along
-  *phase*, which is only 120 long at k=1 and 20 under decimation; the batch axis
-  (`Nprof=2048` profiles, the columns of `profs`) is always long. `_boxcar_gate!`
-  transposes a `B`-profile tile to `(B, nbins)` and runs the same recurrence with
-  `b` innermost — the prefix sum's serial chain becomes `B`-wide and the phase
-  max needs no horizontal reduce. Gate kernel **2.77x** (`Float64`) / **4.05x**
-  (`Float32` tile, what ships). Two traps: **`B` must be a `Val`** — with a
-  runtime `Int` batching is *slower* than the scalar path it replaces — and the
-  `Float32` is sound only *because it is a gate* (error ≤7e-7 vs the
-  `boxcar_medmargin=2.0` slack, so it cannot move which trials get scored
-  exactly). `bench/boxcar_bench.jl` re-measures both axes; two new pins in
-  `test/test_search.jl` cover the gate, which previously had none.
-- **Done (2026-08-09): `_block_sigma` 839 → 289 µs/chunk (2.90x), 1.08x
-  end-to-end**, bit-identical σ̂. (a) The strided gather recomputed `(i,j)` from a
-  linear index the array already had — `size(M,1)==nbins`, so `M[i,j]` *is*
-  `M[t]`; a guard now enforces that. Worth only 1.12x. (b) The real cost was
-  **branch misprediction in `_select!`**: two 8192-sample quickselects were 93%+
-  of the function, and a branchless Lomuto (`i += (x <= pivot)`, unconditional
-  swap) is 3.62x at n=8192. It is **size-gated at `_SELECT_BRANCHLESS_MIN=256`**
-  because it is 0.94x at n=120 — the `:non`/`:sd2` per-trial median that runs
-  ~1e8 times. Selection returns a unique order statistic, so all medians are
-  bit-identical (verified vs the old partition on tied/all-equal/sorted inputs).
-  **Note the profiler charges `_median!` to `median-select` regardless of caller**,
-  which is why `_block_sigma` read as 3.7% while really being ~20%.
-- **Done (2026-08-11): start-up, not the search, was dominating short runs.**
-  Measured on `PM0063_034C1_DM445.0_red.fft`, `-t 1 --hifreq 20 --nharms 32
-  --noplot`: 15.65 s wall for **1.36 s** of actual searching. Phase breakdown —
-  boot + `using` 0.14 s (loading was never the problem), inferring `main` 4.7 s,
-  ArgParse's first `parse_args` 1.6 s, first `search` call 5.9 s. A warm second
-  `main()` in the same process is **0.05 s**, which is both the floor and the
-  marginal cost of an extra file. Three changes, all measured:
-  - **`PrecompileTools` workload** at the bottom of `src/CoherentSearch.jl` (a
-    miniature end-to-end search + a `main` call): 15.65 → 8.13 s. Costs +3.4 s
-    of re-precompilation per `src/` edit (6.05 → 9.47 s).
-  - **CLI moved into the package** (`src/cli.jl`), so `main` and the ArgParse
-    table are cached too: → **2.39 s**, candidates byte-identical. **6.5x.**
-  - **Multi-file runs + `SearchCache`** (reuses hplans/workspaces across files;
-    `dplans` still per-file, they depend on `r_lo`): 3 files in 4.83 s, i.e.
-    ~1.2 s marginal per file vs 15.65 s for a separate invocation.
-  **The biggest single fixed cost left is plotting, which is on by default:**
-  `using CairoMakie` alone is 9.0 s. Plotting is now deferred to one pass after
-  all searches, so a batch pays it once, and bulk runs should use `--noplot`.
-- **The PackageCompiler sysimage (`sysimage/`) is worth it *only* for plotting
-  runs — this was projected as the big win and measured as almost nothing.**
-  Warm: `--noplot` 2.3 s with it vs 2.4 s without (nothing — the precompile
-  workload already took that), but with plots 7.4 s vs 18.7 s (**2.5x**). It
-  removes CairoMakie's load and nothing else, because Julia's boot is only
-  ~0.2 s and the search is already cached. Costs: ~28 min to build, 1.14 GB, and
-  the first run after a build/reboot is **23 s** paging the image in (vs 2.3 s
-  warm) — an occasional single search is *slower* with it than without.
-  Do not use it while editing `src/`: a sysimage freezes the code it was built
-  from and will silently run the old search.
-- **Next target: Kadane** — whose own first-listed step (cross-profile SIMD on
-  the exact scan) is now done, so it is a smaller prize than the write-up assumes.
-  The fully-`Float32` profile stage was tried on the `float32-profiles` branch
-  and measured at **1.05x** (byte-identical candidates) — left unmerged; making
-  the *interpolation* `Float32` too was 7% *slower* than master and is not
-  understood. Both are CPU/`m=16`-specific and worth revisiting for a GPU port.
-- **Measurements in these docs are pinned to the config current when taken —
-  re-check before reusing one.** Three projections have now been wrong because a
-  default moved out from under a recorded number: the `1.35x` for a fully-`Float32`
-  direct inner loop (measured at `m=32`, default is now 16), the `1.46x` for a
-  `Float32` metric kernel (measured against a `Float64` gate, but the shipped gate
-  already uses a `Float32` tile), and the smooth-`fftlen` ceiling. When quoting a
-  figure from `Summary_and_Future_Work.md`, check what `m`, `nharms`, `maxdecim`,
-  metric and interpolator it was taken under, and re-measure if any have moved.
-  The same staleness applies to instructions that name a version or model — say
-  what the thing *is* ("the model that wrote the commit"), not today's value.
-- **Twice now, a plausible mechanism with an order-of-magnitude estimate that
-  *matched the measured total* has been wrong** (smooth `fftlen`; `_block_sigma`'s
-  `idiv`). Split the function and measure the phases before optimising one.
-- **Smooth `fftlen` sizing: re-examined, still rejected — but measure in situ,
-  not per size.** Per transform it really is 1.26× (`next_pow_of_2` wastes a mean
-  1.38× in length, and we choose the length). In a real search it is a wash to
-  −7%: specific smooth lengths (`3^k`-heavy: 6561, 13122, 15309) are *worse* than
-  the power of two, and `:pow2`'s 4 shared `FFTScratch` sets stay cache-warm
-  where 8–16 smooth ones do not. `fftsizing=:pow2` stays the default; `:smooth`
-  is available. **Lesson: an isolated per-size FFT benchmark does not predict
-  this workload.**
-- **`ComplexF32` interpolation is largely moot.** It existed to halve the
-  bandwidth of transforms that no longer run; the direct path already reads
-  `ComplexF32` bins natively and accumulates in `Float64`. What remains is one
-  isolated question — `Float32` weights/planes in the direct inner loop — worth
-  measuring, not architecting.
-- **HPK / KFR (see `~/programming/fft_tests/HPK_JULIA_HANDOFF.md`): deferred.**
-  Its own prerequisite was to profile the FFT fraction first; done, and FFTW now
-  falls to the ~4% batched profile `brfft`. 1.5× on 4% does not justify a
-  proprietary binary-only dependency. Revisit only if `:direct` is backed out.
+- **Match total frequency COVERAGE, not the trial range.** Both codes hit the
+  same sampling wall — riptide needs `P >= tsamp*bins` and downsamples to stay
+  in `[bmin, bmax]`; our `k`-fold of `nharms/k` harmonics needs its top harmonic
+  under Nyquist, the same inequality — and both climb it by folding into fewer
+  bins. So `nharms = bmax/2`, `maxdecim = bmax/bmin`, and **`hifreq =
+  (1/Pmin)/maxdecim`**, decimation carrying coverage the rest of the way.
+  Setting `hifreq = 1/Pmin` instead makes us search 6x riptide's band and
+  reports a bogus 2.1x deficit. **This mistake was made once already** — the
+  first version of this section quoted 2.1x from exactly that mismatch.
+- **Decimation is a real advantage; configure it to be used.** `--maxdecim 6`
+  against `--bmin 20` is the matched pair, not `--maxdecim 1`.
+- **riptide's BLAS threading is a red herring**: pinning every thread pool to 1
+  moved its median wall clock 4.68 -> 4.54 s over 6 interleaved pairs (nothing,
+  against ~8% scatter) while dropping CPU 114% -> 99%. Left enabled by default.
+- Threading is ours alone, not a like-for-like win (riptide has no OpenMP).
+- This laptop throttles (`scaling MHz: 67%`); the **threaded** number is the
+  least reliable, since back-to-back heavy runs clock the CPU down. Quote `-t 1`.
 
 ## Environment gotchas (Julia 1.12)
 

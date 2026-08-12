@@ -288,31 +288,47 @@ both, and cross-matches the candidate lists:
 python3 compare/compare_riptide.py --repeat 3 --threads 4 FILE.fft
 ```
 
-It derives our settings from riptide's: `nharms = bmax/2` and
-`maxdecim = bmax/bmin` line the profile-bin spans up (`--bmin 30 --bmax 120`
-→ `--nharms 60 --maxdecim 4`, both spanning 120…30 bins), and our fundamental
-range is `[1/Pmax, 1/Pmin]`. It prints the derived configuration, and flags
-where the match is imperfect, so the comparison stays auditable.
+It matches the **total frequency coverage** rather than the trial range, which
+is the subtle part. Both codes are limited by the same sampling constraint —
+riptide requires `P >= tsamp * bins` and downsamples to stay within
+`[bmin, bmax]`; our `k`-decimated fold of `nharms/k` harmonics needs its top
+harmonic below Nyquist, which is the same inequality. Both therefore reach high
+frequency by folding into fewer bins, riptide by downsampling and us by harmonic
+decimation. So:
+
+```
+nharms   = bmax / 2        maxdecim = bmax / bmin
+fmax     = 1 / Pmin        hifreq   = fmax / maxdecim   (our fundamental range;
+                                      decimation carries coverage up to fmax)
+```
+
+`--bmin 20 --bmax 120` gives `--nharms 60 --maxdecim 6`, both covering
+0.1–200 Hz in 120…20 bins. `Pmin` defaults to `tsamp * bmin`, riptide's own
+floor, so both run the widest band the data support.
 
 Measured on `PM0063_034C1_DM445.0_red.fft` (T=2097 s, 4-core i7-10510U laptop),
-searching 0.1–20 Hz with 120 profile bins:
+`--preset bench`, both covering 0.1–200 Hz:
 
 | | wall (s) | cores |
 |---|---|---|
-| `rseek` | 4.65 | 1.15 |
-| `coherent_search -t 1` | 9.82 | 1.04 |
-| `coherent_search -t 4` | 6.18 | 2.96 |
+| `rseek` | 24.4 | 1.02 |
+| `coherent_search -t 1` | 29.3 | 1.01 |
+| `coherent_search -t 4` | 22.3 | 3.23 |
 
-**Single-threaded, riptide's FFA is ~2.1× faster.** Both find the 7.1185 Hz
-pulsar with comparable S/N (11.9 vs 12.3) and consistent duty cycle. riptide's
-two other candidates are the `f/2` and `2f` harmonics of it, which we collapse
-by default and it does not filter at all (`--noharmremove` for a like-for-like
+**Single-threaded we are ~1.2–1.4× slower** (run-to-run scatter on this
+throttling laptop is large; the threaded row is the least reliable, since
+back-to-back heavy runs clock the CPU down). **We detect the 7.1185 Hz pulsar
+more strongly: S/N 12.97 vs 11.80**, and we find two candidates it does not.
+riptide's two extra entries are the `f/2` and `2f` of the pulsar, which it does
+not filter and we collapse by default (`--noharmremove` for a like-for-like
 count).
 
-Two axes are ours alone rather than like-for-like wins, and are reported
-separately for that reason: riptide's C extension is built without OpenMP so
-`rseek` cannot use more cores, and harmonic decimation buys us 4× the frequency
-coverage (0.1–80 Hz) for 1.65× the time (16.1 s at `-t 1`).
+Getting this wrong is easy and expensive: setting our `hifreq` to `1/Pmin` —
+the obvious-looking choice — has us search 6× riptide's band and reports us as
+2.1× slower, which is an artefact of the mismatch, not a result.
+
+The threading axis is ours alone rather than a like-for-like win: riptide's C
+extension is built without OpenMP, so `rseek` cannot use more cores.
 
 Reading the output: the two S/N values are *different statistics* (time-domain
 matched filter vs coherent Fourier boxcar) and only roughly comparable. The duty
