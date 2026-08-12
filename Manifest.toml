@@ -2,7 +2,7 @@
 
 julia_version = "1.12.6"
 manifest_format = "2.0"
-project_hash = "84d0d511f3ecb23c96a20a8a45cbf9d2f584b1f2"
+project_hash = "b37629f9008fe8529067cc8bbd7d480a52d042fd"
 
 [[deps.AbstractFFTs]]
 deps = ["LinearAlgebra"]
@@ -178,7 +178,7 @@ uuid = "6b39b394-51ab-5f42-8807-6242bab2b4c2"
 version = "0.8.7"
 
 [[deps.CoherentSearch]]
-deps = ["ArgParse", "CairoMakie", "FFTW", "LinearAlgebra", "Mmap"]
+deps = ["ArgParse", "CairoMakie", "FFTW", "LinearAlgebra", "Logging", "Mmap", "PrecompileTools", "Printf"]
 path = "."
 uuid = "b7e4a1c2-3d6f-4e8a-9c1b-2a5d8f3e6c40"
 version = "0.1.0"

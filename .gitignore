@@ -18,6 +18,13 @@ oracle.json
 .DS_Store
 *.swp
 
+# Sysimage sub-env manifest, and the built image itself: several hundred MB,
+# machine- and Julia-version-specific.  Rebuild with sysimage/build_sysimage.jl.
+/sysimage/Manifest.toml
+/sysimage/*.so
+/sysimage/*.dylib
+/sysimage/*.dll
+
 # Benchmark sub-env manifest (regenerated) and profiler HTML output
 /bench/Manifest.toml
 /bench/statprof/

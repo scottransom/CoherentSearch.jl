@@ -7,8 +7,10 @@ candidate lists written by ``bin/coherent_search.jl`` and for a search that has
 been run over *many observations* (epochs) as well as many DMs.
 
 Each input file holds the candidates from ONE (observation, DM) pair.  The file
-name encodes both, e.g. ``NGC6624_03L_DM87.10.txt`` -> obs="NGC6624_03L",
-DM=87.10.  The columns are::
+name encodes both, e.g. ``NGC6624_03L_DM87.10.cohout`` -> obs="NGC6624_03L",
+DM=87.10.  ``.cohout`` is what a multi-file ``coherent_search.jl`` run writes by
+default (one per input ``.fft``); ``.txt`` files from single-file ``-o`` runs are
+picked up too.  The columns are::
 
     rank   S/N   Frequency(Hz)   Period(ms)   #Harm
 
@@ -641,11 +643,18 @@ def write_html_standalone(signals, opts, path):
 # ----------------------------------------------------------------------------
 # Driver
 # ----------------------------------------------------------------------------
+# Extensions a bare directory is searched for.  ``.cohout`` is the default
+# written by a multi-file coherent_search.jl run; ``.txt`` covers single-file
+# runs that used ``-o``.  An explicit filename or glob bypasses this entirely.
+CAND_EXTS = ("*.cohout", "*.txt")
+
+
 def gather_files(paths):
     files = []
     for p in paths:
         if os.path.isdir(p):
-            files.extend(sorted(glob.glob(os.path.join(p, "*.txt"))))
+            for ext in CAND_EXTS:
+                files.extend(sorted(glob.glob(os.path.join(p, ext))))
         else:
             g = sorted(glob.glob(p))
             files.extend(g if g else [p])
@@ -663,7 +672,8 @@ def main(argv=None):
         description="Cross-observation sifting of CoherentSearch.jl candidate files.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     ap.add_argument("paths", nargs="+",
-                    help="candidate .txt files, globs, and/or directories")
+                    help="candidate files (.cohout/.txt), globs, and/or directories "
+                         "(a directory is searched for %s)" % ", ".join(CAND_EXTS))
     ap.add_argument("--regex",
                     default=r"(?P<obs>.+?)_DM(?P<dm>[0-9]+(?:\.[0-9]+)?)",
                     help="regex with named groups 'obs' and 'dm' matched against "

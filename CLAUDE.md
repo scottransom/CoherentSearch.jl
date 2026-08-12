@@ -41,6 +41,11 @@ for multi-threaded performance and is numerically pinned to the Python original.
     multi-frequency search.
 - `src/candidate.jl`, `bin/plotting.jl` — per-candidate profile reconstruction
   and CairoMakie plots (loaded lazily; ordinary runs/tests never pay for it).
+- `src/cli.jl` — the ArgParse driver, `CoherentSearch.main`. **In the package,
+  not in `bin/`, on purpose**: as a top-level script, inferring and codegen'ing
+  `main` cost ~4.7 s on every run. `bin/coherent_search.jl` is a shim.
+  Searches *many* `.fft` files per invocation, sharing one `SearchParams` and
+  one `SearchCache`, and defers all plotting to a single pass at the end.
 
 **Correctness discipline (do not break this):** every optimisation must keep the
 oracle/equivalence pins green. There are now two, one per interpolator:
@@ -65,6 +70,11 @@ julia --project=. -e 'using Pkg; Pkg.test()'
 
 # Search (-t auto for all cores)
 julia --project=. -t auto bin/coherent_search.jl FILE.fft --lofreq 0.1 --hifreq 100
+# Many files in ONE invocation (start-up + plans paid once; one .cohout each)
+julia --project=. -t auto bin/coherent_search.jl *_red.fft --noplot --threshold 8
+# Production sysimage (build takes minutes; freezes src/ — do not use while editing)
+julia --project=sysimage sysimage/build_sysimage.jl
+julia --sysimage sysimage/coherent_search.so --project=. -t auto bin/coherent_search.jl ...
 # Heavy multi-frequency config (the standard perf test):
 julia --project=. -t 4 bin/coherent_search.jl --threshold 6 --metric sd2 \
       --maxdecim 6 -o out.txt --noplot FILE.fft
@@ -138,6 +148,25 @@ the hot loop. See `Summary_and_Future_Work.md` (§3) for the roadmap.
   bit-identical (verified vs the old partition on tied/all-equal/sorted inputs).
   **Note the profiler charges `_median!` to `median-select` regardless of caller**,
   which is why `_block_sigma` read as 3.7% while really being ~20%.
+- **Done (2026-08-11): start-up, not the search, was dominating short runs.**
+  Measured on `PM0063_034C1_DM445.0_red.fft`, `-t 1 --hifreq 20 --nharms 32
+  --noplot`: 15.65 s wall for **1.36 s** of actual searching. Phase breakdown —
+  boot + `using` 0.14 s (loading was never the problem), inferring `main` 4.7 s,
+  ArgParse's first `parse_args` 1.6 s, first `search` call 5.9 s. A warm second
+  `main()` in the same process is **0.05 s**, which is both the floor and the
+  marginal cost of an extra file. Three changes, all measured:
+  - **`PrecompileTools` workload** at the bottom of `src/CoherentSearch.jl` (a
+    miniature end-to-end search + a `main` call): 15.65 → 8.13 s. Costs +3.4 s
+    of re-precompilation per `src/` edit (6.05 → 9.47 s).
+  - **CLI moved into the package** (`src/cli.jl`), so `main` and the ArgParse
+    table are cached too: → **2.39 s**, candidates byte-identical. **6.5x.**
+  - **Multi-file runs + `SearchCache`** (reuses hplans/workspaces across files;
+    `dplans` still per-file, they depend on `r_lo`): 3 files in 4.83 s, i.e.
+    ~1.2 s marginal per file vs 15.65 s for a separate invocation.
+  **The biggest single fixed cost left is plotting, which is on by default:**
+  `using CairoMakie` alone is 9.0 s, and a default run was 33.5 s vs 8.1 s with
+  `--noplot`. Plotting is now deferred to one pass after all searches, so a batch
+  pays it once. Only a sysimage removes it; `sysimage/` builds one.
 - **Next target: Kadane** — whose own first-listed step (cross-profile SIMD on
   the exact scan) is now done, so it is a smaller prize than the write-up assumes.
   The fully-`Float32` profile stage was tried on the `float32-profiles` branch

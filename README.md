@@ -24,12 +24,15 @@ src/
   fileio.jl           PRESTO .fft / .inf readers (mmap)
   search.jl           chunk-parallel coherent harmonic-summing search
   candidate.jl        per-candidate high-accuracy profile reconstruction
+  cli.jl              ArgParse command-line driver (`CoherentSearch.main`)
 bin/
-  coherent_search.jl  ArgParse command-line front-end
+  coherent_search.jl  command-line entry point (a shim onto src/cli.jl)
   plotting.jl         CairoMakie candidate-profile plotting (loaded on demand)
   plot_candidates.jl  standalone: re-plot profiles from a saved candidate file
+  sift_candidates.py  cross-observation candidate sifter (.cohout / .txt)
 test/                 unit tests (golden values, analytic signals, indexing)
 crossval/             Python-as-oracle accuracy + speed cross-validation
+sysimage/             optional PackageCompiler sysimage for production runs
 ```
 
 ## Design notes
@@ -86,6 +89,62 @@ cands = search(ft, SearchParams(nharms=32); lofreq=0.1, hifreq=100, threshold=8)
 
 Each candidate reports its barycentric spin frequency, period (`1/f`), the S/N
 metric, and the number of harmonics summed in the detection.
+
+### Searching many files at once (and start-up cost)
+
+**Pass every `.fft` file to a single invocation** rather than running the CLI
+once per file:
+
+```sh
+julia --project=. -t auto bin/coherent_search.jl *_red.fft \
+    --lofreq 0.1 --hifreq 100 --threshold 8 --noplot
+```
+
+Julia compiles the search on first use, which costs ~10 s of wall-clock before
+any work happens — comparable to the search itself on a short observation. One
+invocation pays it once for the whole batch, and the harmonic plans, FFTW plans
+and per-thread workspaces (a [`SearchCache`](src/search.jl)) are built once and
+reused, so each additional file costs only its own search time. Measured on a
+32 MB `.fft`, single-threaded: one file 2.4 s, three files 4.8 s — i.e. ~1.2 s
+per extra file against 15.6 s for a separate invocation each.
+
+Output naming follows from this:
+
+| inputs | `-o` / `--outdir` | candidates go to |
+|---|---|---|
+| one file | neither | stdout |
+| one file | `-o NAME` | `NAME` |
+| one file | `--outdir D` | `D/<base>.cohout` |
+| many files | neither | `<fftfile without .fft>.cohout`, beside each input |
+| many files | `--outdir D` | `D/<base>.cohout` |
+| many files | `-o NAME` | rejected — it would have each file overwrite the last |
+
+`bin/sift_candidates.py` reads `.cohout` (and `.txt`) files, so a whole DM sweep
+can be sifted with `sift_candidates.py <dir>`.
+
+**Plotting is deferred to the end of the run.** All searches finish first, then
+CairoMakie is loaded *once* to plot every file's candidates. Loading it costs
+~9 s plus first-call compilation — by far the largest fixed cost in the program —
+so in bulk runs pass `--noplot` and plot later from the saved candidate files
+with `bin/plot_candidates.jl`.
+
+Or from Julia:
+
+```julia
+using CoherentSearch
+ft = FFTFile("FILE.fft")
+cands = search(ft, SearchParams(nharms=32); lofreq=0.1, hifreq=100, threshold=8)
+```
+
+Searching several files from Julia? Share one `SearchCache` (and one
+`SearchParams` object — reuse is keyed on its identity):
+
+```julia
+params, cache = SearchParams(nharms=32), SearchCache()
+for f in files
+    cands = search(FFTFile(f), params; cache=cache, lofreq=0.1, hifreq=100)
+end
+```
 
 ### Multi-frequency search by harmonic decimation
 
@@ -159,6 +218,35 @@ julia --project=. bin/plot_candidates.jl FILE.fft cands.txt --nharms 60
 The CLI prints a chunk-completion meter to `stderr`: a text percentage by
 default, a bar with `--progressbar`, or nothing with `--noprogress`. From the
 library, pass `progress = :text | :bar | :none` to `search`.
+
+## Start-up time
+
+Julia compiles on first use, and for a short search that compilation dominated
+the wall clock: 15.6 s for a run whose actual searching took 1.4 s. Two things
+address it, and a third is available for production.
+
+1. **A precompile workload** (`PrecompileTools`, at the bottom of
+   `src/CoherentSearch.jl`) runs a miniature end-to-end search at package
+   *build* time, so the native code is cached in the package image. The CLI
+   driver lives in `src/cli.jl` rather than in `bin/` for exactly this reason —
+   as a top-level script, inferring `main` alone cost ~4.7 s per run. Together
+   these took the run above to **2.4 s**. The cost is ~3.4 s of extra
+   precompilation after each `src/` edit.
+2. **Batching files** into one invocation (see above) amortises what remains.
+3. **A sysimage** removes the rest, including Julia's own boot and the ~9 s
+   CairoMakie load that plotting needs:
+
+   ```sh
+   julia --project=sysimage -e 'using Pkg; Pkg.develop(path="."); Pkg.instantiate()'
+   julia --project=sysimage sysimage/build_sysimage.jl        # several minutes
+   julia --sysimage sysimage/coherent_search.so --project=. -t auto \
+         bin/coherent_search.jl FILE.fft [FILE2.fft ...] [options]
+   ```
+
+   Use it for production runs, **not during development**: a sysimage freezes
+   `src/` as of its build, so later edits are silently ignored until you rebuild
+   it. Plain `julia --project=.` and `Pkg.test()` always see the live source.
+   The image is specific to the machine and the Julia version.
 
 ## Testing
 

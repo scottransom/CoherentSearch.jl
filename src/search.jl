@@ -1929,6 +1929,68 @@ function _search_region!(ft::FFTFile, params::SearchParams, hplans::Vector{Harmo
 end
 
 """
+    SearchCache()
+
+Reusable per-`SearchParams` setup — the harmonic plans and the per-task
+[`Workspace`](@ref)s — so a run over *many* `.fft` files pays for them once
+instead of once per file.  Pass the same cache to every [`search`](@ref) call;
+it is repopulated automatically whenever `params` or `blocksize` changes.
+
+Only setup that is independent of the file is cached.  The direct interpolator's
+phase tables depend on the starting Fourier bin (`lofreq * ft.T`), which varies
+with the observation length, so those are rebuilt per file — they are cheap once
+warm.  Reuse is keyed on the `params` *object identity*, not on `==`: build one
+`SearchParams` and hand the same one to every call.
+
+Not thread-safe: like the `Workspace`s it holds, a cache belongs to the serial
+setup phase.  FFTW planning is not thread-safe either, which is the whole reason
+workspaces are built outside the parallel region.
+"""
+mutable struct SearchCache
+    params::Union{Nothing,SearchParams}
+    Nprof::Int
+    hplans::Union{Nothing,Vector{HarmonicPlan}}
+    # A concretely-typed `Vector{Workspace{S,B,D}}` held behind an `Any` field:
+    # `S`/`B`/`D` are not known until `params` is, and this is a once-per-file
+    # setup value.  Extracting it costs one dynamic dispatch at the
+    # `_search_region!` call, which is a function barrier — everything inside is
+    # specialised on the concrete element type, so the hot loop is untouched.
+    workspaces::Any
+end
+SearchCache() = SearchCache(nothing, 0, nothing, nothing)
+
+"""
+    _plans!(cache, params, Nprof, nt) -> (hplans, workspaces)
+
+Fetch the harmonic plans and at least `nt` workspaces from `cache`, building
+(or extending) them as needed.  With `cache === nothing`, builds fresh ones.
+"""
+function _plans!(cache::Union{Nothing,SearchCache}, params::SearchParams,
+                 Nprof::Integer, nt::Integer)
+    if cache !== nothing && cache.params === params && cache.Nprof == Nprof &&
+       cache.hplans !== nothing
+        hplans = cache.hplans::Vector{HarmonicPlan}
+        ws = cache.workspaces
+        # A later file may need more tasks than an earlier one (more chunks);
+        # top up rather than rebuild.  Extra workspaces are simply not indexed.
+        while length(ws) < nt
+            push!(ws, Workspace(params, hplans, Nprof))
+        end
+        return hplans, ws
+    end
+    hplans = build_harmonic_plans(params, Nprof)
+    # Planning is not thread-safe: build all workspaces serially, here.
+    ws = [Workspace(params, hplans, Nprof) for _ in 1:nt]
+    if cache !== nothing
+        cache.params = params
+        cache.Nprof = Int(Nprof)
+        cache.hplans = hplans
+        cache.workspaces = ws
+    end
+    return hplans, ws
+end
+
+"""
     search(ft, params; lofreq, hifreq, lobin, blocksize, threshold) -> Vector{Candidate}
 
 Run the full coherent harmonic-summing search over `[lofreq, hifreq]` Hz,
@@ -1962,6 +2024,10 @@ so `threshold` is then in noise-`σ`-like units, not raw-metric units — and ma
 candidate metrics comparable across decimations (improving the cross-`k`
 [`remove_harmonics`](@ref) ranking).  It roughly doubles the runtime (two full
 passes) and assumes the input is normalised (see [`MetricNorm`](@ref)).
+
+Searching several files with the same `params`?  Pass one [`SearchCache`](@ref)
+as `cache` to every call: the harmonic plans and per-task workspaces are then
+built once for the whole run instead of once per file.  Results are unchanged.
 """
 function search(ft::FFTFile, params::SearchParams=SearchParams();
                 lofreq::Real=0.1, hifreq::Real=100.0, lobin::Integer=100,
@@ -1971,7 +2037,8 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
                 progress::Symbol=:none,
                 metricstats::Union{Nothing,MetricStats}=nothing,
                 normalize::Bool=false, verbose::Bool=false,
-                wisdom::Bool=true, wisdom_file::Union{Nothing,AbstractString}=nothing)
+                wisdom::Bool=true, wisdom_file::Union{Nothing,AbstractString}=nothing,
+                cache::Union{Nothing,SearchCache}=nothing)
     progress in (:none, :text, :bar) ||
         throw(ArgumentError("progress must be :none, :text or :bar, got :$progress"))
     params.interp in (:direct, :fft) ||
@@ -1997,13 +2064,11 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
     wpath = wisdom ? (wisdom_file === nothing ? wisdom_path() : String(wisdom_file)) : ""
     wisdom && import_wisdom!(wpath)
 
-    hplans = build_harmonic_plans(params, Nprof)
     # The direct interpolator's phase tables key off the *global* trial index, so
     # they are built once here against `r_lo` and shared read-only by every task.
     dplans = params.interp === :direct ? build_direct_plans(params, r_lo) : nothing
     nt = max(1, min(nthreads(), nchunks))
-    # Planning is not thread-safe: build all workspaces serially, here.
-    workspaces = [Workspace(params, hplans, Nprof) for _ in 1:nt]
+    hplans, workspaces = _plans!(cache, params, Nprof, nt)
 
     wisdom && export_wisdom!(wpath)
 

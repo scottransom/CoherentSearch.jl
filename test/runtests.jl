@@ -5,4 +5,5 @@ using Test
     include("test_fileio.jl")
     include("test_search.jl")
     include("test_candidate.jl")
+    include("test_cli.jl")
 end
