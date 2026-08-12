@@ -315,6 +315,20 @@ Measured on `PM0063_034C1_DM445.0_red.fft` (T=2097 s, 4-core i7-10510U laptop),
 | `coherent_search -t 1` | 29.3 | 1.01 |
 | `coherent_search -t 4` | 22.3 | 3.23 |
 
+The harness also splits start-up from searching, so the obvious objection —
+that this is really measuring Julia's start-up — is answered on every run. It
+is not: the two are within 0.1 s of each other and largely cancel.
+
+| | start-up | searching | wall |
+|---|---|---|---|
+| `rseek` | 1.41 s (Python import) | 22.93 s | 24.34 s |
+| ours `-t 1` | 1.48 s (boot + JIT + FFTW plans) | 28.78 s | 30.26 s |
+
+so the pure-compute ratio (1.26×) matches the wall-clock ratio (1.24×). Note
+that riptide's `find_peaks` is 7.0 s — 31% of its compute — and is a separate
+pass doing candidate work we do inline; comparing our figure against its
+`ffa_search` alone would be wrong.
+
 **Single-threaded we are ~1.2–1.4× slower** (run-to-run scatter on this
 throttling laptop is large; the threaded row is the least reliable, since
 back-to-back heavy runs clock the CPU down). **We detect the 7.1185 Hz pulsar

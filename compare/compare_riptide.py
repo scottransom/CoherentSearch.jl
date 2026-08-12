@@ -37,10 +37,19 @@ The two searches are different algorithms, so "matched" needs stating precisely:
     sides more high-frequency reach at shallower depth.
 
   * **Threads.** riptide's C extension is built without OpenMP (see its
-    ``setup.py``) and its Python driver is serial, so ``rseek`` is
-    single-threaded.  The like-for-like comparison is therefore our ``-t 1``;
-    ``--threads`` runs an additional multi-threaded pass, reported separately
-    rather than as the headline number.
+    ``setup.py``) and its Python driver is serial, so the FFA itself runs on one
+    core.  Measured, ``rseek`` uses 1.0-1.15 cores end to end, the excess being
+    numpy/BLAS in de-reddening and peak-finding; the report prints the measured
+    core count for both sides rather than taking this on trust.
+
+    That BLAS threading is left ENABLED by default -- riptide should get any
+    benefit going.  Measured, there is none: pinning every thread pool to 1
+    (``--rseek-threads 1``) moved the median wall clock 4.68 -> 4.54 s over 6
+    interleaved pairs, i.e. nothing against ~8% scatter, while cutting CPU from
+    114% to 99%.  The extra core is overhead, not speed.
+
+    The like-for-like comparison is our ``-t 1``; ``--threads`` runs an extra
+    multi-threaded pass, reported separately rather than as the headline.
 
   * **Wall-clock.** Both numbers are whole-process wall time, which includes
     each language's interpreter start-up.  On a thermally-limited machine the
@@ -74,6 +83,7 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
+import re
 import resource
 import statistics
 import subprocess
@@ -106,11 +116,12 @@ def read_inf(path):
 class Timing:
     """Wall/CPU timings for one search.  `cores` = CPU seconds / wall seconds."""
 
-    def __init__(self, walls, cores, stdout):
+    def __init__(self, walls, cores, stdout, stderr=""):
         self.min = min(walls)
         self.median = statistics.median(walls)
         self.cores = max(cores)
         self.stdout = stdout
+        self.stderr = stderr
 
 
 def _child_cpu():
@@ -128,7 +139,7 @@ def run_timed(cmd, repeat, env=None, cwd=None):
     is measured rather than assumed from the build flags.
     """
     subprocess.run(cmd, capture_output=True, env=env, cwd=cwd)   # warm-up
-    walls, cores, out = [], [], ""
+    walls, cores, out, err = [], [], "", ""
     for _ in range(repeat):
         c0, t0 = _child_cpu(), time.perf_counter()
         proc = subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=cwd)
@@ -139,8 +150,8 @@ def run_timed(cmd, repeat, env=None, cwd=None):
         if proc.returncode != 0:
             sys.stderr.write(proc.stderr[-4000:])
             raise SystemExit(f"command failed ({proc.returncode}): {' '.join(cmd)}")
-        out = proc.stdout
-    return Timing(walls, cores, out)
+        out, err = proc.stdout, proc.stderr
+    return Timing(walls, cores, out, err)
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +213,19 @@ def parse_cohout(path):
                     ducy = None
             cands.append(Cand(freq, snr, ducy, extra=f"H={nharm}"))
     return cands
+
+
+def rseek_stages(stderr):
+    """Sum rseek's own per-stage DEBUG timings -> (dict of stage->s, total_s).
+
+    riptide logs "'<stage>' runtime: N ms" for each phase, which gives its
+    compute time excluding Python start-up -- the number to compare against our
+    wall clock minus our fixed cost.
+    """
+    stages = {}
+    for m in re.finditer(r"'(\w+)' runtime: ([\d.]+) ms", stderr):
+        stages[m.group(1)] = float(m.group(2)) / 1000.0
+    return stages, sum(stages.values())
 
 
 # ---------------------------------------------------------------------------
@@ -417,6 +441,15 @@ def main(argv=None):
     ct = run_timed(coherent_cmd(1), args.repeat)
     ccands = parse_cohout(out)
 
+    # Our fixed cost: the same command over a near-empty frequency band, so it
+    # pays Julia's boot, the precompiled-code load, and FFTW planning for this
+    # exact nharms/maxdecim, but does essentially no searching.  Subtracting it
+    # answers "is the comparison just measuring Julia's start-up?".
+    fixed_cmd = [c for c in coherent_cmd(1)]
+    fixed_cmd[fixed_cmd.index("--hifreq") + 1] = repr(lofreq * 1.002)
+    print("measuring coherent_search fixed cost (near-empty band) ...", flush=True)
+    ft_fixed = run_timed(fixed_cmd, max(2, args.repeat // 2))
+
     mt = None
     if args.threads > 1:
         print(f"running coherent_search -t {args.threads} ({args.repeat}x) ...", flush=True)
@@ -440,6 +473,28 @@ def main(argv=None):
         print(f"  with {args.threads} threads:  {rt.min / mt.min:.2f}x rseek wall clock -- "
               f"riptide's C extension has no OpenMP,")
         print("                        so this axis is ours alone, not a like-for-like win")
+    # --- start-up vs compute --------------------------------------------
+    stages, rcompute = rseek_stages(rt.stderr)
+    if rcompute > 0:
+        cfixed = ft_fixed.min
+        ccompute = ct.min - cfixed
+        print()
+        print(f"  {'':<26} {'start-up':>9} {'searching':>11} {'ratio':>8}")
+        print(f"  {'rseek':<26} {rt.min - rcompute:>9.2f} {rcompute:>11.2f}")
+        print(f"  {'coherent_search -t 1':<26} {cfixed:>9.2f} {ccompute:>11.2f} "
+              f"{ccompute / rcompute:>7.2f}x")
+        print(f"  rseek stages: "
+              + ", ".join(f"{k} {v:.2f}s" for k, v in sorted(stages.items(),
+                                                             key=lambda kv: -kv[1])))
+        print("  (rseek's stage timings are its own DEBUG log; our start-up is the same")
+        print("   command over a near-empty band, so it pays boot + JIT + FFTW planning.)")
+        if "find_peaks" in stages:
+            print(f"  Do NOT compare our column against ffa_search alone: riptide's "
+                  f"find_peaks\n  ({stages['find_peaks']:.1f}s, "
+                  f"{100 * stages['find_peaks'] / rcompute:.0f}% of its compute) is a "
+                  f"separate pass doing the candidate work\n  that we do inline in the "
+                  f"search loop.  The totals are what line up.")
+
     if args.rseek_threads > 0:
         print(f"\n  rseek's BLAS/OMP pools were pinned to {args.rseek_threads} thread(s).")
     else:

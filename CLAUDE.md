@@ -112,6 +112,13 @@ pulsar at S/N 12.97 vs riptide's 11.80, plus two candidates it does not report.
 riptide's two extra entries are the `f/2` and `2f` of the pulsar, which it does
 not filter and we collapse.
 
+- **Start-up is NOT what the comparison measures**, and the harness proves it
+  per run: rseek 1.41 s start-up + 22.93 s searching, ours 1.48 s + 28.78 s, so
+  the pure-compute ratio (1.26x) matches the wall ratio (1.24x). Our fixed cost
+  is measured by re-running the same command over a near-empty band.
+  riptide's `find_peaks` is 7.0 s (31% of its compute) and is a separate pass
+  doing the candidate work we do inline — do **not** compare us against its
+  `ffa_search` (15.6 s) alone.
 - **Match total frequency COVERAGE, not the trial range.** Both codes hit the
   same sampling wall — riptide needs `P >= tsamp*bins` and downsamples to stay
   in `[bmin, bmax]`; our `k`-fold of `nharms/k` harmonics needs its top harmonic
