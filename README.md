@@ -233,15 +233,24 @@ address it, and a third is available for production.
    these took the run above to **2.4 s**. The cost is ~3.4 s of extra
    precompilation after each `src/` edit.
 2. **Batching files** into one invocation (see above) amortises what remains.
-3. **A sysimage** removes the rest, including Julia's own boot and the ~9 s
-   CairoMakie load that plotting needs:
+3. **A sysimage** (`sysimage/`) removes CairoMakie's load — and, as measured,
+   nothing else:
+
+   | | no sysimage | sysimage |
+   |---|---|---|
+   | `--noplot` | 2.4 s | 2.3 s |
+   | with plots | 18.7 s | **7.4 s** |
 
    ```sh
    julia --project=sysimage -e 'using Pkg; Pkg.develop(path="."); Pkg.instantiate()'
-   julia --project=sysimage sysimage/build_sysimage.jl        # several minutes
+   julia --project=sysimage sysimage/build_sysimage.jl        # ~28 minutes
    julia --sysimage sysimage/coherent_search.so --project=. -t auto \
          bin/coherent_search.jl FILE.fft [FILE2.fft ...] [options]
    ```
+
+   Worth it only for repeated plotting-enabled runs: the image is 1.14 GB, and
+   the *first* run after building it (or after a reboot) spends ~23 s reading it
+   into page cache. If you run with `--noplot`, skip it.
 
    Use it for production runs, **not during development**: a sysimage freezes
    `src/` as of its build, so later edits are silently ignored until you rebuild

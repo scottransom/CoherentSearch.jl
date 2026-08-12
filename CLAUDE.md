@@ -164,9 +164,18 @@ the hot loop. See `Summary_and_Future_Work.md` (§3) for the roadmap.
     `dplans` still per-file, they depend on `r_lo`): 3 files in 4.83 s, i.e.
     ~1.2 s marginal per file vs 15.65 s for a separate invocation.
   **The biggest single fixed cost left is plotting, which is on by default:**
-  `using CairoMakie` alone is 9.0 s, and a default run was 33.5 s vs 8.1 s with
-  `--noplot`. Plotting is now deferred to one pass after all searches, so a batch
-  pays it once. Only a sysimage removes it; `sysimage/` builds one.
+  `using CairoMakie` alone is 9.0 s. Plotting is now deferred to one pass after
+  all searches, so a batch pays it once, and bulk runs should use `--noplot`.
+- **The PackageCompiler sysimage (`sysimage/`) is worth it *only* for plotting
+  runs — this was projected as the big win and measured as almost nothing.**
+  Warm: `--noplot` 2.3 s with it vs 2.4 s without (nothing — the precompile
+  workload already took that), but with plots 7.4 s vs 18.7 s (**2.5x**). It
+  removes CairoMakie's load and nothing else, because Julia's boot is only
+  ~0.2 s and the search is already cached. Costs: ~28 min to build, 1.14 GB, and
+  the first run after a build/reboot is **23 s** paging the image in (vs 2.3 s
+  warm) — an occasional single search is *slower* with it than without.
+  Do not use it while editing `src/`: a sysimage freezes the code it was built
+  from and will silently run the old search.
 - **Next target: Kadane** — whose own first-listed step (cross-profile SIMD on
   the exact scan) is now done, so it is a smaller prize than the write-up assumes.
   The fully-`Float32` profile stage was tried on the `float32-profiles` branch
