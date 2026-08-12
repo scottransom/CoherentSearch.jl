@@ -86,7 +86,41 @@ julia --project=. bin/coherent_search.jl --interp fft --fftsizing pow2 ... FILE.
 # Cross-validation against the Python oracle
 julia --project=crossval        crossval/crossval_accuracy.jl FILE.fft
 julia --project=crossval -t auto crossval/crossval_speed.jl   FILE.fft
+
+# Head-to-head against riptide's FFA (the real external bar)
+python3 compare/compare_riptide.py --repeat 3 --threads 4 FILE.fft
 ```
+
+## The riptide bar (read this before optimising)
+
+**The point of the performance work is to beat riptide's FFA** (`rseek`, cloned
+at `../riptide`), not the Python original. Measured 2026-08-11 on
+`PM0063_034C1_DM445.0_red.fft`, 0.1–20 Hz, 120 profile bins, 4-core i7-10510U:
+
+| | wall (s) | cores |
+|---|---|---|
+| `rseek` | 4.65 | 1.15 |
+| ours `-t 1` | 9.82 | 1.04 |
+| ours `-t 4` | 6.18 | 2.96 |
+
+**We are ~2.1x SLOWER single-threaded.** Detection quality is comparable: both
+find the 7.1185 Hz pulsar (S/N 11.9 vs 12.3) at a consistent duty cycle, and
+riptide's two extra candidates are its `f/2` and `2f`, which it does not filter
+and we collapse. So the gap to close is speed, not sensitivity.
+
+- `compare/compare_riptide.py` derives matched settings (`nharms = bmax/2`,
+  `maxdecim = bmax/bmin`), measures **cores used** on both sides rather than
+  assuming, and flags harmonic relations so riptide's unfiltered family does not
+  read as detections we missed.
+- **riptide's BLAS threading was checked and is a red herring**: pinning every
+  thread pool to 1 moved its median wall clock 4.68 → 4.54 s over 6 interleaved
+  pairs (nothing, against ~8% scatter) while dropping CPU 114% → 99%. Left
+  enabled by default so riptide gets any benefit going.
+- Two axes are ours alone, and must not be quoted as like-for-like wins:
+  threading (riptide has no OpenMP), and decimation coverage (4x the band for
+  1.65x the time — 16.1 s at `-t 1` for 0.1–80 Hz).
+- This laptop throttles (`scaling MHz: 67%`) and run-to-run scatter is ~8%;
+  compare ratios from interleaved runs, not absolute seconds across sessions.
 
 ## Performance work (current focus)
 

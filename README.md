@@ -277,6 +277,47 @@ address it, and a third is available for production.
    it. Plain `julia --project=.` and `Pkg.test()` always see the live source.
    The image is specific to the machine and the Julia version.
 
+## Comparison against riptide's FFA
+
+The external bar for this search is [riptide](https://github.com/v-morello/riptide),
+the Fast Folding Algorithm implementation. `compare/compare_riptide.py` runs
+`rseek` and this code over the same observation with matched settings, times
+both, and cross-matches the candidate lists:
+
+```sh
+python3 compare/compare_riptide.py --repeat 3 --threads 4 FILE.fft
+```
+
+It derives our settings from riptide's: `nharms = bmax/2` and
+`maxdecim = bmax/bmin` line the profile-bin spans up (`--bmin 30 --bmax 120`
+→ `--nharms 60 --maxdecim 4`, both spanning 120…30 bins), and our fundamental
+range is `[1/Pmax, 1/Pmin]`. It prints the derived configuration, and flags
+where the match is imperfect, so the comparison stays auditable.
+
+Measured on `PM0063_034C1_DM445.0_red.fft` (T=2097 s, 4-core i7-10510U laptop),
+searching 0.1–20 Hz with 120 profile bins:
+
+| | wall (s) | cores |
+|---|---|---|
+| `rseek` | 4.65 | 1.15 |
+| `coherent_search -t 1` | 9.82 | 1.04 |
+| `coherent_search -t 4` | 6.18 | 2.96 |
+
+**Single-threaded, riptide's FFA is ~2.1× faster.** Both find the 7.1185 Hz
+pulsar with comparable S/N (11.9 vs 12.3) and consistent duty cycle. riptide's
+two other candidates are the `f/2` and `2f` harmonics of it, which we collapse
+by default and it does not filter at all (`--noharmremove` for a like-for-like
+count).
+
+Two axes are ours alone rather than like-for-like wins, and are reported
+separately for that reason: riptide's C extension is built without OpenMP so
+`rseek` cannot use more cores, and harmonic decimation buys us 4× the frequency
+coverage (0.1–80 Hz) for 1.65× the time (16.1 s at `-t 1`).
+
+Reading the output: the two S/N values are *different statistics* (time-domain
+matched filter vs coherent Fourier boxcar) and only roughly comparable. The duty
+cycles are defined identically on both sides and are the quantity to compare.
+
 ## Testing
 
 ```sh
