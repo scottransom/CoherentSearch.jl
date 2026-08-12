@@ -61,6 +61,44 @@ function candidate_profile(ft::FFTFile, r::Real, nharm::Integer; m::Integer=64)
 end
 
 """
+    measure_ducy(ft, cands, params; m=64) -> Vector{Candidate}
+
+Fill in each candidate's `ducy` — the duty cycle of the best-matching boxcar,
+`width / profile bins`, as riptide's `rseek` reports it — and return the updated
+candidates.  Input candidates are not modified (`Candidate` is immutable).
+
+Each candidate is refolded at its own `r` with its own `nharm` harmonics, which
+reproduces the geometry of the profile the search actually scored: a candidate
+found at decimation `k` carries `r = k·r_fund` and `nharm = ⌊nharms/k⌋`, and the
+decimated fold is exactly the `⌊nharms/k⌋`-harmonic fold of `k·r_fund`.  So the
+`2·nharm`-bin profile here is the same fold, differing only in using the wide
+`m`-bin exact kernel instead of the search's grid-snapped interpolation — i.e. a
+more accurate estimate of the same thing.  Cheap: this runs on the reported
+candidates only, never in the hot loop.
+
+The width bank (`boxcar_fsp`, `boxcar_maxfrac` from `params`) matches the
+search's.  Candidates whose profile cannot be reconstructed keep `ducy = NaN`.
+"""
+function measure_ducy(ft::FFTFile, cands::AbstractVector{Candidate},
+                      params::SearchParams; m::Integer=64)
+    out = Vector{Candidate}(undef, length(cands))
+    for (i, c) in enumerate(cands)
+        ducy = NaN
+        if c.nharm >= 1 && c.r > 0
+            prof = candidate_profile(ft, c.r, c.nharm; m=m)
+            # `candidate_profile` truncates at Nyquist, so the profile can be
+            # shorter than 2*nharm; the duty cycle is relative to what it returns.
+            if length(prof) >= 2
+                _, ducy = boxcar_best_width(prof; fsp=params.boxcar_fsp,
+                                            maxfrac=params.boxcar_maxfrac)
+            end
+        end
+        out[i] = Candidate(c.freq, c.metric, c.r, c.nharm, ducy)
+    end
+    return out
+end
+
+"""
     rotate_to_peak(prof) -> Vector{Float64}
 
 Circularly shift a pulse profile so its maximum bin lands at the center

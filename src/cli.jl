@@ -320,6 +320,12 @@ function search_one(ft::FFTFile, params::SearchParams, a, cache::SearchCache)
     if length(cands) > a["ncands"]
         cands = cands[1:a["ncands"]]
     end
+    # Measure each reported candidate's best-fitting boxcar duty cycle.  Only
+    # meaningful for the :boxcar metric — the others do not scan a width bank —
+    # and only affordable here, on the reported handful (see `measure_ducy`).
+    if params.metric === :boxcar && !isempty(cands)
+        cands = measure_ducy(ft, cands, params)
+    end
     return cands
 end
 
@@ -332,9 +338,14 @@ function write_candidates(cands::Vector{Candidate}, outfile::AbstractString, thr
     # Fixed-width columns; %.12g keeps at least 12 significant figures for the
     # frequency and period at any magnitude (fast pulsars have very short periods,
     # where a fixed number of decimal places would lose precision).
-    header = ["#       'S/N'      Frequency (Hz)        Period (ms)    #Harm"]
-    lines = [@sprintf("%-4d  %8.2f  %18.12f  %18.12f   %3d",
-                      i, c.metric, c.freq, 1000.0 / c.freq, c.nharm) for (i, c) in enumerate(cands)]
+    # `Ducy(%)` is the best-fitting boxcar's duty cycle, defined as riptide's
+    # `rseek` defines it (width / profile bins) so the two are directly
+    # comparable; it is `-` for the non-boxcar metrics, which scan no width bank.
+    header = ["#       'S/N'      Frequency (Hz)        Period (ms)    #Harm  Ducy(%)"]
+    lines = [@sprintf("%-4d  %8.2f  %18.12f  %18.12f   %3d   %6s",
+                      i, c.metric, c.freq, 1000.0 / c.freq, c.nharm,
+                      isnan(c.ducy) ? "-" : @sprintf("%.2f", 100 * c.ducy))
+             for (i, c) in enumerate(cands)]
     outlines = vcat(header, lines)
     if isempty(outfile)
         foreach(println, outlines)

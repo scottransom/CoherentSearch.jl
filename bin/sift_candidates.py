@@ -12,7 +12,11 @@ DM=87.10.  ``.cohout`` is what a multi-file ``coherent_search.jl`` run writes by
 default (one per input ``.fft``); ``.txt`` files from single-file ``-o`` runs are
 picked up too.  The columns are::
 
-    rank   S/N   Frequency(Hz)   Period(ms)   #Harm
+    rank   S/N   Frequency(Hz)   Period(ms)   #Harm   Ducy(%)
+
+The trailing ``Ducy(%)`` column (best-fitting boxcar duty cycle, as riptide's
+``rseek`` reports it) is optional: files written before it existed, and runs
+using a non-boxcar metric, are read exactly as before.
 
 The sifting proceeds in three stages:
 
@@ -103,6 +107,10 @@ class Row:
     freq: float
     period_ms: float
     numharm: int
+    # Best-fitting boxcar duty cycle as a FRACTION (the file stores a percent).
+    # None for files written before the column existed, and for the non-boxcar
+    # metrics, which scan no width bank and write "-".
+    ducy: float = None
 
 
 def parse_name(path, regex):
@@ -135,9 +143,18 @@ def read_rows(path, min_snr):
                 numharm = int(float(parts[4]))
             except ValueError:
                 continue
+            # Optional 6th column: duty cycle in percent, or "-" when the metric
+            # scans no width bank.  Absent entirely in files written before it
+            # was added, so its absence must not disqualify the row.
+            ducy = None
+            if len(parts) >= 6:
+                try:
+                    ducy = float(parts[5]) / 100.0
+                except ValueError:
+                    ducy = None
             if freq <= 0.0 or snr < min_snr:
                 continue
-            rows.append(Row(snr, freq, period_ms, numharm))
+            rows.append(Row(snr, freq, period_ms, numharm, ducy))
     return rows
 
 
@@ -178,6 +195,7 @@ class Detection:
     freq: float = 0.0
     period_ms: float = 0.0
     numharm: int = 0
+    ducy: float = None            # duty cycle of the peak-S/N row (fraction)
     best_snr: float = 0.0
     best_dm: float = 0.0
     hits: dict = field(default_factory=dict)   # dm -> (snr, freq)
@@ -224,6 +242,7 @@ def build_detections(obs, rows, within_tol, dm_index, dm_grid):
                 det.freq = row.freq
                 det.period_ms = row.period_ms
                 det.numharm = row.numharm
+                det.ducy = row.ducy
         det.finalize(dm_index, dm_grid)
         dets.append(det)
     return dets
@@ -245,6 +264,7 @@ class Signal:
     freq_coherence: float = 0.0
     dm_med: float = 0.0
     dm_mad_steps: float = 0.0
+    ducy_med: float = None        # median duty cycle across obs (fraction), or None
     median_ndms: float = 0.0
     frac_edge: float = 0.0
     frac_single: float = 0.0
@@ -274,11 +294,21 @@ class Signal:
         mad = _median([abs(d - self.dm_med) for d in peak_dms])
         self.dm_mad_steps = mad / dm_step if dm_step else 0.0
         self.median_ndms = _median([d.ndms for d in obs_dets])
+        # Median duty cycle over the observations that reported one.  A real
+        # pulsar's duty cycle should be consistent across epochs and DMs; it is
+        # also the quantity directly comparable to riptide's `ducy`.
+        ducys = [d.ducy for d in obs_dets if d.ducy is not None]
+        self.ducy_med = _median(ducys) if ducys else None
         self.frac_edge = sum(d.peak_at_edge for d in obs_dets) / self.n_obs
         self.frac_single = sum(not d.has_neighbour for d in obs_dets) / self.n_obs
         self.frac_broadband = sum(
             d.full_span and d.peak_at_edge and d.period_ms < long_period_ms
             for d in obs_dets) / self.n_obs
+
+
+def _fmt_ducy(d):
+    """Duty cycle as a percentage string, or '-' when it was never reported."""
+    return "-" if d is None else "%.2f" % (100.0 * d)
 
 
 def _median(xs):
@@ -423,13 +453,14 @@ def write_text(signals, opts, out):
          opts["min_dms"], opts["min_obs"]))
     p("# observations: %s" % ", ".join(obs_all))
     p("#")
-    p("# %-5s %-9s %14s %12s %5s %5s %8s %8s %8s %9s %7s  %s"
-      % ("rank", "class", "freq(Hz)", "P(ms)", "#obs", "#har",
+    p("# %-5s %-9s %14s %12s %5s %5s %7s %8s %8s %8s %9s %7s  %s"
+      % ("rank", "class", "freq(Hz)", "P(ms)", "#obs", "#har", "ducy%",
          "sumS/N", "maxS/N", "peakDM", "dMAD(st)", "dffrac", "flags"))
     for i, s in enumerate(signals, 1):
         numharm = int(round(_median([d.numharm for d in s.dets.values()])))
-        p("%-7d %-9s %14.9f %12.4f %5d %5d %8.1f %8.1f %8.*f %9.2f %7.1e  %s"
+        p("%-7d %-9s %14.9f %12.4f %5d %5d %7s %8.1f %8.1f %8.*f %9.2f %7.1e  %s"
           % (i, s.klass, s.freq, s.period_ms, s.n_obs, numharm,
+             _fmt_ducy(s.ducy_med),
              s.sum_snr, s.max_snr, opts["dm_decimals"], s.dm_med,
              s.dm_mad_steps, s.freq_frac_spread, ";".join(s.flags)))
         if opts["verbose"]:
@@ -524,17 +555,18 @@ def build_html_body(signals, opts):
     # summary table
     parts.append('<div class="twrap"><table><thead><tr>'
                  '<th>#</th><th>class</th><th>freq (Hz)</th><th>P (ms)</th>'
-                 '<th>#obs</th><th>sum S/N</th><th>max S/N</th><th>peak DM</th>'
+                 '<th>#obs</th><th>ducy %</th><th>sum S/N</th><th>max S/N</th><th>peak DM</th>'
                  '<th>DM MAD (steps)</th><th>&Delta;f/f</th><th>flags</th>'
                  '</tr></thead><tbody>')
     for i, s in enumerate(signals, 1):
         kcls = s.klass.replace("?", "").replace("-", "").lower()
         parts.append('<tr class="k-%s"><td>%d</td><td><b>%s</b></td>'
                      '<td class="mono">%.9f</td><td class="mono">%.3f</td>'
-                     '<td>%d</td><td>%.1f</td><td>%.1f</td>'
+                     '<td>%d</td><td class="mono">%s</td><td>%.1f</td><td>%.1f</td>'
                      '<td class="mono">%.*f</td><td>%.2f</td>'
                      '<td class="mono">%.1e</td><td class="fl">%s</td></tr>'
                      % (kcls, i, esc(s.klass), s.freq, s.period_ms, s.n_obs,
+                        _fmt_ducy(s.ducy_med),
                         s.sum_snr, s.max_snr, dd, s.dm_med, s.dm_mad_steps,
                         s.freq_frac_spread, esc("; ".join(s.flags))))
     parts.append("</tbody></table></div>")

@@ -182,6 +182,26 @@ Two collapses run on the candidate list, both on by default:
   strongest member. Decimation makes this family especially prominent, so the
   two work together.
 
+### Candidate output format
+
+```
+#       'S/N'      Frequency (Hz)        Period (ms)    #Harm  Ducy(%)
+1        11.92      7.118536329269    140.478316573069    32    14.06
+```
+
+`#Harm` is the harmonic count that found the candidate (`k = nharms ÷ #Harm`
+identifies the decimation). `Ducy(%)` is the duty cycle of the best-fitting
+boxcar — `width / profile bins`, exactly as riptide's `rseek` defines `ducy`, so
+the two searches can be compared directly. It is `-` for the `non`/`sd2`
+metrics, which scan no width bank.
+
+The search's hot loop deliberately discards *which* boxcar width won (it runs
+~1e8 times and only reported candidates need it), so the width is recovered
+afterwards by refolding each reported candidate — see `measure_ducy`. This is
+exact, not an approximation: the noise scale σ multiplies every width's score
+equally and so cannot change which one wins, which is what lets the width be
+recovered from an isolated profile.
+
 ### Candidate profile plots
 
 By default the CLI reconstructs and plots the pulse profile of every reported

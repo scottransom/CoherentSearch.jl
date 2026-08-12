@@ -602,3 +602,71 @@ if isfile(EXAMPLE_FFT)
 else
     @info "Skipping search data tests; example file not found" EXAMPLE_FFT
 end
+
+@testset "boxcar_best_width recovers the width behind the metric" begin
+    # A clean top-hat of width w (from the bank) must be matched by width w.
+    nbins = 64
+    widths = boxcar_widths(nbins)              # 1,2,3,4,6,9,13,19 at fsp=1.5,maxfrac=0.3
+    for w in widths
+        prof = zeros(nbins)
+        prof[10:(10 + w - 1)] .= 1.0
+        best, ducy = boxcar_best_width(prof)
+        @test best == w
+        @test ducy ≈ w / nbins
+    end
+
+    # A pulse that wraps the phase boundary is found at the same width: the
+    # prefix sums are tiled by wmax precisely so a boxcar can wrap.
+    prof = zeros(nbins); prof[63:64] .= 1.0; prof[1:2] .= 1.0
+    @test boxcar_best_width(prof)[1] == 4
+
+    # The width is independent of scale and of an additive baseline (the median
+    # is subtracted, and sigma is a common factor across widths) -- which is what
+    # licenses measuring it on an isolated profile, with no block statistics.
+    prof = zeros(nbins); prof[20:25] .= 1.0
+    w0, _ = boxcar_best_width(prof)
+    @test boxcar_best_width(1e6 .* prof)[1] == w0
+    @test boxcar_best_width(prof .+ 37.0)[1] == w0
+
+    # Pin the prefix-sum machinery to a naive, obviously-correct scan: subtract
+    # the median, sum every circular window of every bank width, divide by sqrt(w).
+    # The wrapped-window indexing is the part that could plausibly be wrong.
+    function naive_best(prof, nb)
+        s = sort(prof)
+        med = isodd(nb) ? s[(nb + 1) ÷ 2] : 0.5 * (s[nb ÷ 2] + s[nb ÷ 2 + 1])
+        z = prof .- med
+        best, bw = -Inf, 0
+        for w in boxcar_widths(nb)
+            for p in 1:nb
+                s = sum(z[mod1(p + i, nb)] for i in 0:(w - 1)) / sqrt(w)
+                s > best && (best = s; bw = w)
+            end
+        end
+        return bw
+    end
+
+    rng = MersenneTwister(20260811)
+    for w in (1, 3, 9, 13)
+        for trial in 1:5
+            prof = 0.05 .* randn(rng, nbins)
+            prof[30:(30 + w - 1)] .+= 3.0
+            @test boxcar_best_width(prof)[1] == naive_best(prof, nbins)
+        end
+    end
+    # Pure noise too, where the winning width is arbitrary and the two
+    # implementations must still agree on it (including tie-breaking).
+    for trial in 1:20
+        prof = randn(rng, nbins)
+        @test boxcar_best_width(prof)[1] == naive_best(prof, nbins)
+    end
+end
+
+@testset "Candidate carries ducy, defaulting to NaN" begin
+    c = Candidate(1.0, 10.0, 1000.0, 32)
+    @test isnan(c.ducy)                       # 4-arg form keeps the hot loop unchanged
+    c2 = Candidate(1.0, 10.0, 1000.0, 32, 0.125)
+    @test c2.ducy == 0.125
+    # De-duplication and harmonic collapse must not disturb it.
+    kept = remove_duplicates([c2]; dr_tol=1.0)
+    @test kept[1].ducy == 0.125
+end

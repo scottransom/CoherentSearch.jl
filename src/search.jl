@@ -107,7 +107,14 @@ struct Candidate
     metric::Float64
     r::Float64
     nharm::Int
+    # Duty cycle of the best-fitting boxcar, i.e. (best width)/(profile bins), as
+    # riptide's `rseek` defines `ducy`.  NaN until measured: the hot loop's
+    # `_boxcar_scan` deliberately discards which width won (it runs ~1e8 times and
+    # only the reported handful of candidates need it), so this is filled in
+    # afterwards by [`measure_ducy`](@ref).
+    ducy::Float64
 end
+Candidate(freq, metric, r, nharm) = Candidate(freq, metric, r, nharm, NaN)
 
 """
     uniform_linear_interp(r, lobin, numbetween, amps) -> ComplexF64
@@ -492,6 +499,46 @@ end
         cand > best && (best = cand)
     end
     return best
+end
+
+"""
+    boxcar_best_width(prof; fsp=1.5, maxfrac=0.3) -> (w, ducy)
+
+Width of the boxcar in the geometric bank that best matches the pulse profile
+`prof`, and the corresponding duty cycle `w / length(prof)`.
+
+This is the width behind a `:boxcar` candidate's reported S/N, recovered after
+the fact: `_boxcar_scan` keeps only the peak S/N because it runs once per trial
+(~1e8 times a search) and only reported candidates need the width.
+
+The result does **not** depend on the noise scale `σ`: `σ` enters every width's
+score as the same multiplicative factor, so it cannot change which width wins.
+That is why this can be evaluated on an isolated profile, with no access to the
+block statistics the search used.  It is otherwise the identical computation —
+same median baseline, same wrapped prefix sums, same bank — so the width it
+returns is the one the search's own scan maximised.
+"""
+function boxcar_best_width(prof::AbstractVector{<:Real}; fsp::Real=1.5, maxfrac::Real=0.3)
+    nbins = length(prof)
+    nbins >= 1 || throw(ArgumentError("profile must be non-empty"))
+    col = prof isa Vector{Float64} ? prof : Vector{Float64}(prof)
+    widths = boxcar_widths(nbins; fsp=fsp, maxfrac=maxfrac)
+    med = _median!(copy(col), nbins)      # same baseline the exact scan subtracts
+    psum = Vector{Float64}(undef, nbins + widths[end] + 1)
+    _boxcar_psum!(psum, col, nbins, widths[end], med)
+    best, bestw = -Inf, widths[1]
+    @inbounds for w in widths
+        invsw = 1.0 / sqrt(float(w))
+        m = psum[1 + w] - psum[1]
+        for p in 2:nbins
+            m = max(m, psum[p + w] - psum[p])
+        end
+        cand = m * invsw
+        # Strictly-greater keeps the *narrowest* winner on a tie, matching
+        # `_boxcar_scan`'s `cand > best` over the same ascending bank.
+        cand > best && (best = cand; bestw = w)
+    end
+    return bestw, bestw / nbins
 end
 
 # ---------------------------------------------------------------------------

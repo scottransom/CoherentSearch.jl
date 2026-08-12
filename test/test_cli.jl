@@ -83,6 +83,23 @@ mktempdir() do dir
         @test all(c.metric === f.metric for (c, f) in zip(reopened, fresh))
     end
 
+    @testset "measure_ducy fills the duty cycle without moving anything else" begin
+        cands = search(ft, params; kw...)
+        @test all(isnan(c.ducy) for c in cands)      # the hot loop does not measure it
+        measured = measure_ducy(ft, cands, params)
+        @test length(measured) == length(cands)
+        for (m, c) in zip(measured, cands)
+            # Only `ducy` changes; the detection itself must be untouched.
+            @test m.freq === c.freq && m.metric === c.metric &&
+                  m.r === c.r && m.nharm == c.nharm
+            @test 0 < m.ducy <= params.boxcar_maxfrac
+        end
+        # The injected signal is a harmonic series with a narrow pulse, so the
+        # strongest candidate should be matched by a narrow boxcar, not the widest.
+        best = measured[argmax([c.metric for c in measured])]
+        @test best.ducy < params.boxcar_maxfrac
+    end
+
     @testset "SearchCache rebuilds when params or blocksize change" begin
         cache = SearchCache()
         search(ft, params; cache = cache, kw...)
@@ -138,6 +155,19 @@ end
         f1 = parse(Float64, split(l1[2])[3])
         f2 = parse(Float64, split(l2[2])[3])
         @test !isapprox(f1, f2; rtol = 1e-3)
+
+        # The Ducy(%) column: present in the header, and a real number for every
+        # :boxcar candidate (the default metric).  It is the quantity compared
+        # against riptide's `ducy`, so it must never silently come out blank.
+        @test occursin("Ducy(%)", l1[1])
+        for line in l1[2:end]
+            f = split(line)
+            @test length(f) == 6
+            d = parse(Float64, f[6])
+            # A duty cycle is a fraction of the profile, and the width bank tops
+            # out at boxcar_maxfrac = 0.3 of it.
+            @test 0 < d <= 30.0
+        end
 
         # -o and --plotstem name a single output; with several inputs they would
         # have each file clobber the last, so they must be rejected outright.

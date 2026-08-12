@@ -27,7 +27,7 @@ include("fileio.jl")
 export SearchParams, Candidate, search, search_block, block_metrics, coherent_profiles,
        reference_profiles, snr_metrics, chunk_ngoodbins, remove_duplicates,
        remove_harmonics, chunk_metrics, build_harmonic_plans, harmonic_numbetween,
-       decimation_set, boxcar_widths, BlockMetricStats, MetricHistogram, MetricStats,
+       decimation_set, boxcar_widths, boxcar_best_width, BlockMetricStats, MetricHistogram, MetricStats,
        SearchCache,
        metricstats_summary, metricstats_windows, hist_quantile,
        MetricNorm, build_metricnorm, harmonic_plan_report
@@ -45,7 +45,7 @@ export wisdom_path, import_wisdom!, export_wisdom!, prime_wisdom
 include("wisdom.jl")
 
 # --- Per-candidate profile reconstruction (for plotting) ---
-export candidate_profile, rotate_to_peak
+export candidate_profile, rotate_to_peak, measure_ducy
 include("candidate.jl")
 
 # --- Command-line front-end (`bin/coherent_search.jl` is a shim onto this) ---
