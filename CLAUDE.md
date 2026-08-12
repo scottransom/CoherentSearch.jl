@@ -41,6 +41,12 @@ for multi-threaded performance and is numerically pinned to the Python original.
     multi-frequency search.
 - `src/candidate.jl`, `bin/plotting.jl` — per-candidate profile reconstruction
   and CairoMakie plots (loaded lazily; ordinary runs/tests never pay for it).
+- `bin/sift_candidates.py` — cross-observation/cross-DM candidate sifter (a
+  PRESTO `ACCEL_sift` analogue; pure stdlib, no numpy). Reads the `.cohout`/`.txt`
+  candidate files, parses DM from the filename, and learns everything else from
+  the inputs. Three stages: per-obs collapse across DM → link across obs by
+  *fractional* frequency (T-independent) → harmonic collapse + pulsar-likeness
+  score. Text report plus a self-contained HTML/SVG summary (`--html`).
 - `src/cli.jl` — the ArgParse driver, `CoherentSearch.main`. **In the package,
   not in `bin/`, on purpose**: as a top-level script, inferring and codegen'ing
   `main` cost ~4.7 s on every run. `bin/coherent_search.jl` is a shim.
@@ -83,7 +89,12 @@ julia --project=. bin/coherent_search.jl --verbose ... FILE.fft
 # The old FFT-correlation interpolator (fallback / equivalence gate)
 julia --project=. bin/coherent_search.jl --interp fft --fftsizing pow2 ... FILE.fft
 
-# Cross-validation against the Python oracle
+# Cross-validation against the Python oracle.  Needs an interpreter that can
+# `import coherent_search`: /home/sransom/python_venvs/pixiPSR/.pixi/envs/default/bin/python
+# (override with $COHERENT_PYTHON).  Default test data is the sibling repo's
+# examples/harmonics_hi.fft — a 10.0123456789123 Hz fake pulsar, T=1000 s
+# (override with $COHERENT_FFT).  Both paths are machine-specific; re-point them
+# on a new host.
 julia --project=crossval        crossval/crossval_accuracy.jl FILE.fft
 julia --project=crossval -t auto crossval/crossval_speed.jl   FILE.fft
 
@@ -245,6 +256,10 @@ the hot loop. See `Summary_and_Future_Work.md` (§3) for the roadmap.
   scaling culprit and is not.
 - **Next target: Kadane** — whose own first-listed step (cross-profile SIMD on
   the exact scan) is now done, so it is a smaller prize than the write-up assumes.
+  Branch `float32-profiles` (commit `53ca8fc`) narrows the profile stage to
+  `Float32` through a `ProfT`/`CProfT` alias pair at the top of `src/search.jl`
+  — set them back to `Float64`/`ComplexF64` and it is master, which is what
+  makes it cheap to A/B.
   The fully-`Float32` profile stage on the `float32-profiles` branch measured
   **1.05x** here (byte-identical candidates) and was left unmerged as sitting
   inside the ~9% short-run scatter. **That verdict is superseded (2026-08-11):**
