@@ -157,9 +157,21 @@ the hot loop. See `Summary_and_Future_Work.md` (§3) for the roadmap.
   `microbench.jl` (per-bucket timings, both interpolators), `profile_search.jl`
   (warm sampling profile with a bucket-aggregated self-time table),
   `median_bench.jl`, `interp_bench.jl` (interpolator throughput in points/sec vs
-  `m`, grid oversampling and request size, + plots). Run single-threaded (`-t 1`)
+  `m`, grid oversampling and request size, + plots), `thread_scaling.jl`
+  (speedup vs threads against the ideal line and an Amdahl fit, plus the
+  CPU-seconds panel; CSV + PNG). Run single-threaded (`-t 1`)
   for clean profile attribution; warm up before timing to exclude JIT. Example
   FFT for longer runs: `PM0063_034C1_DM445.0_red.fft`.
+- **`bench/thread_scaling.jl` is the standard scaling check** (it replaced the
+  old `scaling.jl`, which timed one thread count per invocation and left the
+  analysis to you). It re-invokes itself as a worker per thread count — Julia
+  fixes `nthreads` at process start — and each worker times only the *warm
+  in-process* `search`. **Excluding start-up is the point:** on the whole-process
+  wall clock the same run scales 6.7x at `-t 20`, and 9.9x once the ~1.4 s fixed
+  cost is out. Measured on master, 20-core workstation, PM0063 at the riptide
+  bench config: 1/2/4/8/16/20 threads → 31.9/18.3/9.4/5.4/3.3/3.2 s, i.e. **9.9x
+  at `-t 20` (49% efficiency), Amdahl `s = 0.059`.** CPU-seconds inflate 63%
+  over the same span, which is the memory-stall term, not a code defect.
 - **Done (2026-07):** quickselect median in `_profile_snr` (was 41% of runtime →
   7.5%) and a type-stable `Workspace{S,B,D}` (killed hot-loop dynamic `mul!`
   dispatch) — together ~1.6× warm single-thread, results unchanged. See §2 of
@@ -256,18 +268,42 @@ the hot loop. See `Summary_and_Future_Work.md` (§3) for the roadmap.
   scaling culprit and is not.
 - **Next target: Kadane** — whose own first-listed step (cross-profile SIMD on
   the exact scan) is now done, so it is a smaller prize than the write-up assumes.
-  Branch `float32-profiles` (commit `53ca8fc`) narrows the profile stage to
-  `Float32` through a `ProfT`/`CProfT` alias pair at the top of `src/search.jl`
-  — set them back to `Float64`/`ComplexF64` and it is master, which is what
-  makes it cheap to A/B.
-  The fully-`Float32` profile stage on the `float32-profiles` branch measured
-  **1.05x** here (byte-identical candidates) and was left unmerged as sitting
-  inside the ~9% short-run scatter. **That verdict is superseded (2026-08-11):**
-  Scott re-measured on his 20-CPU workstation over datasets with runtimes of
-  many minutes each and got **~4% faster on average** — a second machine, and
-  runs long enough that the scatter argument does not apply. Merging it is the
-  expected next piece of performance work.
-  Keep the two Float32 results distinct: the *profile stage* is a ~4-5% win;
+  Branch `float32-profiles` narrows the profile stage to `Float32` through a
+  `ProfT`/`CProfT` alias pair at the top of `src/search.jl` — set them back to
+  `Float64`/`ComplexF64` and it is master, which is what makes it cheap to A/B.
+  Rebased onto master 2026-08-15 (so it has the start-up work); 423/423 tests
+  pass and candidates stay byte-identical to master.
+- **The `Float32` profile stage is a *thread-count-dependent* win, and at `-t 1`
+  it is a loss (2026-08-15).** Both earlier verdicts were right about their own
+  configuration and wrong as generalisations. Interleaved A/B, two git worktrees
+  so neither arm invalidates the other's precompile cache, PM0063 at the riptide
+  bench config plus `--ncands 300 --threshold 6.3`:
+
+  | threads | master | f32 | f32 vs master | master CPU-s | f32 CPU-s |
+  |---|---|---|---|---|---|
+  | 1 | 31.1 s | 35.2 s | **0.88x** | 30.6 | 34.7 |
+  | 2 | 18.4 s | 19.9 s | 0.93x | 33.6 | 37.0 |
+  | 4 | 11.1 s | 11.1 s | 1.00x | 37.3 | 37.4 |
+  | 8 | 6.99 s | 6.80 s | 1.03x | 42.3 | 40.9 |
+  | 16 | 5.10 s | 4.49 s | **1.14x** | 51.4 | 45.0 |
+  | 20 | 4.64 s | 4.28 s | 1.08x | 55.5 | 47.7 |
+
+  The CPU-seconds give the mechanism: `Float32` does **13% more** CPU work at
+  `-t 1`, and wins only by *stalling less* once cores contend for bandwidth —
+  master's CPU-seconds inflate 81% from 1→20 threads, f32's only 37%. Crossover
+  is ~4 threads. Scott's `-t 8` NGC6624 runs (227 → 217.5 s, 4.2%, distributions
+  non-overlapping) sit exactly on this curve, as does the original laptop 1.05x
+  at `-t 4`. So it is not a scatter artefact and never was — it is a different
+  point on a curve nobody had swept.
+- **Which makes the merge decision depend on how searches are actually
+  deployed.** A production search over many DMs usually gets its parallelism for
+  free by running one *single-threaded* process per DM, in which case throughput
+  is governed by `-t 1` CPU-seconds — where `Float32` is 13% **worse**. Do not
+  merge `float32-profiles` on the strength of the threaded number alone; decide
+  the deployment model first (see §3 of `Summary_and_Future_Work.md`). The open
+  optimisation is to find and remove f32's extra `-t 1` CPU cost, which would
+  make it a win on both axes.
+  Keep the two Float32 results distinct: the *profile stage* is the above;
   adding Float32 to the *interpolation* on top was 7% *slower* than master and
   is still not understood (CPU/`m=16`-specific; revisit for a GPU port).
 - **Measurements in these docs are pinned to the config current when taken —

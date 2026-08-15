@@ -706,10 +706,12 @@ oversampling at high harmonics became visible in the first place.
   now had its second pass: **cross-profile SIMD batching (2026-08-09) took the
   gate 2.77x and the whole search 1.26x** with a byte-identical candidate file
   (see §2). What that leaves on the metric side, in order:
-  - *Fully `Float32` profile stage* — a further 1.46x on the metric kernel plus a
-    cut to the 12.9% FFTW bucket, at the price of moving reported metrics by
-    ~3e-7 and loosening the `align=false` pins from machine precision to ~1e-6.
-    Measured, deliberately not taken; see §2.
+  - *Fully `Float32` profile stage* — implemented on `float32-profiles`, rebased
+    onto master 2026-08-15, and now **swept over thread count, which is what the
+    contradictory earlier verdicts were missing** (§3.1 below). It is 0.88x at
+    `-t 1` and 1.14x at `-t 16`; the accuracy price is unchanged (reported
+    metrics move ~3e-7, `align=false` pins loosen from machine precision to
+    ~1e-6). Still unmerged, now for a different and better-understood reason.
   - ***`_block_sigma`* — done (2026-08-09), 2.90x (839 → 289 µs/chunk), 1.08x
     end-to-end, bit-identical. Almost all of it was branch misprediction in the
     quickselect, not the integer division the first diagnosis blamed. See §2.
@@ -729,6 +731,53 @@ oversampling at high harmonics became visible in the first place.
   - *`fftlen` sizing* — reopened, re-measured in situ, and re-rejected; `:pow2`
     stays the default but for different reasons than originally recorded. See §2.
     Tiling a chunk into smaller overlapping transforms remains unmotivated.
+
+### 3.1 Thread scaling, and the deployment model that decides what to optimise
+
+`bench/thread_scaling.jl` is the standard measurement: it re-invokes itself once
+per thread count (Julia fixes `nthreads` at process start), times only the *warm
+in-process* `search`, fits Amdahl, and plots speedup against the ideal line
+alongside a CPU-seconds panel. Excluding start-up matters — the same run scales
+6.7x at `-t 20` on whole-process wall clock and 9.9x with the ~1.4 s fixed cost
+removed.
+
+Master, 20-core workstation, PM0063 at the riptide bench config
+(`--ncands 300 --threshold 6.3`), medians of 3:
+
+| threads | 1 | 2 | 4 | 8 | 16 | 20 |
+|---|---|---|---|---|---|---|
+| wall (s) | 31.9 | 18.3 | 9.4 | 5.4 | 3.3 | 3.2 |
+| speedup | 1.00 | 1.74 | 3.39 | 5.95 | 9.59 | 9.88 |
+| CPU-s | 31.7 | 36.3 | 36.8 | 41.5 | 48.0 | 51.8 |
+
+**9.88x at `-t 20` (49% efficiency), Amdahl `s = 0.059`.** The efficiency loss is
+not serial-fraction-shaped so much as bandwidth-shaped: CPU-seconds for
+*identical work* inflate 63% across the sweep, and the `float32-profiles` branch
+— which changes nothing but the width of the profile arrays — reaches **13.6x
+(68%)** with only 34% CPU inflation. The parallel decomposition is fine; the
+memory system is the limit.
+
+**But thread scaling may be the wrong axis for production.** A real search runs
+over many DMs, and that parallelism is usually taken by scheduling one
+*single-threaded* process per DM, one per core. Under that model the figure that
+governs throughput is **`-t 1` CPU-seconds**, and the whole speedup curve above
+is irrelevant — every core is already busy with its own DM. The two models rank
+optimisations differently, and `Float32` is the case in point: 1.14x at `-t 16`,
+0.88x at `-t 1`. Committing to one would be premature; what is *not* premature is
+recording that the choice exists, because several past decisions here were made
+against an unstated assumption of multi-threaded deployment.
+
+Open question, and the natural next piece of work: **how should large-scale
+searches actually be driven?** The candidates are (a) one single-threaded
+process per DM, maximising throughput and letting the batch scheduler handle
+parallelism; (b) one multi-threaded process per DM, minimising latency per DM
+and amortising start-up; (c) the existing multi-file mode, which already shares
+`SearchCache` (hplans + workspaces) across files in one invocation and costs
+~1.2 s marginal per file against ~15 s for a separate invocation — but which
+currently shares that cache across *files*, not across DMs of the same file, and
+whose `dplans` are per-file because they depend on `r_lo`. (c) is the least
+explored and probably the most interesting, since DMs of one observation share
+`T`, `N`, and hence the entire plan structure.
 
 - **Kadane's algorithm as a fast (approximate) boxcar metric — to investigate.**
   The boxcar width×phase scan is now the single largest bucket (44.6%), and it is

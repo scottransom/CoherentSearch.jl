@@ -31,3 +31,6 @@ oracle.json
 # interp_bench.jl output (regenerate with `julia --project=bench bench/interp_bench.jl`)
 /bench/interp_bench_*.png
 /bench/interp_bench.csv
+# thread_scaling.jl output (regenerate with `julia --project=bench bench/thread_scaling.jl`)
+/bench/thread_scaling.csv
+/bench/thread_scaling.png
