@@ -767,6 +767,51 @@ optimisations differently, and `Float32` is the case in point: 1.14x at `-t 16`,
 recording that the choice exists, because several past decisions here were made
 against an unstated assumption of multi-threaded deployment.
 
+#### Where Float32's extra `-t 1` cost actually is (2026-08-15)
+
+Profiled both arms at `-t 1` over the *same* band the A/B used. **Note the
+default profiling band does not reproduce the regression**: `profile_search.jl`
+starts at 5 Hz, and over 5–30 Hz the two arms are within 0.6% of each other. The
+A/B band starts at 0.1 Hz, where red noise floods candidates past the gate and
+the exact-median rescue path actually runs. Profile the band you benchmarked.
+
+Absolute samples over 0.1–33.3 Hz:
+
+| bucket | master | f32 | Δ |
+|---|---|---|---|
+| boxcar-gate (batched) | 23990 | 23869 | −0.5% |
+| interp (direct O(m)) | 14835 | 16105 | **+8.6%** |
+| FFTW (batched brfft) | 12149 | 13660 | **+12.4%** |
+| decim (gather) | 9509 | 8869 | −6.7% |
+| median-select | 3710 | 4250 | +14.6% |
+| block-sigma | 1093 | 540 | −50.6% |
+| boxcar-metric | 825 | 1351 | +63.8% |
+
+`Float32` wins where expected — `_block_sigma` halves, the gate and the decim
+gather improve — and loses in two places that need explaining:
+
+- **interp is not a failed SIMD widening.** `src/directinterp.jl` is *byte
+  identical* between the arms: `W` is `Matrix{Float64}`, the `re`/`im` planes are
+  already `Float32` on master, and `sre`/`sim` accumulate in `Float64`. The only
+  change is the destination — `ftprofs[hrow,k] = A[p]*complex(sre,sim)` now
+  narrows into a `ComplexF32` matrix. So this is a store-side effect in an
+  otherwise unchanged loop, and *widening the `m`-sum to 8 lanes was never part
+  of this branch.* (That separate experiment is the 7%-slower one, and the reason
+  is that at `m=16` the `m`-sum is only ~23% of interp cost while the horizontal
+  reduce — paid once per trial — gets a shuffle stage deeper at 8 lanes.)
+- **FFTW is not the transform getting slower.** Timed on its own, the batched
+  `brfft` at `(61, 2048) -> (120, 2048)` is **422 µs in `Float32` vs 483 µs in
+  `Float64`, i.e. 1.14x *faster*** — the opposite sign to the in-situ bucket. So
+  the cost is an interaction, not the kernel, and optimising the transform would
+  be aimed at the wrong thing. **This is the third time an isolated benchmark has
+  failed to predict this workload** (smooth `fftlen`, `_block_sigma`'s `idiv`,
+  now this); the standing lesson applies — split the phases *in situ*.
+
+Next step is to split the chunk fill into "interp writes `ftprofs`" and "brfft
+reads `ftprofs`" with separate timers, since both regressions sit on the same
+array and a single cause (the narrowed strided scatter leaving the array in a
+state the transform reads back more slowly) would explain both.
+
 Open question, and the natural next piece of work: **how should large-scale
 searches actually be driven?** The candidates are (a) one single-threaded
 process per DM, maximising throughput and letting the batch scheduler handle

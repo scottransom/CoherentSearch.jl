@@ -300,9 +300,18 @@ the hot loop. See `Summary_and_Future_Work.md` (§3) for the roadmap.
   free by running one *single-threaded* process per DM, in which case throughput
   is governed by `-t 1` CPU-seconds — where `Float32` is 13% **worse**. Do not
   merge `float32-profiles` on the strength of the threaded number alone; decide
-  the deployment model first (see §3 of `Summary_and_Future_Work.md`). The open
+  the deployment model first (see §3.1 of `Summary_and_Future_Work.md`). The open
   optimisation is to find and remove f32's extra `-t 1` CPU cost, which would
-  make it a win on both axes.
+  make it a win on both axes. Diagnosed so far (§3.1): it is **not** the
+  transform (the `Float32` batched `brfft` is 1.14x *faster* timed alone) and
+  **not** a failed SIMD widening (`src/directinterp.jl` is byte-identical between
+  the arms — the `m`-sum is `Float64` on both). Both regressions sit on
+  `ftprofs`, whose store narrowed to `ComplexF32`.
+- **Profile the band you benchmarked.** `bench/profile_search.jl` defaults to
+  5–30 Hz, and over that band the two Float32 arms differ by 0.6% — the whole
+  effect lives below 5 Hz, where red noise pushes trials past the boxcar gate
+  into the exact-median rescan. Pass `FILE.fft 33.3333 0.1` to match the riptide
+  bench config.
   Keep the two Float32 results distinct: the *profile stage* is the above;
   adding Float32 to the *interpolation* on top was 7% *slower* than master and
   is still not understood (CPU/`m=16`-specific; revisit for a GPU port).
