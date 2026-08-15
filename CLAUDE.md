@@ -238,6 +238,39 @@ the hot loop. See `Summary_and_Future_Work.md` (§3) for the roadmap.
   **The biggest single fixed cost left is plotting, which is on by default:**
   `using CairoMakie` alone is 9.0 s. Plotting is now deferred to one pass after
   all searches, so a batch pays it once, and bulk runs should use `--noplot`.
+- **`SearchCache` is already DM-safe — glob a whole DM range into one
+  invocation** (`... NGC6624_16L_DM??.??_red.fft`). `_plans!` keys reuse on
+  `cache.params === params && cache.Nprof == Nprof` and **never consults the
+  file**, so hplans and the `FFTW.MEASURE` workspaces are shared across any file
+  list. A dedispersion plan gives neighbouring DMs identical `N` and `dt`, hence
+  identical `T`, `r_lo = lofreq*T` and Nyquist — only the noise values differ —
+  so the `dplans` caveat above is vacuous across such a group *and* immaterial
+  anyway: `build_direct_plans` is **0.29 ms** at nharms=60. Measured on ten
+  NGC6624 `16L` DMs (T=26459 s), narrow band, `-t 8`: 1 file 2.91 s, 10 files
+  **12.88 s = 1.11 s marginal each**, against 29.1 s for ten separate
+  invocations (2.3x).
+- **Mixing files with *different* `N`/`dt` in one invocation is also correct, and
+  needs no guard.** Everything cached is a pure function of `(params, Nprof)`:
+  `build_harmonic_plans` never sees the file, and `direct_window_size` is
+  `ceil((Nprof-1)*hidr) + m + 4`. Everything file-scaled — `r_lo = lofreq*ft.T`,
+  `dplans`, the trial ranges, the `Nhalf = ft.N÷2` Nyquist guard — is recomputed
+  per `search` call. **Verified, not just read:** one invocation over PM0063
+  (T=2097 s) and NGC6624 (T=26459 s), a 12.6x span, produces `.cohout` files
+  byte-identical to running each alone. So a heterogeneous glob costs 0.29 ms
+  extra per file, not a cache rebuild — do not add a warning saying otherwise.
+- **The genuinely silent case is Nyquist, not the cache.** When a harmonic runs
+  past `ft.N÷2`, `fill_harmonic_row_direct!` returns early and leaves that row of
+  `ftprofs` **zero** — no error, no warning. That is deliberate (it is how the
+  search degrades at the top of the band), but it means a band chosen for a
+  finely-sampled file will quietly lose harmonics on a coarser-sampled one in the
+  same glob. If a diagnostic is ever wanted for mixed-`dt` runs, this is where it
+  belongs.
+- **But use `--noplot` for such a run, for a second reason beyond CairoMakie's
+  9 s.** With plotting on, `main`'s deferral pushes `(ft, cands, stem)` into
+  `toplot` and plots only after every search, so **every input's mmap stays live
+  to the end of the run** — 50 NGC6624 files is 69 GB of mmap pinned at once
+  (`FFTFile` mmaps the whole `.fft`; `src/fileio.jl`). With `--noplot` each `ft`
+  is collectable as its iteration ends.
 - **The PackageCompiler sysimage (`sysimage/`) is worth it *only* for plotting
   runs — this was projected as the big win and measured as almost nothing.**
   Warm: `--noplot` 2.3 s with it vs 2.4 s without (nothing — the precompile

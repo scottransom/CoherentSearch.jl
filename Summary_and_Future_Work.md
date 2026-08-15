@@ -820,9 +820,46 @@ and amortising start-up; (c) the existing multi-file mode, which already shares
 `SearchCache` (hplans + workspaces) across files in one invocation and costs
 ~1.2 s marginal per file against ~15 s for a separate invocation — but which
 currently shares that cache across *files*, not across DMs of the same file, and
-whose `dplans` are per-file because they depend on `r_lo`. (c) is the least
-explored and probably the most interesting, since DMs of one observation share
-`T`, `N`, and hence the entire plan structure.
+whose `dplans` are per-file because they depend on `r_lo`.
+
+**(c) turns out to need no work at all — it already spans DMs.** `_plans!` keys
+cache reuse on `cache.params === params && cache.Nprof == Nprof` and never
+consults the file, so `hplans` and the `FFTW.MEASURE` workspaces are shared
+across an arbitrary file list. And the `dplans` caveat is vacuous over a
+dedispersion plan: neighbouring DMs are sums of the same channels with different
+delays, so they share `N` and `dt` exactly — only the per-sample noise differs —
+which makes `T`, `r_lo = lofreq*T`, the bin spacing and Nyquist identical, and
+therefore `dplans` identical too. It is immaterial regardless:
+`build_direct_plans` is 0.29 ms at `nharms=60`, against a ~1.1 s marginal
+per-file cost. Measured over ten NGC6624 `16L` DMs (T=26459 s), narrow band,
+`-t 8`: 1 file 2.91 s, 10 files 12.88 s (1.11 s marginal each) versus 29.1 s as
+ten invocations — 2.3x. So `coherent_search.jl ...DM??.??_red.fft` over a whole
+DM range is the supported path today.
+
+**Nor does it need the files to match.** Everything cached is a pure function of
+`(params, Nprof)` — `build_harmonic_plans` never sees the file, and
+`direct_window_size` is `ceil((Nprof-1)*hidr) + m + 4` — while everything
+file-scaled (`r_lo`, `dplans`, the trial ranges, the `ft.N÷2` Nyquist guard) is
+recomputed per `search` call. A single invocation over PM0063 (T=2097 s) and
+NGC6624 (T=26459 s), a 12.6x span in `T`, writes `.cohout` files byte-identical
+to running each alone. So mixed `N`/`dt` is correct and costs 0.29 ms per file,
+not a cache rebuild; a warning claiming the cache must be rebuilt would be wrong.
+
+The silent hazard in a heterogeneous glob is elsewhere: when a harmonic passes
+`ft.N÷2`, `fill_harmonic_row_direct!` returns early leaving that row of
+`ftprofs` zero, with no error or warning. That is deliberate — it is how the
+search degrades at the top of the band — but a band chosen for a finely-sampled
+file will quietly lose harmonics on a coarser-sampled one. A mixed-`dt`
+diagnostic, if ever wanted, belongs there rather than on the cache.
+
+One caveat for that mode, and it is not the obvious one: **pass `--noplot`.**
+Beyond CairoMakie's 9 s load, `main` defers plotting to a pass after every
+search, holding `(ft, cands, stem)` in `toplot` — so each input's mmap stays
+live for the whole run. At 50 NGC6624 files that pins 69 GB of mmap at once.
+With `--noplot` each `FFTFile` becomes collectable as its iteration ends.
+
+That leaves (a) versus (b) as the real open question, and it is the same
+`-t 1`-versus-threaded axis that decides the `Float32` merge.
 
 - **Kadane's algorithm as a fast (approximate) boxcar metric — to investigate.**
   The boxcar width×phase scan is now the single largest bucket (44.6%), and it is
