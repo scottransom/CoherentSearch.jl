@@ -281,14 +281,17 @@ the hot loop. See `Summary_and_Future_Work.md` (§3) for the roadmap.
   warm) — an occasional single search is *slower* with it than without.
   Do not use it while editing `src/`: a sysimage freezes the code it was built
   from and will silently run the old search.
-- **Thread scaling cannot be measured on this laptop — use the workstation.**
-  At the riptide bench config, `-t 1/2/4/8` gave 29.8/19.7/15.8/15.1 s: only
-  1.88x from 4 threads. That is the machine, not the code. CPU-seconds for
-  *identical work* inflate 30 → 38 → 54 → 82 s, and the clock falls 2400 MHz
-  (`-t 1`) → 1800 MHz (`-t 4`, exactly the i7-10510U base) on 4 physical cores
-  that also carry the desktop's own ~2 cores of load. Clock-normalised, 4
-  threads deliver ~2.6x (~66% efficiency). **Measure CPU-seconds and the clock
-  before blaming the code for poor scaling.**
+- **Thread scaling cannot be measured on the laptop — use the workstation
+  (which is where it has now been measured; see `bench/thread_scaling.jl`
+  above, 9.9x at `-t 20`).** On the laptop, at the riptide bench config,
+  `-t 1/2/4/8` gave 29.8/19.7/15.8/15.1 s: only 1.88x from 4 threads. That was
+  the machine, not the code. CPU-seconds for *identical work* inflate
+  30 → 38 → 54 → 82 s, and the clock falls 2400 MHz (`-t 1`) → 1800 MHz
+  (`-t 4`, exactly the i7-10510U base) on 4 physical cores that also carry the
+  desktop's own ~2 cores of load. Clock-normalised, 4 threads deliver ~2.6x
+  (~66% efficiency). **Measure CPU-seconds and the clock before blaming the code
+  for poor scaling** — the workstation numbers make the same point in the other
+  direction, since its CPU-seconds still inflate 63% across the sweep.
 - **Chunk→thread assignment is whole-chunk round-robin** (`c = t; c += nt` in
   `_search_region!`), never per-trial, which is what lets
   `fill_harmonic_row_direct!` load each harmonic's bin window *once per chunk*
