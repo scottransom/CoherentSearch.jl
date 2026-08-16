@@ -28,6 +28,85 @@ using Base.Threads: @spawn, nthreads, Atomic, atomic_add!
 using LinearAlgebra: mul!
 using Printf: @printf
 
+# ---------------------------------------------------------------------------
+# In-situ phase timers.
+#
+# Three separate optimisation calls in this project have been decided by an
+# *isolated* micro-benchmark and turned out backwards in the real search (smooth
+# `fftlen`, `_block_sigma`'s `idiv`, the `Float32` batched `brfft`).  The fix is
+# to time the phases where they actually run, so this is a permanent, always-on
+# facility rather than a temporary patch.
+#
+# Granularity is one `time_ns()` pair per phase per chunk (per `(chunk, k)` for
+# the decimation phases), i.e. ~2 µs of clock reads against ~7 ms of work — 0.03%,
+# below the run-to-run scatter and independent of `nharms`/`Nprof`.  Accumulators
+# are per-thread, `_PHASE_STRIDE` apart so no two threads share a cache line.
+# ---------------------------------------------------------------------------
+
+const PHASE_NAMES = ("interp", "brfft", "block-sigma", "gate+metric", "cand-loop",
+                     "zero-ftprofs", "decim-brfft", "decim-metric", "decim-cand-loop",
+                     # Slots 10.. break `decim-brfft` out by decimation factor, so a
+                     # cost that belongs to one transform size is not read as a
+                     # property of "the decimated transform" in general.
+                     "decim-brfft-k2", "decim-brfft-k3", "decim-brfft-k4",
+                     "decim-brfft-k5", "decim-brfft-k6", "decim-brfft-k7+")
+const _NPHASE = length(PHASE_NAMES)
+# Slot for decimation factor `k`: 10 for k=2 … 15 for k≥7.
+@inline _decim_brfft_slot(k::Integer) = 8 + min(Int(k), 7)
+const _PHASE_STRIDE = 24          # ≥ _NPHASE, and 24*8 B spans whole cache lines
+const _PHASE_MAXTHREADS = 512
+const _PHASE_NS = zeros(Int64, _PHASE_STRIDE, _PHASE_MAXTHREADS)
+
+# Time `expr` into phase `i` of the calling thread's slot.  `Threads.threadid()`
+# is used only as an accumulator index — never to key correctness-bearing state —
+# so a task migrating between threads merely splits its time across two slots.
+macro phase(i, expr)
+    quote
+        local _t0 = time_ns()
+        local _v = $(esc(expr))
+        local _tid = Threads.threadid()
+        @inbounds _PHASE_NS[$(esc(i)), _tid] += (time_ns() - _t0) % Int64
+        _v
+    end
+end
+
+"""
+    phase_reset!()
+
+Zero the [`phase_times`](@ref) accumulators.  Call before a timed search.
+"""
+phase_reset!() = (fill!(_PHASE_NS, 0); nothing)
+
+"""
+    phase_times() -> Vector{Pair{String,Float64}}
+
+Accumulated seconds per hot-loop phase since the last [`phase_reset!`](@ref),
+summed over threads and sorted by cost.  These are *CPU* seconds (each thread's
+own clock), so under `-t N` they sum to roughly `N ×` the wall time of the
+parallel region.
+"""
+function phase_times()
+    tot = [sum(@view _PHASE_NS[i, :]) * 1e-9 for i in 1:_NPHASE]
+    return sort([PHASE_NAMES[i] => tot[i] for i in 1:_NPHASE]; by = p -> -p.second)
+end
+
+# ---------------------------------------------------------------------------
+# Precision of the *profile stage* — the stacked harmonic amplitudes
+# (`ftprofs`), the batched inverse transform, and the folded profiles the
+# detection metric reads.
+#
+# This is a *runtime* choice (`SearchParams.precision`), carried as the type
+# parameter `P` of `Workspace{…,P}` / `DecimBuf{…,P}` so that both widths are
+# compiled into one build.  That is deliberate: the two are close enough in
+# wall-clock that A/B-ing them across separate builds is dominated by Julia's
+# precompile cache (see the `ab-benchmark-worktrees` note), whereas in-process
+# they alternate under identical conditions.
+#
+# Everything downstream of the metric — the reported metric, candidate
+# frequencies, `MetricNorm`, the histograms — stays `Float64`.  Only the bulk
+# arrays that FFTW and the metric stream through are narrowed.
+# ---------------------------------------------------------------------------
+
 """
     SearchParams
 
@@ -79,6 +158,19 @@ Base.@kwdef struct SearchParams
     decimations::Vector{Int} = [1]  # harmonic-decimation factors k (see decimation_design.md)
     interp::Symbol = :direct  # :direct (exact O(m) summation) or :fft (FFT-correlation + linear interp)
     fftsizing::Symbol = :pow2  # :fft interpolation length rounding — :pow2 or :smooth (2·3·5·7)
+    precision::Symbol = :f64   # profile-stage element type — :f64 or :f32 (see `proftype`)
+end
+
+"""
+    proftype(params) -> Type{<:AbstractFloat}
+
+Element type of the profile stage for `params.precision` (`:f64` or `:f32`); see
+the precision note above [`SearchParams`](@ref).
+"""
+@inline function proftype(params::SearchParams)
+    params.precision === :f64 && return Float64
+    params.precision === :f32 && return Float32
+    throw(ArgumentError("precision must be :f64 or :f32, got $(params.precision)"))
 end
 
 """
@@ -237,7 +329,7 @@ Exact median of `v[1:n]` (partially reorders `v`, which must be scratch).  For
 even `n` (the search always has `n = 2*nharms`) it is the mean of the two central
 order statistics; for odd `n`, the middle one.  Same value a full sort yields.
 """
-@inline function _median!(v::AbstractVector{Float64}, n::Int)
+@inline function _median!(v::AbstractVector{T}, n::Int) where {T<:AbstractFloat}
     half = n >>> 1
     _select!(v, 1, n, half + 1)               # upper-median order stat at v[half+1]
     isodd(n) && return @inbounds v[half + 1]
@@ -246,7 +338,7 @@ order statistics; for odd `n`, the middle one.  Same value a full sort yields.
     @inbounds for i in 2:half
         v[i] > lower && (lower = v[i])
     end
-    return 0.5 * (lower + upper)
+    return T(0.5) * (lower + upper)
 end
 
 # --- Branchless sorting-network median for short profiles ------------------
@@ -286,7 +378,7 @@ end
 
 # Median of `v[1:n]` via a precomputed compare-exchange network (branchless
 # min/max), then the central order statistic(s).  Same value as `_median!`.
-@inline function _median_net!(v::AbstractVector{Float64}, pairs::Vector{Tuple{Int,Int}}, n::Int)
+@inline function _median_net!(v::AbstractVector{T}, pairs::Vector{Tuple{Int,Int}}, n::Int) where {T<:AbstractFloat}
     @inbounds for (a, b) in pairs
         x = v[a]; y = v[b]
         v[a] = ifelse(x < y, x, y)                 # min
@@ -294,12 +386,12 @@ end
     end
     half = n >>> 1
     isodd(n) && return @inbounds v[half + 1]
-    return @inbounds 0.5 * (v[half] + v[half + 1])
+    return @inbounds T(0.5) * (v[half] + v[half + 1])
 end
 
 # Per-profile baseline median: network for short profiles (`pairs` non-empty),
 # quickselect otherwise.  `pairs` is chosen once per pass from `nbins`.
-@inline _baseline_median!(v::AbstractVector{Float64}, n::Int, pairs::Vector{Tuple{Int,Int}}) =
+@inline _baseline_median!(v::AbstractVector{<:AbstractFloat}, n::Int, pairs::Vector{Tuple{Int,Int}}) =
     isempty(pairs) ? _median!(v, n) : _median_net!(v, pairs, n)
 
 # Shared empty network for the reference/public paths (they use quickselect).
@@ -342,14 +434,15 @@ unnormalised `brfft` used in the hot loop.  The median, argmax, on-pulse set,
 and width are all scale-invariant, so only the linear `signal` term needs
 `scale` — which is why the fast path can skip the irfft normalisation entirely.
 """
-@inline function _profile_snr(profs::AbstractMatrix{Float64}, j::Integer,
-                              medbuf::Vector{Float64}, nbins::Int, invrms::Float64,
-                              scale::Float64, xsignal::Float64, metric::Symbol, pexp::Float64)
+@inline function _profile_snr(profs::AbstractMatrix{T}, j::Integer,
+                              medbuf::Vector{T}, nbins::Int, invrms::Float64,
+                              scale::Float64, xsignal::Float64, metric::Symbol,
+                              pexp::Float64) where {T<:AbstractFloat}
     col = @view profs[:, j]
     half = nbins >>> 1                           # nbins is even (= 2*nharms)
     # One fused pass: copy the column into the median scratch AND find the peak
     # (first-max tie-break, as np.argmax), instead of a separate copyto! + scan.
-    mx = -Inf; mxind = 1
+    mx = T(-Inf); mxind = 1
     @inbounds for k in 1:nbins
         v = col[k]
         medbuf[k] = v
@@ -359,14 +452,14 @@ and width are all scale-invariant, so only the linear `signal` term needs
     end
     med = _median!(medbuf, nbins)                # quickselect (see _median!)
     peak = mx - med                              # peak height over the baseline
-    sig_thr = med + xsignal * peak               # on-pulse level
+    sig_thr = med + T(xsignal) * peak               # on-pulse level
 
     signal = 0.0
     non = 0
     sumsq = 0.0
     @inbounds for k in 1:nbins
         col[k] > sig_thr || continue             # restrict to the on-pulse set
-        signal += col[k] - med
+        signal += Float64(col[k] - med)
         non += 1
         d = mxind - k
         d >  half && (d -= nbins)                # wrap to the nearest periodic image
@@ -433,14 +526,14 @@ The subsample indices depend only on `(nbins, n)`, and `M` enters only through t
 ratio the caller forms (`excess/σ`), so the unnormalised `brfft` and normalised
 `irfft` paths yield the identical scale-free S/N (the `align=false` pin holds).
 """
-function _block_sigma(M::AbstractMatrix{Float64}, nbins::Int, n::Int, buf::Vector{Float64})
+function _block_sigma(M::AbstractMatrix{T}, nbins::Int, n::Int, buf::Vector{T}) where {T<:AbstractFloat}
     # The linear indexing below is only the intended (i, j) if the profile axis is
     # exactly `M`'s first dimension — cheap to check once per block, and a silent
     # wrong σ̂ (hence a silently wrong metric everywhere) if it ever stops holding.
     size(M, 1) == nbins ||
         throw(DimensionMismatch("_block_sigma: size(M,1)=$(size(M,1)) != nbins=$nbins"))
     N = nbins * n
-    N == 0 && return 0.0
+    N == 0 && return zero(T)
     cap = length(buf)
     ns = 0
     # `M` is column-major with `size(M, 1) == nbins`, so the (i, j) this used to
@@ -466,15 +559,15 @@ function _block_sigma(M::AbstractMatrix{Float64}, nbins::Int, n::Int, buf::Vecto
     @inbounds for t in 1:ns
         buf[t] = abs(buf[t] - med)                # MAD over the same multiset (order irrelevant)
     end
-    return 1.4826 * _median!(buf, ns)
+    return T(1.4826) * _median!(buf, ns)
 end
 
 # Prefix sum of the profile column minus a scalar baseline `b`, tiled by one extra
 # `wmax` samples so a boxcar that wraps past bin `nbins` reads real (wrapped) data:
 # boxcar sum of bins p..p+w-1 (1-based) = psum[p+w] - psum[p].
-@inline function _boxcar_psum!(psum::Vector{Float64}, col::AbstractVector{Float64},
-                               nbins::Int, wmax::Int, b::Float64)
-    psum[1] = 0.0
+@inline function _boxcar_psum!(psum::Vector{T}, col::AbstractVector{T},
+                               nbins::Int, wmax::Int, b::T) where {T<:AbstractFloat}
+    psum[1] = zero(T)
     @inbounds for i in 1:(nbins + wmax)
         idx = i > nbins ? i - nbins : i
         psum[i + 1] = psum[i] + (col[idx] - b)
@@ -486,11 +579,11 @@ end
 # pure max-reduction over the strided prefix-sum difference `psum[p+w] - psum[p]`
 # (two contiguous, `w`-shifted loads), which `@simd` vectorises; pulling `invsw`
 # out of the inner loop returns the identical `Float64`.
-@inline function _boxcar_scan(psum::Vector{Float64}, widths::Vector{Int},
-                              nbins::Int, invsigma::Float64)
-    best = -Inf
+@inline function _boxcar_scan(psum::Vector{T}, widths::Vector{Int},
+                              nbins::Int, invsigma::T) where {T<:AbstractFloat}
+    best = T(-Inf)
     @inbounds for w in widths
-        invsw = invsigma / sqrt(float(w))
+        invsw = invsigma / sqrt(T(w))
         m = psum[1 + w] - psum[1]                  # finite seed (no -Inf in the reduction)
         @simd for p in 2:nbins
             m = max(m, psum[p + w] - psum[p])
@@ -608,7 +701,7 @@ end
 # to the tile's eltype.  The read is column-contiguous and the tile is tens of KB
 # (15 KB at B=32, nbins=120), so it is still L1/L2-resident for the scan that
 # follows.  ~20% of the batched gate, and the price of admission for the rest.
-@inline function _bc_transpose!(tile::Vector{T}, profs::AbstractMatrix{Float64},
+@inline function _bc_transpose!(tile::Vector{T}, profs::AbstractMatrix{<:AbstractFloat},
                                 j0::Int, nbins::Int, ::Val{B}) where {T,B}
     @inbounds for i in 1:nbins
         o = (i - 1) * B
@@ -663,9 +756,9 @@ end
 # Zero-baseline gate for every column `1:n`, into `bb.mvals`.  Full `B`-tiles go
 # through the batched kernel; the `< B` leftover columns take the scalar one
 # (both are valid lower bounds, which is all the gate needs).
-function _boxcar_gate!(bb::BoxcarBatch{T}, profs::AbstractMatrix{Float64}, n::Int,
-                       psum::Vector{Float64}, widths::Vector{Int}, nbins::Int,
-                       invsigma::Float64) where {T}
+function _boxcar_gate!(bb::BoxcarBatch{T}, profs::AbstractMatrix{P}, n::Int,
+                       psum::Vector{P}, widths::Vector{Int}, nbins::Int,
+                       invsigma::P) where {T,P<:AbstractFloat}
     B = _BC_BATCH
     vb = Val(B)
     invsig_t = T(invsigma)
@@ -682,8 +775,8 @@ function _boxcar_gate!(bb::BoxcarBatch{T}, profs::AbstractMatrix{Float64}, n::In
     wmax = widths[end]
     @inbounds for j in (j0 + 1):n
         col = @view profs[:, j]
-        _boxcar_psum!(psum, col, nbins, wmax, 0.0)
-        mvals[j] = _boxcar_scan(psum, widths, nbins, invsigma)
+        _boxcar_psum!(psum, col, nbins, wmax, zero(P))
+        mvals[j] = Float64(_boxcar_scan(psum, widths, nbins, invsigma))
     end
     return mvals
 end
@@ -704,22 +797,22 @@ Identical results to a per-column `_profile_boxcar` loop for every trial that ca
 become a candidate; see the section comment above for why the `Float32` gate
 cannot move that set.
 """
-function boxcar_metrics!(bb::BoxcarBatch, profs::AbstractMatrix{Float64}, n::Int,
-                         medbuf::Vector{Float64}, psum::Vector{Float64},
-                         widths::Vector{Int}, nbins::Int, invsigma::Float64,
-                         medpairs::Vector{Tuple{Int,Int}}, medcut::Float64)
+function boxcar_metrics!(bb::BoxcarBatch, profs::AbstractMatrix{P}, n::Int,
+                         medbuf::Vector{P}, psum::Vector{P},
+                         widths::Vector{Int}, nbins::Int, invsigma::P,
+                         medpairs::Vector{Tuple{Int,Int}}, medcut::Float64) where {P<:AbstractFloat}
     mvals = bb.mvals
     if medcut == -Inf || invsigma <= 0
         @inbounds for j in 1:n
-            mvals[j] = _profile_boxcar(profs, j, medbuf, psum, widths, nbins,
-                                       invsigma, medpairs)
+            mvals[j] = Float64(_profile_boxcar(profs, j, medbuf, psum, widths, nbins,
+                                               invsigma, medpairs))
         end
         return mvals
     end
     _boxcar_gate!(bb, profs, n, psum, widths, nbins, invsigma)
     @inbounds for j in 1:n
         mvals[j] < medcut && continue         # cannot reach threshold: keep the bound
-        mvals[j] = _boxcar_exact(profs, j, medbuf, psum, widths, nbins, invsigma, medpairs)
+        mvals[j] = Float64(_boxcar_exact(profs, j, medbuf, psum, widths, nbins, invsigma, medpairs))
     end
     return mvals
 end
@@ -754,17 +847,17 @@ the candidate list is unchanged provided `boxcar_medmargin ≥ |med|·√wₘₐ
 `medcut = -∞` (the default, and the metricstats/normalize/reference paths) always
 computes the exact median.
 """
-@inline function _profile_boxcar(profs::AbstractMatrix{Float64}, j::Integer,
-                                 medbuf::Vector{Float64}, psum::Vector{Float64},
-                                 widths::Vector{Int}, nbins::Int, invsigma::Float64,
+@inline function _profile_boxcar(profs::AbstractMatrix{T}, j::Integer,
+                                 medbuf::Vector{T}, psum::Vector{T},
+                                 widths::Vector{Int}, nbins::Int, invsigma::T,
                                  medpairs::Vector{Tuple{Int,Int}}=_NO_MEDPAIRS,
-                                 medcut::Float64=-Inf)
-    invsigma > 0 || return 0.0                    # degenerate (flat block): no detection
+                                 medcut::Float64=-Inf) where {T<:AbstractFloat}
+    invsigma > 0 || return zero(T)                # degenerate (flat block): no detection
     if medcut > -Inf                              # fast gate: cheap zero-baseline scan first
         col = @view profs[:, j]
-        _boxcar_psum!(psum, col, nbins, widths[end], 0.0)
+        _boxcar_psum!(psum, col, nbins, widths[end], zero(T))
         m0 = _boxcar_scan(psum, widths, nbins, invsigma)
-        m0 < medcut && return m0                  # can't reach threshold — skip the median
+        m0 < T(medcut) && return m0               # can't reach threshold — skip the median
     end
     return _boxcar_exact(profs, j, medbuf, psum, widths, nbins, invsigma, medpairs)
 end
@@ -772,10 +865,10 @@ end
 # The exact (median-baseline) half of `_profile_boxcar`, split out so the batched
 # gate in `boxcar_metrics!` can rescue a trial without redoing the zero-baseline
 # scan.  Assumes `invsigma > 0`.
-@inline function _boxcar_exact(profs::AbstractMatrix{Float64}, j::Integer,
-                               medbuf::Vector{Float64}, psum::Vector{Float64},
-                               widths::Vector{Int}, nbins::Int, invsigma::Float64,
-                               medpairs::Vector{Tuple{Int,Int}})
+@inline function _boxcar_exact(profs::AbstractMatrix{T}, j::Integer,
+                               medbuf::Vector{T}, psum::Vector{T},
+                               widths::Vector{Int}, nbins::Int, invsigma::T,
+                               medpairs::Vector{Tuple{Int,Int}}) where {T<:AbstractFloat}
     col = @view profs[:, j]
     @inbounds for i in 1:nbins
         medbuf[i] = col[i]
@@ -1169,39 +1262,56 @@ end
     DecimBuf
 
 Per-decimation-factor `k` scratch for the harmonic-decimation multi-frequency
-search: the decimated amplitude stack `dftprofs` (`(Hₖ+1, Nprof)`, `Hₖ =
-⌊nharms/k⌋`), the real profile array `dprofs` (`(2Hₖ, Nprof)`), a per-profile
-median buffer, and the batched complex→real inverse plan.  Built once per
-`Workspace`; never shared.  Row `j+1` of `dftprofs` is filled from base harmonic
-`j·k` (row `j·k+1` of the workspace `ftprofs`); the DC row stays zero.
+search: the real profile array `dprofs` (`(2Hₖ, Nprof)`, `Hₖ = ⌊nharms/k⌋`), a
+per-profile median buffer, and the batched complex→real inverse plan.  Built once
+per `Workspace`; never shared.
+
+**There is no decimated amplitude stack.**  The `k`-decimated stack is rows
+`1, k+1, 2k+1, …, Hₖk+1` of the workspace's `ftprofs` — a uniform stride-`k`
+slice — and `src` is exactly that view, which `brfftplan` transforms in place.
+The DC row it starts on is `ftprofs`' own DC row, which the search never writes
+and `fill_chunk_profiles!` zeroes, so it is the zero a compact stack would have
+put there.
+
+This replaces a strided row-by-row copy into a compact `(Hₖ+1, Nprof)` buffer
+that the transform then re-read.  Letting FFTW take the stride is **1.36x
+(`Float64`) / 1.60x (`Float32`) faster than copy-then-transform** across
+`k = 2…6` at `nharms = 60, Nprof = 2048` — the copy was reading exactly the same
+elements the transform reads, so it was pure duplicated traffic — and it removes
+`Σₖ (Hₖ+1)·Nprof` complex words per workspace, which is most of the per-thread
+footprint.
 """
-struct DecimBuf{B}
+struct DecimBuf{B,P<:AbstractFloat,V<:AbstractMatrix{<:Complex}}
     k::Int
     Hk::Int
-    dftprofs::Matrix{ComplexF64}  # (Hk+1, Nprof)
-    dprofs::Matrix{Float64}       # (2*Hk, Nprof)
-    medbuf::Vector{Float64}       # (2*Hk,)
-    brfftplan::B                   # plan_brfft(dftprofs, 2*Hk, 1)
+    src::V                         # view(ftprofs, 1:k:(Hk*k+1), :) — the decimated stack
+    dprofs::Matrix{P}             # (2*Hk, Nprof)
+    medbuf::Vector{P}             # (2*Hk,)
+    brfftplan::B                   # plan_brfft(src, 2*Hk, 1)
     bcwidths::Vector{Int}          # :boxcar width bank for 2*Hk-bin profiles
-    bcpsum::Vector{Float64}        # :boxcar prefix-sum scratch (2*Hk + wmax + 1)
-    bcsig::Vector{Float64}         # :boxcar per-block σ subsample scratch
+    bcpsum::Vector{P}              # :boxcar prefix-sum scratch (2*Hk + wmax + 1)
+    bcsig::Vector{P}               # :boxcar per-block σ subsample scratch
     medpairs::Vector{Tuple{Int,Int}}  # sorting-network median pairs (empty ⇒ quickselect)
     bcbatch::BoxcarBatch{_BC_TILE}    # :boxcar cross-profile SIMD gate scratch + metrics
 end
 
-function DecimBuf(k::Integer, nharms::Integer, Nprof::Integer, params::SearchParams)
+# `ftprofs` is the workspace array this buffer decimates; the plan is built
+# against a view of it and must only ever be executed on that same view (FFTW
+# plans encode strides and alignment), which is why the view is stored.
+function DecimBuf(k::Integer, nharms::Integer, ftprofs::Matrix{Complex{P}},
+                  params::SearchParams) where {P<:AbstractFloat}
     Hk = fld(nharms, k)
-    dftprofs = zeros(ComplexF64, Hk + 1, Nprof)
-    dprofs   = Matrix{Float64}(undef, 2Hk, Nprof)
-    medbuf   = Vector{Float64}(undef, 2Hk)
-    brfftplan = plan_brfft(dftprofs, 2Hk, 1; flags=plan_rigor())
-    fill!(dftprofs, 0)   # MEASURE planning may have dirtied the buffer
+    Nprof = size(ftprofs, 2)
+    src = @view ftprofs[1:k:(Hk * k + 1), :]
+    dprofs   = Matrix{P}(undef, 2Hk, Nprof)
+    medbuf   = Vector{P}(undef, 2Hk)
+    brfftplan = plan_brfft(src, 2Hk, 1; flags=plan_rigor())
     bcwidths = boxcar_widths(2Hk; fsp=params.boxcar_fsp, maxfrac=params.boxcar_maxfrac)
-    bcpsum   = Vector{Float64}(undef, 2Hk + bcwidths[end] + 1)
-    bcsig    = Vector{Float64}(undef, min(2Hk * Nprof, _BOXCAR_SIGMA_SAMPLES))
+    bcpsum   = Vector{P}(undef, 2Hk + bcwidths[end] + 1)
+    bcsig    = Vector{P}(undef, min(2Hk * Nprof, _BOXCAR_SIGMA_SAMPLES))
     medpairs = 2Hk <= _MED_NET_MAX ? _batcher_pairs(2Hk) : _NO_MEDPAIRS
     bcbatch  = BoxcarBatch(2Hk, bcwidths[end], Nprof)
-    return DecimBuf(Int(k), Hk, dftprofs, dprofs, medbuf, brfftplan, bcwidths, bcpsum,
+    return DecimBuf(Int(k), Hk, src, dprofs, medbuf, brfftplan, bcwidths, bcpsum,
                     bcsig, medpairs, bcbatch)
 end
 
@@ -1220,15 +1330,15 @@ factor `k > 1`.  One `Workspace` per task; never shared.
 # `db.brfftplan` `::Any`, turning every `mul!` in the hot loop into a dynamic
 # dispatch (and boxing its result).  All `cFFTWPlan{ComplexF64,…}` share one
 # concrete type regardless of length, so a single `S`/`B` covers every fftlen.
-struct Workspace{S<:FFTScratch, B, D<:DecimBuf}
+struct Workspace{S<:FFTScratch, B, D<:DecimBuf, P<:AbstractFloat}
     scratch::Dict{Int,S}
-    ftprofs::Matrix{ComplexF64}   # (nharms+1, Nprof)
-    profs::Matrix{Float64}        # (2*nharms, Nprof)
-    medbuf::Vector{Float64}       # (2*nharms,) scratch for the per-profile median
+    ftprofs::Matrix{Complex{P}}   # (nharms+1, Nprof)
+    profs::Matrix{P}              # (2*nharms, Nprof)
+    medbuf::Vector{P}             # (2*nharms,) scratch for the per-profile median
     brfftplan::B                   # plan_brfft(ftprofs, 2*nharms, 1)
     bcwidths::Vector{Int}          # :boxcar width bank for the base 2*nharms-bin profiles
-    bcpsum::Vector{Float64}        # :boxcar prefix-sum scratch (2*nharms + wmax + 1)
-    bcsig::Vector{Float64}         # :boxcar per-block σ subsample scratch
+    bcpsum::Vector{P}              # :boxcar prefix-sum scratch (2*nharms + wmax + 1)
+    bcsig::Vector{P}               # :boxcar per-block σ subsample scratch
     medpairs::Vector{Tuple{Int,Int}}  # sorting-network median pairs (empty ⇒ quickselect; nbins=120 default)
     bcbatch::BoxcarBatch{_BC_TILE}    # :boxcar cross-profile SIMD gate scratch + metrics
     decims::Vector{D}              # one per decimation factor k > 1
@@ -1240,7 +1350,13 @@ struct Workspace{S<:FFTScratch, B, D<:DecimBuf}
     im::Vector{Float32}            # (both empty under :fft)
 end
 
-function Workspace(params::SearchParams, hplans::Vector{HarmonicPlan}, Nprof::Integer)
+Workspace(params::SearchParams, hplans::Vector{HarmonicPlan}, Nprof::Integer) =
+    Workspace(proftype(params), params, hplans, Nprof)
+
+# As with `DecimBuf`: `P` arrives as a type argument so the body (and the
+# `decims` vector it builds) infers concretely.
+function Workspace(::Type{P}, params::SearchParams, hplans::Vector{HarmonicPlan},
+                   Nprof::Integer) where {P<:AbstractFloat}
     nh = params.nharms
     # Build the Dict from concrete pairs so it infers Dict{Int,FFTScratch{P,Q}}
     # (a concrete value type) rather than the abstract Dict{Int,FFTScratch}.
@@ -1251,20 +1367,23 @@ function Workspace(params::SearchParams, hplans::Vector{HarmonicPlan}, Nprof::In
     scratch = params.interp === :direct ?
         Dict{Int,typeof(FFTScratch(8))}() :
         Dict(fl => FFTScratch(fl) for fl in unique(hp.fftlen for hp in hplans))
-    ftprofs = zeros(ComplexF64, nh + 1, Nprof)
-    profs   = Matrix{Float64}(undef, 2nh, Nprof)
-    medbuf  = Vector{Float64}(undef, 2nh)
+    ftprofs = zeros(Complex{P}, nh + 1, Nprof)
+    profs   = Matrix{P}(undef, 2nh, Nprof)
+    medbuf  = Vector{P}(undef, 2nh)
     brfftplan = plan_brfft(ftprofs, 2nh, 1; flags=plan_rigor())
-    fill!(ftprofs, 0)   # MEASURE planning may have dirtied the buffer
     bcwidths = boxcar_widths(2nh; fsp=params.boxcar_fsp, maxfrac=params.boxcar_maxfrac)
-    bcpsum   = Vector{Float64}(undef, 2nh + bcwidths[end] + 1)
-    bcsig    = Vector{Float64}(undef, min(2nh * Nprof, _BOXCAR_SIGMA_SAMPLES))
+    bcpsum   = Vector{P}(undef, 2nh + bcwidths[end] + 1)
+    bcsig    = Vector{P}(undef, min(2nh * Nprof, _BOXCAR_SIGMA_SAMPLES))
     medpairs = 2nh <= _MED_NET_MAX ? _batcher_pairs(2nh) : _NO_MEDPAIRS
     bcbatch  = BoxcarBatch(2nh, bcwidths[end], Nprof)
     # A DecimBuf per k > 1 (k = 1 is the base ftprofs/profs above).  `map` (not a
     # `DecimBuf[...]` comprehension) keeps the element type the concrete
     # `DecimBuf{B}` even when empty, so `Workspace`'s `D<:DecimBuf` stays concrete.
-    decims = map(k -> DecimBuf(k, nh, Nprof, params), filter(>(1), params.decimations))
+    decims = map(k -> DecimBuf(k, nh, ftprofs, params), filter(>(1), params.decimations))
+    # Every plan above (base and decimated) is built with `FFTW.MEASURE`, which
+    # writes into the arrays it plans on — and the decimated plans plan on views
+    # of `ftprofs`.  So zero it *after* the last plan, not after the first.
+    fill!(ftprofs, 0)
     nw = params.interp === :direct ? direct_window_size(params, Nprof) : 0
     re = Vector{Float32}(undef, nw)
     im = Vector{Float32}(undef, nw)
@@ -1350,23 +1469,25 @@ function fill_chunk_profiles!(ws::Workspace, hplans::Vector{HarmonicPlan}, ft::F
                               params::SearchParams, rstart::Real, lodr::Real, n::Integer;
                               dplans::Union{Nothing,AbstractVector}=nothing,
                               t0::Integer=0)
-    fill!(ws.ftprofs, 0)
-    if params.interp === :direct
-        dplans === nothing &&
-            throw(ArgumentError("interp=:direct needs `dplans` from build_direct_plans"))
-        for dp in dplans
-            fill_harmonic_row_direct!(ws, dp, ft, params, t0, n)
-        end
-    else
-        for hp in hplans
-            fill_harmonic_row!(ws, hp, ft, params, hp.h * rstart, n)
+    @phase 6 fill!(ws.ftprofs, 0)
+    @phase 1 begin
+        if params.interp === :direct
+            dplans === nothing &&
+                throw(ArgumentError("interp=:direct needs `dplans` from build_direct_plans"))
+            for dp in dplans
+                fill_harmonic_row_direct!(ws, dp, ft, params, t0, n)
+            end
+        else
+            for hp in hplans
+                fill_harmonic_row!(ws, hp, ft, params, hp.h * rstart, n)
+            end
         end
     end
     # One batched complex→real transform for all Nprof profiles at once.  This
     # is an unnormalised `brfft` (= Nbins × a true irfft); the S/N metric folds
     # the missing 1/Nbins into its `scale` argument (see `_profile_snr`), so the
     # profiles here are left unnormalised.
-    mul!(ws.profs, ws.brfftplan, ws.ftprofs)
+    @phase 2 mul!(ws.profs, ws.brfftplan, ws.ftprofs)
     return
 end
 
@@ -1745,13 +1866,9 @@ function decim_pass!(out::Vector{Candidate}, ws::Workspace, db::DecimBuf, ft::FF
     k = db.k
     Hk = db.Hk
     nbins = 2Hk
-    src = ws.ftprofs
-    # Row j+1 of the decimated stack is base harmonic j*k (row j*k+1); DC stays 0.
-    @inbounds for j in 1:Hk
-        rowbase = j * k + 1
-        @views db.dftprofs[j + 1, 1:n] .= src[rowbase, 1:n]
-    end
-    mul!(db.dprofs, db.brfftplan, db.dftprofs)
+    # No gather: `db.src` already *is* the decimated stack (a stride-`k` view of
+    # `ws.ftprofs`), so the transform reads the base amplitudes where they lie.
+    @phase 7 @phase _decim_brfft_slot(k) mul!(db.dprofs, db.brfftplan, db.src)
 
     rmean = rstart + (n - 1) * lodr / 2
     ngood = chunk_ngoodbins(ft, Hk, k * rmean)
@@ -1764,22 +1881,25 @@ function decim_pass!(out::Vector{Candidate}, ws::Workspace, db::DecimBuf, ft::FF
     end
     # One robust per-bin σ for this (block, k), from the valid profiles only (past-
     # Nyquist columns are partly zero-padded and would deflate it).
-    invsigma = 0.0
+    P = eltype(db.dprofs)
+    invsigma = zero(P)
     if params.metric === :boxcar
-        sig = _block_sigma(db.dprofs, nbins, nvalid, db.bcsig)
-        invsigma = sig > 0 ? 1.0 / sig : 0.0
-        # Only the valid prefix is scored; past-Nyquist columns are skipped below.
-        boxcar_metrics!(db.bcbatch, db.dprofs, nvalid, db.medbuf, db.bcpsum,
-                        db.bcwidths, nbins, invsigma, db.medpairs, Float64(medcut))
+        @phase 8 begin
+            sig = _block_sigma(db.dprofs, nbins, nvalid, db.bcsig)
+            invsigma = sig > 0 ? one(P) / sig : zero(P)
+            # Only the valid prefix is scored; past-Nyquist columns are skipped below.
+            boxcar_metrics!(db.bcbatch, db.dprofs, nvalid, db.medbuf, db.bcpsum,
+                            db.bcwidths, nbins, invsigma, db.medpairs, Float64(medcut))
+        end
     end
     mbuf = stats === nothing ? nothing : Float64[]     # gather metrics if requested
-    @inbounds for j in 1:n
+    @phase 9 @inbounds for j in 1:n
         r_dec = k * (rstart + (j - 1) * lodr)
         r_dec < nyq || continue                       # fundamental past Nyquist
         mval = params.metric === :boxcar ?
             db.bcbatch.mvals[j] :
-            _profile_snr(db.dprofs, j, db.medbuf, nbins, invrms,
-                         1.0 / nbins, params.xsignal, params.metric, params.pexp)
+            Float64(_profile_snr(db.dprofs, j, db.medbuf, nbins, invrms,
+                                 1.0 / nbins, params.xsignal, params.metric, params.pexp))
         if mbuf !== nothing
             push!(mbuf, mval)
             hist === nothing || _hist_push!(hist, mval)
@@ -1824,13 +1944,14 @@ function chunk_metrics(ft::FFTFile, params::SearchParams, rstart::Real, n::Integ
     dplans = params.interp === :direct ? build_direct_plans(params, rstart) : nothing
     fill_chunk_profiles!(ws, hplans, ft, params, rstart, lodr, n; dplans=dplans, t0=0)
     if params.metric === :boxcar
+        P = eltype(ws.profs)
         sigma = _block_sigma(ws.profs, nbins, n, ws.bcsig)
-        invsigma = sigma > 0 ? 1.0 / sigma : 0.0
-        return [_profile_boxcar(ws.profs, j, ws.medbuf, ws.bcpsum, ws.bcwidths, nbins, invsigma, ws.medpairs) for j in 1:n]
+        invsigma = sigma > 0 ? one(P) / sigma : zero(P)
+        return [Float64(_profile_boxcar(ws.profs, j, ws.medbuf, ws.bcpsum, ws.bcwidths, nbins, invsigma, ws.medpairs)) for j in 1:n]
     end
     rmean = rstart + (n - 1) * lodr / 2
     invrms = sqrt(2 * chunk_ngoodbins(ft, nh, rmean) + 1)
-    return [_profile_snr(ws.profs, j, ws.medbuf, nbins, invrms, 1.0 / nbins, params.xsignal, params.metric, params.pexp) for j in 1:n]
+    return [Float64(_profile_snr(ws.profs, j, ws.medbuf, nbins, invrms, 1.0 / nbins, params.xsignal, params.metric, params.pexp)) for j in 1:n]
 end
 
 # ---------------------------------------------------------------------------
@@ -1883,6 +2004,7 @@ function _search_region!(ft::FFTFile, params::SearchParams, hplans::Vector{Harmo
                      for k in statks) :
                 nothing
             mbuf = collect_stats ? Vector{Float64}(undef, Nprof) : nothing
+            P = eltype(ws.profs)
             c = t
             while c <= nchunks
                 i0 = (c - 1) * Nprof
@@ -1893,19 +2015,22 @@ function _search_region!(ft::FFTFile, params::SearchParams, hplans::Vector{Harmo
                 rmean = rstart + (n - 1) * lodr / 2
                 ngood = chunk_ngoodbins(ft, params.nharms, rmean)
                 invrms = sqrt(2 * ngood + 1)
-                invsigma = 0.0
+                invsigma = zero(P)
                 if params.metric === :boxcar
-                    sig = _block_sigma(ws.profs, nbins, n, ws.bcsig)   # one robust σ per block
-                    invsigma = sig > 0 ? 1.0 / sig : 0.0
+                    # one robust σ per block
+                    @phase 3 begin
+                        sig = _block_sigma(ws.profs, nbins, n, ws.bcsig)
+                        invsigma = sig > 0 ? one(P) / sig : zero(P)
+                    end
                     # All n trials at once: batched zero-baseline gate, then the
                     # exact median rescan only for those that reach `medcut`.
-                    boxcar_metrics!(ws.bcbatch, ws.profs, n, ws.medbuf, ws.bcpsum,
-                                    ws.bcwidths, nbins, invsigma, ws.medpairs, medcut)
+                    @phase 4 boxcar_metrics!(ws.bcbatch, ws.profs, n, ws.medbuf, ws.bcpsum,
+                                             ws.bcwidths, nbins, invsigma, ws.medpairs, medcut)
                 end
                 # Whole (narrow) block → one window, keyed by its centre freq.
                 basehist = collect_stats ?
                     hists[1][_window_index(wedges[1], rmean / ft.T)] : nothing
-                for j in 1:n
+                @phase 5 for j in 1:n
                     metric = params.metric === :boxcar ?
                         ws.bcbatch.mvals[j] :
                         _profile_snr(ws.profs, j, ws.medbuf, nbins, invrms, 1.0 / nbins, params.xsignal, params.metric, params.pexp)
@@ -2026,8 +2151,17 @@ function _plans!(cache::Union{Nothing,SearchCache}, params::SearchParams,
         return hplans, ws
     end
     hplans = build_harmonic_plans(params, Nprof)
-    # Planning is not thread-safe: build all workspaces serially, here.
-    ws = [Workspace(params, hplans, Nprof) for _ in 1:nt]
+    # Planning is not thread-safe: build all workspaces serially, here.  The
+    # vector is typed off the first element rather than built by comprehension:
+    # `params.precision` is a runtime `Symbol`, so the `Workspace` constructor's
+    # return type is a two-way union, and only a concretely-typed vector makes
+    # `workspaces[t]` concrete inside `_search_region!` (the function barrier).
+    w1 = Workspace(params, hplans, Nprof)
+    ws = Vector{typeof(w1)}(undef, nt)
+    ws[1] = w1
+    for i in 2:nt
+        ws[i] = Workspace(params, hplans, Nprof)
+    end
     if cache !== nothing
         cache.params = params
         cache.Nprof = Int(Nprof)

@@ -9,6 +9,17 @@ using Random
 const EXAMPLE_FFT = joinpath(@__DIR__, "..", "..", "coherent_search",
                              "examples", "harmonics_hi.fft")
 
+# Tolerance for the optimised-vs-reference equivalence pins.  The profile stage's
+# precision is a runtime choice (`SearchParams.precision`), and these pins run at
+# the default `:f64`, where they are machine-precision pins.  `PIN_PRECISION` is
+# the knob a `:f32` sweep flips; the bound is *derived* from it rather than
+# relaxed by hand, and a real regression is orders of magnitude larger than
+# either bound.
+const PIN_PRECISION = :f64
+const PIN_TOL = PIN_PRECISION === :f32 ? 1e-6 : 1e-8
+const PIN_PROFT = PIN_PRECISION === :f32 ? Float32 : Float64
+
+
 @testset "harmonic_numbetween schedule" begin
     nh, hidr, minnb = 32, 0.5, 16
     # Never below the floor; finer at the low harmonics; matched to deltar_h.
@@ -176,7 +187,7 @@ if isfile(EXAMPLE_FFT)
         @info "align=false reference agreement" relerr
         # Both paths compute identical profiles to ~1e-10; the snr metric is a
         # continuous function of them except at the (rare) half-max threshold tie.
-        @test relerr < 1e-8
+        @test relerr < PIN_TOL
     end
 
     @testset "boxcar metric: optimised path reproduces the reference (align=false)" begin
@@ -194,7 +205,7 @@ if isfile(EXAMPLE_FFT)
         opt = chunk_metrics(ft, params, rstart, n; lodr=lodr)
         relerr = maximum(abs.(opt .- ref)) / maximum(abs.(ref))
         @info "boxcar align=false reference agreement" relerr
-        @test relerr < 1e-8
+        @test relerr < PIN_TOL
     end
 
     @testset "direct interpolation is the exact kernel" begin
@@ -343,13 +354,13 @@ if isfile(EXAMPLE_FFT)
         CS.fill_chunk_profiles!(ws, hplans, ft, params, rstart, lodr, Nprof;
                                 dplans=dplans, t0=0)
         sigma = CS._block_sigma(ws.profs, nbins, Nprof, ws.bcsig)
-        invsigma = 1.0 / sigma
+        invsigma = one(PIN_PROFT) / sigma
 
         CS._boxcar_gate!(ws.bcbatch, ws.profs, Nprof, ws.bcpsum, ws.bcwidths,
-                         nbins, invsigma)
+                         nbins, PIN_PROFT(invsigma))
         got = copy(ws.bcbatch.mvals[1:Nprof])
-        want = [CS._profile_boxcar(ws.profs, j, ws.medbuf, ws.bcpsum, ws.bcwidths,
-                                   nbins, invsigma, ws.medpairs, Inf) for j in 1:Nprof]
+        want = [Float64(CS._profile_boxcar(ws.profs, j, ws.medbuf, ws.bcpsum, ws.bcwidths,
+                                           nbins, invsigma, ws.medpairs, Inf)) for j in 1:Nprof]
         err = maximum(abs.(got .- want))
         @info "batched vs scalar boxcar gate" maxabs=err medmargin=params.boxcar_medmargin
         @test err < 1e-3 * params.boxcar_medmargin
@@ -450,9 +461,61 @@ if isfile(EXAMPLE_FFT)
             got = [c.metric for c in out]             # emitted in ascending-r (j) order
             relerr = maximum(abs.(got .- ref)) / maximum(abs.(ref))
             @info "decimation k native-fold agreement" k relerr
-            @test relerr < 1e-8
+            @test relerr < PIN_TOL
             @test all(c.nharm == Hk for c in out)
         end
+    end
+
+    @testset "decimation source view is the gather it replaced" begin
+        # `DecimBuf` no longer copies every k-th harmonic row into a compact
+        # stack; it hands FFTW a stride-k view of `ftprofs` instead.  That is only
+        # correct if the view holds *exactly* what the copy would have: DC in row
+        # 1, then base harmonic j*k in row j+1.  Checked against an explicit
+        # gather, since a silently mis-strided view would still transform fine and
+        # simply fold the wrong harmonics.
+        params = SearchParams(nharms=60, metric=:boxcar, decimations=[1, 2, 3, 4, 5, 6])
+        n = 128
+        lodr = params.hidr / params.nharms
+        rstart = 5000.0
+        hplans = build_harmonic_plans(params, n)
+        ws = CoherentSearch.Workspace(params, hplans, n)
+        dplans = CoherentSearch.build_direct_plans(params, rstart)
+        CoherentSearch.fill_chunk_profiles!(ws, hplans, ft, params, rstart, lodr, n;
+                                            dplans=dplans, t0=0)
+        for db in ws.decims
+            want = zeros(eltype(ws.ftprofs), db.Hk + 1, n)   # DC row stays zero
+            for j in 1:db.Hk
+                want[j + 1, :] .= ws.ftprofs[j * db.k + 1, 1:n]
+            end
+            @test size(db.src) == (db.Hk + 1, size(ws.ftprofs, 2))
+            @test db.src[:, 1:n] == want
+            @test all(iszero, db.src[1, :])                  # DC never written
+        end
+    end
+
+    @testset "precision=:f32 tracks the :f64 profile stage" begin
+        # The narrowed profile stage is a *runtime* choice, so both widths run in
+        # one build and can be compared directly.  It must find the same
+        # candidates; the metrics differ only by the single rounding per harmonic
+        # amplitude, so they agree to ~1e-6 relative — orders of magnitude below
+        # the ~1.3% signal-power loss the m=16 kernel already accepts.
+        f = 10.0123456789123
+        base = (nharms=32, threshold=6.0, metric=:boxcar)
+        c64 = search(ft, SearchParams(; base..., precision=:f64);
+                     lofreq=f - 0.05, hifreq=f + 0.05, progress=:none)
+        c32 = search(ft, SearchParams(; base..., precision=:f32);
+                     lofreq=f - 0.05, hifreq=f + 0.05, progress=:none)
+        @test !isempty(c64)
+        @test length(c32) == length(c64)
+        @test [c.freq for c in c32] == [c.freq for c in c64]
+        @test [c.nharm for c in c32] == [c.nharm for c in c64]
+        relerr = maximum(abs(a.metric - b.metric) / abs(b.metric)
+                         for (a, b) in zip(c32, c64))
+        @info "f32 vs f64 profile stage" relerr ncands=length(c64)
+        @test relerr < 1e-5
+        @test CoherentSearch.proftype(SearchParams(precision=:f32)) === Float32
+        @test CoherentSearch.proftype(SearchParams(precision=:f64)) === Float64
+        @test_throws ArgumentError CoherentSearch.proftype(SearchParams(precision=:f16))
     end
 
     @testset "detects the 10.0123 Hz pulsar via decimation" begin

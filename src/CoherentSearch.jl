@@ -30,7 +30,8 @@ export SearchParams, Candidate, search, search_block, block_metrics, coherent_pr
        decimation_set, boxcar_widths, boxcar_best_width, BlockMetricStats, MetricHistogram, MetricStats,
        SearchCache,
        metricstats_summary, metricstats_windows, hist_quantile,
-       MetricNorm, build_metricnorm, harmonic_plan_report
+       MetricNorm, build_metricnorm, harmonic_plan_report,
+       proftype, phase_reset!, phase_times, PHASE_NAMES
 include("search.jl")
 
 # --- Direct O(m) Fourier interpolation (the default production interpolator) ---

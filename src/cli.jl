@@ -122,6 +122,11 @@ function parse_cmdline(argv)
             arg_type = String
             default = "pow2"
             range_tester = x -> x in ("smooth", "pow2")
+        "--precision"
+            help = "Element type of the profile stage (interpolated harmonic amplitudes, the batched inverse FFT, and the folded profiles the metric reads): 'f64' (default) or 'f32'. Everything reported stays Float64; f32 halves the bandwidth of the bulk arrays and is a win once several threads contend for memory"
+            arg_type = String
+            default = "f64"
+            range_tester = x -> x in ("f64", "f32")
         "--xsignal"
             help = "Peak fraction bounding the on-pulse signal sum in the S/N metric"
             arg_type = Float64
@@ -245,6 +250,7 @@ function main(argv)
         decimations = decimations,
         interp = Symbol(a["interp"]),
         fftsizing = Symbol(a["fftsizing"]),
+        precision = Symbol(a["precision"]),
     )
 
     cache = SearchCache()

@@ -126,8 +126,15 @@ holds the `m` real weights `1/(dr - j)`, `A[p]` the complex scalar
 wrapped past 1 (which bumps the integer bin index by one).
 
 `P == 0` marks the no-table fallback described in [`DIRECT_QMAX`](@ref).
+
+The table's element type `WT` is the interpolation working precision, taken from
+`SearchParams.precision` (see [`proftype`](@ref)).  Every entry is *computed* in
+`Float64` and rounded once on storage, so `WT = Float32` costs one rounding of a
+tabulated constant — not an accumulated error — while halving the bytes the inner
+sum streams and doubling its SIMD width.  See [`fill_harmonic_row_direct!`](@ref)
+for what that is worth and what it costs in accuracy.
 """
-struct DirectPlan
+struct DirectPlan{WT<:AbstractFloat}
     h::Int
     m::Int
     q::Int                    # trial-grid denominator
@@ -138,8 +145,8 @@ struct DirectPlan
     dr0::Float64              # h*r_lo - floor(h*r_lo)
     P::Int                    # phase-cycle length (0 ⇒ per-trial fallback)
     row::Vector{Int32}        # (q,) residue -> row index, 0 if unvisited
-    W::Matrix{Float64}        # (m, P) real weights 1/(dr - j)
-    A::Vector{ComplexF64}     # (P,) conj(A(dr))
+    W::Matrix{WT}             # (m, P) real weights 1/(dr - j)
+    A::Vector{Complex{WT}}    # (P,) conj(A(dr))
     carry::Vector{Bool}       # (P,)
 end
 
@@ -166,26 +173,42 @@ end
 
 """
     build_direct_plans(params, r_lo) -> Vector{DirectPlan}
+    build_direct_plans(WT, params, r_lo) -> Vector{DirectPlan{WT}}
 
 Build the per-harmonic phase tables for a search whose *global* trial 0 sits at
 fundamental Fourier frequency `r_lo`.  Cheap (a few thousand divisions per
 harmonic) and done once, before the parallel region.
 """
-function build_direct_plans(params::SearchParams, r_lo::Real)
+# The interpolation working precision is deliberately **not** tied to
+# `params.precision`.  A fully-`Float32` inner sum was measured at **1.64x
+# slower** than `Float64` on the production configuration (Xeon Silver 4114,
+# AVX-512, m=16, nharms=60, Nprof=2048): at `m = 16` the sum is exactly one
+# 16-lane `Float32` vector, so there is a single FMA with no instruction-level
+# parallelism followed by a *four*-stage cross-lane reduce, against `Float64`'s
+# two independent 8-lane accumulators and a three-stage reduce.  The per-trial
+# horizontal reduction — not the width of the data — is what this loop is paying
+# for, and narrowing makes it worse.  `build_direct_plans(WT, …)` keeps the
+# experiment one argument away (and a machine with cheap cross-lane reduces, or a
+# GPU port, may well flip it), but the search always asks for `Float64`.
+build_direct_plans(params::SearchParams, r_lo::Real) =
+    build_direct_plans(Float64, params, r_lo)
+
+function build_direct_plans(::Type{WT}, params::SearchParams, r_lo::Real) where {WT<:AbstractFloat}
     lodr = params.hidr / params.nharms
     rq = trial_grid_rational(lodr)
     m = params.m
     iseven(m) || throw(ArgumentError("m must be even"))
     m2 = m ÷ 2
-    plans = DirectPlan[]
+    CT = Complex{WT}
+    plans = DirectPlan{WT}[]
     for h in 1:params.nharms
         hr = h * float(r_lo)
         rfloor0 = floor(Int, hr)
         dr0 = hr - rfloor0
         if rq === nothing
-            push!(plans, DirectPlan(h, m, 1, 0, 0, 1, rfloor0, dr0, 0,
-                                    Int32[], Matrix{Float64}(undef, m, 0),
-                                    ComplexF64[], Bool[]))
+            push!(plans, DirectPlan{WT}(h, m, 1, 0, 0, 1, rfloor0, dr0, 0,
+                                        Int32[], Matrix{WT}(undef, m, 0),
+                                        CT[], Bool[]))
             continue
         end
         pnum, q = rq
@@ -194,10 +217,14 @@ function build_direct_plans(params::SearchParams, r_lo::Real)
         base_adv = fld(step, q)
         P = q ÷ gcd(step, q)
         row = zeros(Int32, q)
-        W = Matrix{Float64}(undef, m, P)
-        A = Vector{ComplexF64}(undef, P)
+        W = Matrix{WT}(undef, m, P)
+        A = Vector{CT}(undef, P)
         carry = Vector{Bool}(undef, P)
         res = 0
+        # Every entry is computed in Float64 and rounded once into `WT`: the table
+        # is small (m×P) and built once per file, so there is nothing to gain from
+        # evaluating the transcendentals at reduced precision, and rounding the
+        # exact value is the most accurate `WT` table available.
         for p in 1:P
             row[res + 1] = Int32(p)
             u = dr0 + res / q
@@ -206,21 +233,21 @@ function build_direct_plans(params::SearchParams, r_lo::Real)
             if dr == 0.0
                 # r is exactly a Fourier bin: the kernel collapses to a delta on
                 # that bin (A -> 0 while 1/(dr-j) -> Inf at j=0; the product is 1).
-                A[p] = one(ComplexF64)
+                A[p] = one(CT)
                 @inbounds for i in 1:m
-                    W[i, p] = (i == m2) ? 1.0 : 0.0
+                    W[i, p] = (i == m2) ? one(WT) : zero(WT)
                 end
             else
-                A[p] = conj(sinpi(dr) * cispi(dr) / pi)
+                A[p] = CT(conj(sinpi(dr) * cispi(dr) / pi))
                 @inbounds for i in 1:m
-                    W[i, p] = 1.0 / (dr - (i - m2))
+                    W[i, p] = WT(1.0 / (dr - (i - m2)))
                 end
             end
             res += s
             res >= q && (res -= q)
         end
-        push!(plans, DirectPlan(h, m, q, s, base_adv, pnum, rfloor0, dr0,
-                                P, row, W, A, carry))
+        push!(plans, DirectPlan{WT}(h, m, q, s, base_adv, pnum, rfloor0, dr0,
+                                    P, row, W, A, carry))
     end
     return plans
 end
@@ -250,9 +277,19 @@ end of the available amplitudes or past Nyquist (matching
 The `m` bins each trial reads are de-interleaved once per chunk into the
 workspace's real/imaginary plane buffers, which turns the inner loop into two
 independent real dot products — the form the vectoriser handles best.
+
+The sum accumulates in the plan's weight type `WT`.  At `WT = Float64` the
+`Float32` planes widen exactly, so the result is bit-identical to `Float64`
+planes.  At `WT = Float32` the whole `m`-sum is single precision: twice the SIMD
+lanes and half the weight-table traffic, for a relative error of ~1e-6 against
+the ~1e-10 the `Float64` sum achieves.  That is far below the ~1.3% signal-power
+loss the `m = 16` kernel already accepts and the ~6.5% the `hidr` grid costs at
+the top harmonic, so it is invisible in a detection — but it is *not* invisible
+to the equivalence pins, which is why `Float64` remains the default and the pins
+run there.
 """
-function fill_harmonic_row_direct!(ws::Workspace, dp::DirectPlan, ft::FFTFile,
-                                   params::SearchParams, t0::Integer, n::Integer)
+function fill_harmonic_row_direct!(ws::Workspace, dp::DirectPlan{WT}, ft::FFTFile,
+                                   params::SearchParams, t0::Integer, n::Integer) where {WT}
     n >= 1 || return
     h = dp.h
     m = dp.m
@@ -304,14 +341,15 @@ function fill_harmonic_row_direct!(ws::Workspace, dp::DirectPlan, ft::FFTFile,
         p = row[res + 1]
         # Offset of this trial's first bin within the de-interleaved window.
         b = dp.rfloor0 + qint + carry[p] + 2 - m2 - lo
-        sre = 0.0
-        sim = 0.0
-        # `Float32 -> Float64` is exact, so this accumulates identically to
-        # `Float64` planes while reading half the bytes.
+        sre = zero(WT)
+        sim = zero(WT)
+        # `Float32 -> WT` is exact for both `WT`, so at `WT = Float64` this
+        # accumulates identically to `Float64` planes while reading half the bytes,
+        # and at `WT = Float32` it is a no-op conversion.
         @simd for i in 1:m
             w = W[i, p]
-            sre = muladd(w, Float64(re[b + i]), sre)
-            sim = muladd(w, Float64(im[b + i]), sim)
+            sre = muladd(w, WT(re[b + i]), sre)
+            sim = muladd(w, WT(im[b + i]), sim)
         end
         ftprofs[hrow, k] = A[p] * complex(sre, sim)
         res += s

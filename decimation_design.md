@@ -115,21 +115,29 @@ Only the optimised `search` path changes; the reference `block_metrics` /
   detection (`Hₖ`). This *is* the decimation label (`k = nharms ÷ nharm`), so
   the CLI can report it directly. Period is `1/freq`.
 
-- **Per-`k` buffers + plans (`DecimBuf`).** For each `k ≥ 2`: a compact
-  `dftprofs` `(Hₖ+1, Nprof)`, a real `dprofs` `(2Hₖ, Nprof)`, a `medbuf`, and a
-  batched `plan_brfft(dftprofs, 2Hₖ, 1)`. Built once per `Workspace`
-  (single-threaded, like the existing base plan), private per task. When
-  `decimations == [1]` the list is empty and the base path is byte-for-byte
-  unchanged (preserving the `align=false` equivalence test).
+- **Per-`k` buffers + plans (`DecimBuf`).** For each `k ≥ 2`: a real `dprofs`
+  `(2Hₖ, Nprof)`, a `medbuf`, and a batched `plan_brfft(src, 2Hₖ, 1)`. Built once
+  per `Workspace` (single-threaded, like the existing base plan), private per
+  task. When `decimations == [1]` the list is empty and the base path is
+  byte-for-byte unchanged (preserving the `align=false` equivalence test).
+
+  **There is no compact `dftprofs`.** As first written, each `DecimBuf` held its
+  own `(Hₖ+1, Nprof)` stack and a loop copied `ftprofs[j·k+1, :]` into it before
+  transforming. That copy read exactly the elements the transform then read
+  again — the decimated stack *is* rows `1, k+1, …, Hₖk+1` of `ftprofs`, a
+  uniform stride-`k` slice, DC row included (the search never writes row 1). So
+  `db.src` is that view and FFTW takes the stride: **1.36x (`Float64`) / 1.60x
+  (`Float32`) faster than copy-then-transform** over `k = 2…6`, 1.12x (`-t 1`) to
+  1.26x (`-t 4…16`) end to end, with byte-identical candidates, and
+  `Σₖ (Hₖ+1)·Nprof` complex words removed from every workspace.
 
 - **Hot loop.** After the existing base (`k = 1`) profile + metric pass, for each
-  `DecimBuf`: gather the strided rows (`dftprofs[j+1, :] .= ftprofs[j·k+1, :]`
-  for `j = 1…Hₖ`; row 1 stays DC = 0), one `mul!(dprofs, brfftplan, dftprofs)`,
+  `DecimBuf`: one `mul!(dprofs, brfftplan, db.src)` straight off the strided view,
   then the same `_profile_snr` scan with `invrms` from the `k`-specific
   `ngoodbins` and `scale = 1/(2Hₖ)`. Emit `Candidate(k·rf/T, metric, k·rf, Hₖ)`
   for trials above threshold, skipping any with `r_dec ≥ N/2` (fundamental past
-  Nyquist). The strided copy is `O((Hₖ+1)·Nprof)`, negligible beside the
-  `nharms` interpolations.
+  Nyquist). The decimated transform costs `O(Hₖ·Nprof·log Hₖ)` and reads the base
+  amplitudes in place, so a decimation factor adds no data movement of its own.
 
 - **CLI.** Add `--maxdecim` (default 1 = off). When `> 1`, set
   `decimations = decimation_set(nharms, maxdecim)` and default `nharms` to `60`
@@ -143,7 +151,7 @@ Only the optimised `search` path changes; the reference `block_metrics` /
 
 - **Native-fold equivalence (the strong test, no new Python needed).**
   Decimation pass `k` must reproduce, to machine precision, a *native* `Hₖ`-
-  harmonic fold at the multiplied frequencies — i.e. the strided-gather +
+  harmonic fold at the multiplied frequencies — i.e. the strided-view
   short `irfft` must equal `reference_profiles(ft, k·rfund,
   SearchParams(nharms=Hₖ, …))`. Since `reference_profiles` is already pinned to
   the Python oracle at ~8e-16, this transitively pins decimation. One asserted

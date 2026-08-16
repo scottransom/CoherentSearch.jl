@@ -812,6 +812,142 @@ reads `ftprofs`" with separate timers, since both regressions sit on the same
 array and a single cause (the narrowed strided scatter leaving the array in a
 state the transform reads back more slowly) would explain both.
 
+#### The split, done — and it dissolved the "FFTW" bucket (2026-08-16)
+
+The phase timers now live in `search.jl` (`phase_reset!` / `phase_times`, always
+on, ~0.03% of runtime) rather than in a profiler's bucket classifier, and they
+immediately contradicted the table above. The "FFTW +12.4%" bucket was **two
+transforms of opposite sign**:
+
+| phase | f64 | f32 | Δ |
+|---|---|---|---|
+| base `brfft` (61→120) | 0.64 | 0.50 | **−22%** |
+| decimated `brfft` (k=2…6) | 0.84 | 1.28 | **+52%** |
+
+The base transform behaves exactly as the isolated benchmark said it would; only
+the decimated ones regress, and the smaller the transform the worse it got
+(k=2 +15%, k=3 +61%, k=4 +93%, k=5 +94%, k=6 +37%). Two other corrections fell
+out at the same time:
+
+- **"The whole regression lives below 5 Hz" was wrong** — an artefact of profile
+  attribution, not a property of the search. `interp` regresses **+20% at
+  5–13 Hz** just as it does at 0.1–8 Hz. Band choice changes the *mix* (the
+  exact-median rescan), not the interp penalty.
+- **`fill!(ws.ftprofs, 0)` was hiding inside the `interp` bucket** and is 0.29x
+  in `Float32` — a real win that was being netted against a real loss.
+
+Four candidate mechanisms for the decimated transform were then tested and all
+four are **wrong**, which is worth recording because each is the obvious guess:
+
+1. *Alignment of the leading dimension.* `Hk+1` is odd for four of the five `k`,
+   so `ComplexF32` columns start 8-byte-aligned where `ComplexF64` columns are
+   always 16-byte-aligned. But `k=4` gives `Hk+1 = 16` — perfectly 64-byte
+   aligned in `Float32` — and it was the *worst* of the five. Padding the
+   leading dimension would fix nothing.
+2. *The transposed layout.* `(Nprof, Hk+1)` transforming along dim 2 gives FFTW a
+   batch stride of 1, which is supposed to be its best case. It is **2–3x
+   slower** at every size, in both precisions. The current layout is already the
+   right one for the transform.
+3. *The data.* FFTW is data-independent apart from subnormals; timed on genuine
+   chunk contents versus `randn` of the same shape, the two agree to <1%.
+4. *Cold caches.* Flushing 32 MB between calls makes `Float32` **relatively
+   better** (0.70–0.82x), not worse.
+
+#### What it actually was: the decimation gather (2026-08-16) — 1.12x…1.26x
+
+`decim_pass!` copied every `k`-th row of `ftprofs` into a compact
+`(Hₖ+1, Nprof)` buffer and transformed that. The copy read exactly the elements
+the transform then read again — **pure duplicated traffic**, 14% of single-thread
+runtime in its own right, and the thing that made the `Float32` arm look bad
+because it doubled the pressure on the array whose narrowing was supposed to
+relieve it.
+
+The decimated stack does not need to be built at all: rows `1, k+1, 2k+1, …` of
+`ftprofs` *are* the stack, DC row included (the search never writes it), so
+`DecimBuf.src` is a stride-`k` view and FFTW takes the stride. Measured
+standalone over `k = 2…6` at `nharms = 60, Nprof = 2048`, against gather +
+contiguous transform:
+
+| | gather+transform | strided view | |
+|---|---|---|---|
+| `Float64` | 1417 µs | 1038 µs | **1.36x** |
+| `Float32` | 1267 µs | 792 µs | **1.60x** |
+
+End to end on PM0063 at the riptide bench config, warm in-process `search`,
+median of 3, **candidate files byte-identical to master**:
+
+| threads | master | strided | speedup |
+|---|---|---|---|
+| 1 | 30.14 s | 26.99 s | **1.12x** |
+| 4 | 9.98 s | 7.92 s | **1.26x** |
+| 8 | 5.59 s | 4.46 s | **1.25x** |
+| 16 | 3.36 s | 2.66 s | **1.26x** |
+
+It also deletes `Σₖ (Hₖ+1)·Nprof` complex words from every workspace — most of
+the per-thread footprint — which is why the win *grows* with thread count.
+
+#### Which changes the `Float32` verdict (2026-08-16)
+
+`SearchParams.precision` (`:f64` default, `:f32`) now carries the profile-stage
+width as a type parameter on `Workspace{…,P}`/`DecimBuf{…,P}`, so **both widths
+are compiled into one build** and A/B in one process — no branch switching, and
+none of the ~24 s precompile that once produced a confidently wrong result. With
+the gather gone:
+
+| threads | `:f64` | `:f32` | f32 vs f64 |
+|---|---|---|---|
+| 1 | 26.99 s | 32.81 s | **0.82x** |
+| 4 | 7.92 s | 8.64 s | 0.92x |
+| 8 | 4.46 s | 4.53 s | 0.98x |
+| 16 | 2.66 s | 2.64 s | **1.01x** |
+
+**The threaded win is gone.** `Float32` never made the search faster; it relieved
+a bandwidth problem, and that problem has now been fixed at its source. It is a
+clear loss single-threaded and a wash at 16 threads, so **do not merge
+`float32-profiles`** — the deployment-model question of §3.1 no longer decides
+anything. The knob stays in tree because it costs nothing and makes the
+measurement repeatable.
+
+#### Fully-`Float32` interpolation: 1.64x slower, and now understood
+
+Narrowing `DirectPlan`'s `W`/`A` and the accumulators to `Float32` — the last
+piece of "make everything `Float32`" — is **1.64x slower** than the `Float64`
+sum (1533 → 2482 µs per chunk), against the 1.09x that narrowing only the *store*
+into `ftprofs` costs. The mechanism is the same one that killed the earlier
+8-lane widening experiment, and it is not about bandwidth at all: at `m = 16` the
+`Float32` sum is *exactly one* 16-lane vector, so there is a single FMA with no
+instruction-level parallelism followed by a **four**-stage cross-lane reduce,
+where `Float64` gets two independent 8-lane accumulators and a three-stage
+reduce. **The per-trial horizontal reduction is what this loop pays for**, and
+every attempt to narrow or widen the `m`-axis makes it worse.
+
+That is also the standing lesson for the next interp optimisation: the win is not
+a wider vector along `m`, it is *removing the reduce* by vectorising across
+trials — the same move that gave the boxcar gate 2.77–4.05x. The structure is
+there for it (`base_adv = 0` for every harmonic when `hidr < 1`, so the bin
+window slides by 0 or 1 bin per trial, and the weight table is periodic with
+period `P` in trial index, so a trial-ordered transposed table `Wt[P, m]` makes
+consecutive trials contiguous). The obstacle is that a same-window run is only
+~`q/h` trials long, so it vectorises well for low harmonics and barely at all for
+`h > 15`; a version that handles the ±1 window slide with a permute rather than a
+gather is the piece that has not been prototyped.
+
+#### Where the single-thread time is now
+
+`Float64`, PM0063, 0.1–33.3 Hz, `-t 1`, 29.5 s of accounted phase time:
+
+| phase | s | % |
+|---|---|---|
+| decim-metric (σ̂ + boxcar, k=2…6) | 8.43 | 29% |
+| interp (direct O(m)) | 7.15 | 24% |
+| decim-brfft (k=2…6) | 5.18 | 18% |
+| gate+metric (k=1) | 5.19 | 18% |
+| base brfft | 2.56 | 9% |
+| block-sigma, zeroing, candidate loops | 0.94 | 3% |
+
+The boxcar metric work is **47%** across the two metric rows — the largest single
+target left, and larger than the interpolation it was long assumed to sit behind.
+
 Open question, and the natural next piece of work: **how should large-scale
 searches actually be driven?** The candidates are (a) one single-threaded
 process per DM, maximising throughput and letting the batch scheduler handle

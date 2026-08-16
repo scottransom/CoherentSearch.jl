@@ -88,6 +88,8 @@ julia --project=. -t 4 bin/coherent_search.jl --threshold 6 --metric sd2 \
 julia --project=. bin/coherent_search.jl --verbose ... FILE.fft
 # The old FFT-correlation interpolator (fallback / equivalence gate)
 julia --project=. bin/coherent_search.jl --interp fft --fftsizing pow2 ... FILE.fft
+# Narrowed profile stage (measured a loss at every thread count -- see below)
+julia --project=. bin/coherent_search.jl --precision f32 ... FILE.fft
 
 # Cross-validation against the Python oracle.  Needs an interpreter that can
 # `import coherent_search`: /home/sransom/python_venvs/pixiPSR/.pixi/envs/default/bin/python
@@ -159,7 +161,11 @@ the hot loop. See `Summary_and_Future_Work.md` (§3) for the roadmap.
   `median_bench.jl`, `interp_bench.jl` (interpolator throughput in points/sec vs
   `m`, grid oversampling and request size, + plots), `thread_scaling.jl`
   (speedup vs threads against the ideal line and an Amdahl fit, plus the
-  CPU-seconds panel; CSV + PNG). Run single-threaded (`-t 1`)
+  CPU-seconds panel; CSV + PNG), `precision_ab.jl` (`:f64` vs `:f32` in **one
+  process**, wall clock plus the in-situ `phase_times` split — the first thing to
+  run when a phase looks suspicious), `chunkfill_bench.jl` (splits
+  `fill_chunk_profiles!` into zeroing / interp / transform, and times the
+  decimated transforms, on the production `Workspace`). Run single-threaded (`-t 1`)
   for clean profile attribution; warm up before timing to exclude JIT. Example
   FFT for longer runs: `PM0063_034C1_DM445.0_red.fft`.
 - **`bench/thread_scaling.jl` is the standard scaling check** (it replaced the
@@ -302,55 +308,79 @@ the hot loop. See `Summary_and_Future_Work.md` (§3) for the roadmap.
   `brfft` efficiency, `_block_sigma`'s 8192-sample subsample) dominate. The
   per-thread workspace is 3.78 MB vs 8 MB shared L3, which *looked* like the
   scaling culprit and is not.
-- **Next target: Kadane** — whose own first-listed step (cross-profile SIMD on
-  the exact scan) is now done, so it is a smaller prize than the write-up assumes.
-  Branch `float32-profiles` narrows the profile stage to `Float32` through a
-  `ProfT`/`CProfT` alias pair at the top of `src/search.jl` — set them back to
-  `Float64`/`ComplexF64` and it is master, which is what makes it cheap to A/B.
-  Rebased onto master 2026-08-15 (so it has the start-up work); 423/423 tests
-  pass and candidates stay byte-identical to master.
-- **The `Float32` profile stage is a *thread-count-dependent* win, and at `-t 1`
-  it is a loss (2026-08-15).** Both earlier verdicts were right about their own
-  configuration and wrong as generalisations. Interleaved A/B, two git worktrees
-  so neither arm invalidates the other's precompile cache, PM0063 at the riptide
-  bench config plus `--ncands 300 --threshold 6.3`:
-
-  | threads | master | f32 | f32 vs master | master CPU-s | f32 CPU-s |
-  |---|---|---|---|---|---|
-  | 1 | 31.1 s | 35.2 s | **0.88x** | 30.6 | 34.7 |
-  | 2 | 18.4 s | 19.9 s | 0.93x | 33.6 | 37.0 |
-  | 4 | 11.1 s | 11.1 s | 1.00x | 37.3 | 37.4 |
-  | 8 | 6.99 s | 6.80 s | 1.03x | 42.3 | 40.9 |
-  | 16 | 5.10 s | 4.49 s | **1.14x** | 51.4 | 45.0 |
-  | 20 | 4.64 s | 4.28 s | 1.08x | 55.5 | 47.7 |
-
-  The CPU-seconds give the mechanism: `Float32` does **13% more** CPU work at
-  `-t 1`, and wins only by *stalling less* once cores contend for bandwidth —
-  master's CPU-seconds inflate 81% from 1→20 threads, f32's only 37%. Crossover
-  is ~4 threads. Scott's `-t 8` NGC6624 runs (227 → 217.5 s, 4.2%, distributions
-  non-overlapping) sit exactly on this curve, as does the original laptop 1.05x
-  at `-t 4`. So it is not a scatter artefact and never was — it is a different
-  point on a curve nobody had swept.
-- **Which makes the merge decision depend on how searches are actually
-  deployed.** A production search over many DMs usually gets its parallelism for
-  free by running one *single-threaded* process per DM, in which case throughput
-  is governed by `-t 1` CPU-seconds — where `Float32` is 13% **worse**. Do not
-  merge `float32-profiles` on the strength of the threaded number alone; decide
-  the deployment model first (see §3.1 of `Summary_and_Future_Work.md`). The open
-  optimisation is to find and remove f32's extra `-t 1` CPU cost, which would
-  make it a win on both axes. Diagnosed so far (§3.1): it is **not** the
-  transform (the `Float32` batched `brfft` is 1.14x *faster* timed alone) and
-  **not** a failed SIMD widening (`src/directinterp.jl` is byte-identical between
-  the arms — the `m`-sum is `Float64` on both). Both regressions sit on
-  `ftprofs`, whose store narrowed to `ComplexF32`.
-- **Profile the band you benchmarked.** `bench/profile_search.jl` defaults to
-  5–30 Hz, and over that band the two Float32 arms differ by 0.6% — the whole
-  effect lives below 5 Hz, where red noise pushes trials past the boxcar gate
-  into the exact-median rescan. Pass `FILE.fft 33.3333 0.1` to match the riptide
-  bench config.
-  Keep the two Float32 results distinct: the *profile stage* is the above;
-  adding Float32 to the *interpolation* on top was 7% *slower* than master and
-  is still not understood (CPU/`m=16`-specific; revisit for a GPU port).
+- **Done (2026-08-16): the decimation gather is gone — 1.12x at `-t 1`, 1.26x at
+  `-t 4…16`, candidates byte-identical.** `decim_pass!` used to copy every `k`-th
+  row of `ftprofs` into a compact `(Hₖ+1, Nprof)` buffer and transform that. The
+  copy read exactly the elements the transform then read again. Rows
+  `1, k+1, 2k+1, …` of `ftprofs` **are** the decimated stack (DC included — the
+  search never writes row 1), so `DecimBuf.src` is now a stride-`k` *view* and
+  FFTW takes the stride. Standalone over `k=2…6`: **1.36x** (`Float64`) /
+  **1.60x** (`Float32`) vs gather-then-transform. End to end (PM0063, riptide
+  bench config, warm in-process, median of 3): `-t 1` 30.14 → 26.99 s, `-t 4`
+  9.98 → 7.92, `-t 8` 5.59 → 4.46, `-t 16` 3.36 → 2.66. It also deletes
+  `Σₖ (Hₖ+1)·Nprof` complex words per workspace, which is why the win grows with
+  thread count.
+- **In-situ phase timers are now permanent** (`phase_reset!` / `phase_times`,
+  `PHASE_NAMES`; ~0.03% of runtime, one `time_ns` pair per phase per chunk).
+  `bench/precision_ab.jl` prints them alongside a wall-clock A/B. Use them
+  *before* reaching for a profiler bucket table: the bucket classifier lumped the
+  base and decimated transforms into one "FFTW" row that was hiding a −22% and a
+  +52% inside a reported +12.4%, and it charged `fill!(ws.ftprofs, 0)` (0.29x in
+  `Float32`) to the `interp` bucket.
+- **`SearchParams.precision` (`:f64` default, `:f32`) replaces the
+  `float32-profiles` branch.** The profile-stage width is a type parameter on
+  `Workspace{…,P}` / `DecimBuf{…,P}`, so both widths live in one build and A/B in
+  one process — which removes the precompile confound that once produced a
+  confidently wrong answer, and makes `--precision f32` a flag rather than a
+  checkout.
+- **`Float32` profiles: do not merge, at any thread count (2026-08-16).** The
+  2026-08-15 verdict below ("a thread-count-dependent win, crossover ~4 threads")
+  was measured *over the gather* and no longer holds. With the gather removed,
+  `:f32` vs `:f64` is **0.82x at `-t 1`, 0.92x at `-t 4`, 0.98x at `-t 8`, 1.01x
+  at `-t 16`.** `Float32` never made the search faster — it relieved a bandwidth
+  problem, and that problem has been fixed at its source, so the threaded win
+  went with it. The deployment-model question (§3.1) therefore no longer decides
+  anything.
+- **Fully-`Float32` interpolation is 1.64x SLOWER, and the reason generalises.**
+  Narrowing `DirectPlan`'s `W`/`A` and the accumulators (the last piece of "make
+  everything `Float32`") costs 1533 → 2482 µs per chunk, against the 1.09x that
+  narrowing only the *store* into `ftprofs` costs. At `m = 16` the `Float32` sum
+  is *exactly one* 16-lane vector — one FMA, no ILP, then a **four**-stage
+  cross-lane reduce — where `Float64` gets two independent 8-lane accumulators and
+  a three-stage reduce. **The per-trial horizontal reduce is what this loop pays
+  for**; narrowing *or* widening the `m`-axis both make it worse (this is the same
+  mechanism as the earlier 8-lane experiment). `build_direct_plans(WT, …)` keeps
+  the knob, but the search always asks for `Float64`.
+- **Four plausible mechanisms for the decimated-transform regression, all
+  measured, all wrong** — record them so they are not re-guessed: (1) *leading-dimension
+  alignment* — `k=4` gives `Hₖ+1 = 16`, perfectly 64-byte aligned in `Float32`,
+  and was the *worst* of the five; padding fixes nothing. (2) *The transposed
+  layout* `(Nprof, Hₖ+1)` transforming along dim 2, giving FFTW batch stride 1 —
+  **2–3x slower** at every size in both precisions, so the current layout is
+  already the right one for the transform. (3) *The data* — genuine chunk
+  contents vs `randn` of the same shape agree to <1% (no subnormals). (4) *Cold
+  caches* — flushing 32 MB between calls makes `Float32` relatively **better**.
+- **"The whole regression lives below 5 Hz" was wrong** (it was profile
+  attribution, not the search): `interp` regresses +20% at 5–13 Hz just as at
+  0.1–8 Hz. Band choice changes the *mix* (how much exact-median rescan runs), not
+  the interp penalty. `bench/profile_search.jl` still defaults to 5–30 Hz; pass
+  `FILE.fft 33.3333 0.1` to match the riptide bench config.
+- **Where the single-thread time is now** (`:f64`, PM0063, 0.1–33.3 Hz, `-t 1`,
+  29.5 s of phases): decim-metric 29%, interp 24%, decim-brfft 18%, gate+metric
+  18%, base brfft 9%. **The boxcar metric work is 47%** across the two metric
+  rows — the largest remaining target, and larger than the interpolation it was
+  long assumed to sit behind. For `interp` (24%), the identified structural cost
+  is the per-trial horizontal reduce, and the way out is vectorising across
+  *trials* (as the boxcar gate did for 2.77–4.05x), not a wider `m`-axis; see
+  §3.1 for the periodicity that makes a trial-ordered weight table possible and
+  for the part that has not been prototyped.
+- **Historical (2026-08-15), superseded by the two entries above but kept because
+  the *shape* of the curve was real:** with the gather still present, `Float32`
+  was 0.88x at `-t 1`, 1.00x at `-t 4`, 1.14x at `-t 16`, doing 13% more CPU work
+  at `-t 1` and winning only by stalling less under contention. Both of the
+  *earlier* verdicts (a laptop 1.05x at `-t 4`, a "do not merge" at `-t 1`) were
+  right about their own configuration and wrong as generalisations — which is the
+  standing lesson, now applied a third time to the 2026-08-15 numbers themselves.
 - **Measurements in these docs are pinned to the config current when taken —
   re-check before reusing one.** Three projections have now been wrong because a
   default moved out from under a recorded number: the `1.35x` for a fully-`Float32`
