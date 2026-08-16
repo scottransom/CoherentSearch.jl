@@ -64,8 +64,9 @@ include("cli.jl")
 # not re-derive it.  Costs ~3.4 s of extra precompilation per `src/` edit and
 # saves ~13 s per run.
 #
-# `--noplot` is essential: plotting would drag CairoMakie (a ~9 s load) into
-# precompilation for no benefit.
+# Plotting must stay out of it — CairoMakie is a ~9 s load and would be dragged
+# into precompilation for no benefit — which is now simply the CLI default
+# (`--plot` opts in), so the workload need not say anything.
 # ---------------------------------------------------------------------------
 using PrecompileTools: @setup_workload, @compile_workload
 
@@ -86,7 +87,11 @@ using PrecompileTools: @setup_workload, @compile_workload
           " Number of bins in the time series          =  $_N\n" *
           " Width of each time series bin (sec)        =  $_dt\n" *
           " Dispersion measure (cm-3 pc)               =  0.0\n")
-    _argv = [_fftpath, "--noplot", "--noprogress", "--threshold", "1e9",
+    # No `--maxdecim`: the CLI now defaults to 6, so letting the workload take
+    # the default is what makes it cache `decim_pass!` — the code path every real
+    # invocation runs.  `Hk` is a field, not a type parameter, so the extra
+    # decimation factors cost a little workload runtime and no extra compilation.
+    _argv = [_fftpath, "--noprogress", "--threshold", "1e9",
              "--nharms", "8", "--blocksize", "64", "--lofreq", "0.6",
              "--hifreq", "0.64", "--nowisdom",
              "-o", joinpath(_dir, "synthetic.cohout")]

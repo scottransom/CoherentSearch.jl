@@ -32,10 +32,13 @@ function parse_cmdline(argv)
         Near-identical candidates are collapsed by default (--noremove disables it),
         as are harmonically-related ones -- the f/2, 2f, 3f/2, ... family of a real
         signal (--noharmremove disables it, --numharm sets the max harmonic).
-        With --maxdecim>1, harmonic decimation also folds each fundamental at 2..k
-        times its frequency almost for free (re-using the interpolated harmonics),
-        extending the search to faster pulsars with fewer summed harmonics; the
-        reported harmonic count identifies which decimation found each candidate.
+        HARMONIC DECIMATION (--maxdecim, default 6) also folds each fundamental at
+        2..k times its frequency almost for free, re-using the interpolated
+        harmonics and summing nharms/k of them; the reported harmonic count
+        identifies which decimation found each candidate.  It is what sets the
+        top of the searched band: --hifreq is the highest FUNDAMENTAL, and the
+        defaults 125 Hz x 6 cover spin frequencies to 750 Hz -- past the 716 Hz
+        of the fastest known pulsar -- in 120 down to 20 profile bins.
         A progress meter prints to stderr (--progressbar for a bar, --noprogress off).
         Pass `-t auto` to Julia for multi-threaded runs.
 
@@ -51,11 +54,15 @@ function parse_cmdline(argv)
         redirects those .cohout files into one directory (and selects .cohout
         naming even for a single file).  `bin/sift_candidates.py` reads .cohout.
 
-        PLOTTING is deferred: all searches run first, and the plotting backend
-        (CairoMakie) is loaded once at the very end to plot every file's
-        candidates.  Loading it costs ~9 s plus first-call compilation, so it is
-        worth avoiding entirely with --noplot in bulk runs; candidates can always
-        be plotted afterwards from the .cohout files with bin/plot_candidates.jl.
+        PLOTTING is OFF by default and enabled with --plot, at which point it is
+        deferred: all searches run first, and the plotting backend (CairoMakie) is
+        loaded once at the very end to plot every file's candidates.  Off by
+        default because it costs ~9 s to load plus first-call compilation, and
+        because deferring it keeps every input's mmap live to the end of the run
+        (50 large files is tens of GB of address space pinned at once) -- neither
+        of which a pipeline wants.  Candidates can always be plotted afterwards
+        from the .cohout files with bin/plot_candidates.jl.  --noplot is still
+        accepted, and ignored, so existing scripts keep working.
         """,
     )
     @add_arg_table! s begin
@@ -77,9 +84,9 @@ function parse_cmdline(argv)
             arg_type = String
             default = ""
         "--nharms", "-n"
-            help = "Number of harmonics to sum (default: 32, or 60 when --maxdecim>1)"
+            help = "Number of harmonics to sum. 60 is composite, so it decimates evenly by 2,3,4,5,6"
             arg_type = Int
-            default = -1
+            default = 60
         "--ncands"
             help = "Maximum number of candidates to return"
             arg_type = Int
@@ -93,9 +100,9 @@ function parse_cmdline(argv)
             arg_type = Float64
             default = 0.1
         "--hifreq"
-            help = "Highest frequency (in Hz) to search"
+            help = "Highest FUNDAMENTAL frequency (in Hz) to search. Decimation carries coverage the rest of the way, to --hifreq * --maxdecim; the default 125 x 6 = 750 Hz clears the fastest known pulsar (716 Hz) with headroom"
             arg_type = Float64
-            default = 100.0
+            default = 125.0
         "--hidr"
             help = "Fourier bin resolution at highest harmonic"
             arg_type = Float64
@@ -115,9 +122,9 @@ function parse_cmdline(argv)
             arg_type = Int
             default = 2048
         "--maxdecim"
-            help = "Max harmonic-decimation factor k: also search 2..k times each fundamental (default: 1 = off)"
+            help = "Max harmonic-decimation factor k: also search 2..k times each fundamental, folding nharms/k harmonics. 1 disables it"
             arg_type = Int
-            default = 1
+            default = 6
         "--drtol"
             help = "Fourier-bin tolerance for collapsing near-identical candidates"
             arg_type = Float64
@@ -154,8 +161,11 @@ function parse_cmdline(argv)
             help = "Path to the FFTW plan-wisdom cache (default: per-host file under the Julia depot, or \$COHERENT_WISDOM)"
             arg_type = String
             default = ""
+        "--plot"
+            help = "Plot the candidate pulse profiles. Off by default: it loads CairoMakie (~9 s) and holds every input's mmap live until the end of the run, neither of which a pipeline wants. Plot afterwards from the candidate files with bin/plot_candidates.jl"
+            action = :store_true
         "--noplot"
-            help = "Do not plot the candidate pulse profiles (plotting is on by default)"
+            help = "Accepted and ignored -- plotting is already off unless --plot is given. Kept so existing pipelines and scripts do not break"
             action = :store_true
         "--plotstem"
             help = "Output path stem for profile-plot PNGs (single input file only; default: derived from the candidate filename or the FFT name)"
@@ -177,7 +187,7 @@ end
     main(argv) -> Nothing
 
 Entry point for the `coherent_search` command line.  Searches every FFT file in
-`argv`, writing each one's candidates as it finishes, then — unless `--noplot` —
+`argv`, writing each one's candidates as it finishes, then — only with `--plot` —
 loads the plotting backend *once* and plots them all.
 """
 function main(argv)
@@ -195,12 +205,17 @@ function main(argv)
         throw(ArgumentError("--plotstem names one plot stem but $nfiles FFT files were given; " *
                             "omit it (each file's plots are named after its own .cohout)"))
     end
+    # `--plotstem` only means anything with `--plot`; silently ignoring it would
+    # leave someone waiting for PNGs that are never coming.
+    if !a["plot"] && !isempty(a["plotstem"])
+        @warn "--plotstem given but plotting is off; pass --plot to produce them"
+    end
+
     outdir = a["outdir"]
     isempty(outdir) || mkpath(outdir)
 
     maxdecim = a["maxdecim"]
-    # Resolve nharms: explicit if given, else 60 when decimating (composite) or 32.
-    nharms = a["nharms"] >= 1 ? a["nharms"] : (maxdecim > 1 ? 60 : 32)
+    nharms = a["nharms"]
     decimations = decimation_set(nharms, maxdecim)
     # One `SearchParams` for every file — `SearchCache` keys its reuse on this
     # object's identity, so it must not be rebuilt inside the loop.
@@ -225,7 +240,7 @@ function main(argv)
         outfile = output_path(path, a["outputfilenm"], outdir, nfiles)
         cands = search_one(ft, params, a, cache)
         write_candidates(cands, outfile, a["threshold"])
-        if !a["noplot"] && !isempty(cands)
+        if a["plot"] && !isempty(cands)
             push!(toplot, (ft, cands, plot_stem(a["plotstem"], outfile, path)))
         end
     end
@@ -334,7 +349,7 @@ pays its ~9 s load once rather than once per file.
 """
 function plot_all(toplot::Vector{Tuple{FFTFile,Vector{Candidate},String}}, params::SearchParams, a)
     isempty(toplot) && return nothing
-    @info "Loading the plotting backend (CairoMakie); --noplot skips this" files=length(toplot)
+    @info "Loading the plotting backend (CairoMakie) for --plot" files=length(toplot)
     # Include into `Main`, not into this module: `plotting.jl` depends on
     # CairoMakie and Dates, which belong to the *active project*, not to
     # CoherentSearch's own dependencies.  Including it here would resolve those

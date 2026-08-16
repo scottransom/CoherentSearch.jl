@@ -84,16 +84,19 @@ byte-identical candidates is the normal standard.
 # Tests (the correctness gate)
 julia --project=. -e 'using Pkg; Pkg.test()'
 
-# Search (-t auto for all cores)
-julia --project=. -t auto bin/coherent_search.jl FILE.fft --lofreq 0.1 --hifreq 100
+# Search (-t auto for all cores).  The bare defaults are a full blind search:
+# 0.1-125 Hz fundamentals, --nharms 60 --maxdecim 6 => spin coverage to 750 Hz,
+# and no plotting (--plot opts in; --noplot is accepted and ignored).
+julia --project=. -t auto bin/coherent_search.jl FILE.fft
 # Many files in ONE invocation (start-up + plans paid once; one .cohout each)
-julia --project=. -t auto bin/coherent_search.jl *_red.fft --noplot --threshold 8
+julia --project=. -t auto bin/coherent_search.jl *_red.fft --threshold 8
 # Production sysimage (build takes minutes; freezes src/ — do not use while editing)
 julia --project=sysimage sysimage/build_sysimage.jl
 julia --sysimage sysimage/coherent_search.so --project=. -t auto bin/coherent_search.jl ...
-# Heavy multi-frequency config (the standard perf test):
+# The standard perf test (this is now close to the defaults; --hifreq pins the
+# band so timings stay comparable to the recorded ones):
 julia --project=. -t 4 bin/coherent_search.jl --threshold 6 \
-      --maxdecim 6 -o out.txt --noplot FILE.fft
+      --lofreq 0.1 --hifreq 33.3333 -o out.txt FILE.fft
 # Trial grid, chunking and interpolation phase-cycle lengths
 julia --project=. bin/coherent_search.jl --verbose ... FILE.fft
 # Narrowed profile stage (measured a loss at every thread count -- see below)
@@ -250,9 +253,11 @@ the hot loop. See `Summary_and_Future_Work.md` (§3) for the roadmap.
   - **Multi-file runs + `SearchCache`** (reuses hplans/workspaces across files;
     `dplans` still per-file, they depend on `r_lo`): 3 files in 4.83 s, i.e.
     ~1.2 s marginal per file vs 15.65 s for a separate invocation.
-  **The biggest single fixed cost left is plotting, which is on by default:**
+  **The biggest single fixed cost left is plotting, which was on by default when
+  this was measured:**
   `using CairoMakie` alone is 9.0 s. Plotting is now deferred to one pass after
-  all searches, so a batch pays it once, and bulk runs should use `--noplot`.
+  all searches, so a batch pays it once. **Plotting is off by default as of
+  2026-08-16** (`--plot` opts in), for this reason and the mmap one below.
 - **`SearchCache` is already DM-safe — glob a whole DM range into one
   invocation** (`... NGC6624_16L_DM??.??_red.fft`). `_plans!` keys reuse on
   `cache.params === params && cache.Nprof == Nprof` and **never consults the
@@ -280,15 +285,15 @@ the hot loop. See `Summary_and_Future_Work.md` (§3) for the roadmap.
   finely-sampled file will quietly lose harmonics on a coarser-sampled one in the
   same glob. If a diagnostic is ever wanted for mixed-`dt` runs, this is where it
   belongs.
-- **But use `--noplot` for such a run, for a second reason beyond CairoMakie's
-  9 s.** With plotting on, `main`'s deferral pushes `(ft, cands, stem)` into
+- **The second reason plotting is off by default, beyond CairoMakie's 9 s.**
+  With plotting on, `main`'s deferral pushes `(ft, cands, stem)` into
   `toplot` and plots only after every search, so **every input's mmap stays live
   to the end of the run** — 50 NGC6624 files is 69 GB of mmap pinned at once
-  (`FFTFile` mmaps the whole `.fft`; `src/fileio.jl`). With `--noplot` each `ft`
+  (`FFTFile` mmaps the whole `.fft`; `src/fileio.jl`). Without `--plot` each `ft`
   is collectable as its iteration ends.
 - **The PackageCompiler sysimage (`sysimage/`) is worth it *only* for plotting
   runs — this was projected as the big win and measured as almost nothing.**
-  Warm: `--noplot` 2.3 s with it vs 2.4 s without (nothing — the precompile
+  Warm: no-plot 2.3 s with it vs 2.4 s without (nothing — the precompile
   workload already took that), but with plots 7.4 s vs 18.7 s (**2.5x**). It
   removes CairoMakie's load and nothing else, because Julia's boot is only
   ~0.2 s and the search is already cached. Costs: ~28 min to build, 1.14 GB, and

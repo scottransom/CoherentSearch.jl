@@ -430,7 +430,7 @@ def main(argv=None):
               os.path.join(REPO, "bin", "coherent_search.jl"),
               "--lofreq", repr(lofreq), "--hifreq", repr(hifreq),
               "--nharms", str(nharms), "--maxdecim", str(maxdecim),
-              "--threshold", str(threshold), "--noplot", "--noprogress",
+              "--threshold", str(threshold), "--noprogress",
               "-o", out]
         if args.noharmremove:
             c += ["--noharmremove"]

@@ -75,16 +75,25 @@ programs as described below.
 Run the CLI (use `-t auto` so Julia uses all cores):
 
 ```sh
-julia --project=. -t auto bin/coherent_search.jl FILE.fft \
-    --lofreq 0.1 --hifreq 100 --nharms 32 --threshold 8
+julia --project=. -t auto bin/coherent_search.jl FILE.fft
 ```
 
-Or from Julia:
+The defaults are a full blind search: fundamentals `0.1–125 Hz` with
+`--nharms 60`, plus `--maxdecim 6`, which carries coverage to **750 Hz** in spin
+frequency — past the 716 Hz of the fastest known pulsar, with headroom — folding
+120 profile bins at the low end down to 20 at the high end. Plotting is off;
+pass `--plot` for it.
+
+Or from Julia — the same search the CLI runs by default, spelled out. The
+library primitives keep their own minimal defaults (`SearchParams()` is
+`nharms = 32`, no decimation); the survey policy above lives in the CLI, so
+state it explicitly when calling `search` directly:
 
 ```julia
 using CoherentSearch
 ft = FFTFile("FILE.fft")
-cands = search(ft, SearchParams(nharms=32); lofreq=0.1, hifreq=100, threshold=8)
+params = SearchParams(nharms=60, decimations=decimation_set(60, 6), threshold=8)
+cands = search(ft, params; lofreq=0.1, hifreq=125, threshold=8)
 ```
 
 Each candidate reports its barycentric spin frequency, period (`1/f`), the S/N
@@ -97,7 +106,7 @@ once per file:
 
 ```sh
 julia --project=. -t auto bin/coherent_search.jl *_red.fft \
-    --lofreq 0.1 --hifreq 100 --threshold 8 --noplot
+    --threshold 8
 ```
 
 Julia compiles the search on first use, which costs ~10 s of wall-clock before
@@ -122,47 +131,56 @@ Output naming follows from this:
 `bin/sift_candidates.py` reads `.cohout` (and `.txt`) files, so a whole DM sweep
 can be sifted with `sift_candidates.py <dir>`.
 
-**Plotting is deferred to the end of the run.** All searches finish first, then
-CairoMakie is loaded *once* to plot every file's candidates. Loading it costs
-~9 s plus first-call compilation — by far the largest fixed cost in the program —
-so in bulk runs pass `--noplot` and plot later from the saved candidate files
-with `bin/plot_candidates.jl`.
-
-Or from Julia:
-
-```julia
-using CoherentSearch
-ft = FFTFile("FILE.fft")
-cands = search(ft, SearchParams(nharms=32); lofreq=0.1, hifreq=100, threshold=8)
-```
+**Plotting is off by default, and deferred when enabled.** With `--plot`, all
+searches finish first and CairoMakie is loaded *once* to plot every file's
+candidates. Loading it costs ~9 s plus first-call compilation — by far the
+largest fixed cost in the program — and the deferral pins every input's mmap
+until the end of the run, so bulk runs should leave it off and plot later from
+the saved candidate files with `bin/plot_candidates.jl`.
 
 Searching several files from Julia? Share one `SearchCache` (and one
 `SearchParams` object — reuse is keyed on its identity):
 
 ```julia
-params, cache = SearchParams(nharms=32), SearchCache()
+params = SearchParams(nharms=60, decimations=decimation_set(60, 6))
+cache = SearchCache()
 for f in files
-    cands = search(FFTFile(f), params; cache=cache, lofreq=0.1, hifreq=100)
+    cands = search(FFTFile(f), params; cache=cache, lofreq=0.1, hifreq=125)
 end
 ```
 
 ### Multi-frequency search by harmonic decimation
 
-`--maxdecim k` (default `1` = off) additionally folds every trial fundamental at
-`2×, 3×, … k×` its frequency *almost for free*, by re-using the harmonic
-amplitudes already interpolated for the base fold: taking every `k`-th harmonic
-and running a shorter inverse FFT yields the fold at `k·rf` with
+`--maxdecim k` (default `6`; `1` disables it) additionally folds every trial
+fundamental at `2×, 3×, … k×` its frequency *almost for free*, by re-using the
+harmonic amplitudes already interpolated for the base fold: taking every `k`-th
+harmonic and running a shorter inverse FFT yields the fold at `k·rf` with
 `⌊nharms/k⌋` harmonics. This extends the search to faster pulsars (which tend to
 have wider profiles and so need fewer harmonics) without paying for extra
-interpolation. When enabled, `nharms` defaults to a composite `60` so that many
-`k` give clean integer harmonic counts. The harmonic count printed for each
-candidate identifies the decimation that found it (`k = nharms ÷ nharm`).
+interpolation. `nharms` defaults to a composite `60` so that `k = 2,3,4,5,6` all
+give clean integer harmonic counts. The harmonic count printed for each candidate
+identifies the decimation that found it (`k = nharms ÷ nharm`).
+
+**This is what sets the top of the searched band.** `--hifreq` is the highest
+*fundamental*; decimation carries coverage to `--hifreq × --maxdecim`. The
+defaults (`125 × 6`) reach 750 Hz. Raising `--hifreq` alone is usually the wrong
+move — it buys the same coverage at far more cost, since every extra fundamental
+is a full 60-harmonic interpolation while a decimation is nearly free.
 
 ```sh
-# Search fundamentals 0.1–100 Hz and, via decimation, faster pulsars up to ~600 Hz
+# Fundamentals 0.1–200 Hz, and via decimation spin frequencies to 1200 Hz
 julia --project=. -t auto bin/coherent_search.jl FILE.fft \
-    --lofreq 0.1 --hifreq 100 --maxdecim 6 --threshold 8
+    --hifreq 200 --maxdecim 6 --threshold 8
 ```
+
+> **A note on the harmonic depth.** At `--nharms 60`, a signal whose harmonic
+> content extends well past harmonic 60 can be detected *more* strongly at one of
+> its own harmonics than at the fundamental — folding at `11f` puts the same
+> absolute pulse width across a proportionally coarser phase grid, which the
+> boxcar bank matches better. Harmonic collapse keeps the strongest member of the
+> family, so such a signal is reported at that harmonic. It shows up on
+> narrow-duty synthetic tests; on real observations, whose harmonic content is
+> bounded by scattering and finite time resolution, the fundamental wins.
 
 See `decimation_design.md` for the derivation that decimation stays correctly
 sampled (each `k`'s top harmonic still steps by ≤ `hidr`, and the base input-FFT
@@ -203,14 +221,18 @@ recovered from an isolated profile.
 
 ### Candidate profile plots
 
-By default the CLI reconstructs and plots the pulse profile of every reported
+With `--plot`, the CLI reconstructs and plots the pulse profile of every reported
 candidate, one grid of panels per US-Letter portrait page, written as
-zero-padded PNGs (`<stem>_01.png`, `<stem>_02.png`, …).  Each profile is folded
+zero-padded PNGs (`<stem>_01.png`, `<stem>_02.png`, …).  It is **off by default**:
+CairoMakie costs ~9 s to load, and because plotting is deferred to the end of the
+run it keeps every input's mmap live until then, which a bulk pipeline does not
+want.  (`--noplot` is still accepted and ignored, so existing scripts keep
+working.)  Each profile is folded
 with a high-accuracy exact-interpolation path (independent of the throughput-
 tuned search) and rotated so its peak sits at phase 0.5; the panel caption
 carries the full text-line information (index, S/N, frequency, period, harmonic
 count, and the decimation `k`).  Plotting loads CairoMakie lazily — searches
-that pass `--noplot`, the test suite, and the cross-validation never load it.
+without `--plot`, the test suite, and the cross-validation never load it.
 
 Every profile is folded at the **full `--nharms` harmonic depth**, regardless of
 the harmonic-decimation factor `k` that found the candidate (a `k=3` detection
@@ -222,7 +244,7 @@ omitted (not zero-padded), so a fast candidate's profile uses fewer bins.  The
 
 ```sh
 julia --project=. -t auto bin/coherent_search.jl FILE.fft -o cands.txt \
-    --plotstem cands --plotcols 3 --plotrows 5     # -> cands_01.png, ...
+    --plot --plotstem cands --plotcols 3 --plotrows 5     # -> cands_01.png, ...
 ```
 
 The same plots can be regenerated later from a saved candidate file, without
@@ -257,7 +279,7 @@ address it, and a third is available for production.
 
    | | no sysimage | sysimage |
    |---|---|---|
-   | `--noplot` | 2.4 s | 2.3 s |
+   | no `--plot` | 2.4 s | 2.3 s |
    | with plots | 18.7 s | **7.4 s** |
 
    ```sh
@@ -269,7 +291,7 @@ address it, and a third is available for production.
 
    Worth it only for repeated plotting-enabled runs: the image is 1.14 GB, and
    the *first* run after building it (or after a reboot) spends ~23 s reading it
-   into page cache. If you run with `--noplot`, skip it.
+   into page cache. If you run without `--plot`, skip it.
 
    Use it for production runs, **not during development**: a sysimage freezes
    `src/` as of its build, so later edits are silently ignored until you rebuild
