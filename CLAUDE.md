@@ -460,6 +460,31 @@ strictly dominated for a while and was still costing something to carry.
   production one (equivalence-faithful). Previously both were the same accidental
   constant, which would have started lying silently the moment either moved.
 
+## Known follow-up: the test signal is too bright
+
+`../coherent_search/examples/harmonics_hi.fft` (the 10.0123456789123 Hz fake
+pulsar, `T = 1000 s`) is far stronger than anything a search would really face,
+and its harmonic content runs well past harmonic 60. That is what makes the
+default `--nharms 60` search report it at **11f rather than f**: folded at 11f it
+scores 31.92 against the fundamental's 28.97, so harmonic collapse — which keeps
+the strongest family member — quite correctly picks the harmonic. Real
+observations do not behave this way (scattering and finite time resolution bound
+the harmonic content), so this is a property of the test fixture, not a defect.
+
+**The fix is to regenerate the fixture fainter**, in the sibling Python repo.
+Before doing that, note what leans on its brightness:
+
+- Several `test/test_search.jl` pins assert `!isempty(cands)` at `threshold=8.0`
+  over 9.5–10.5 Hz; a much fainter signal could drop below and turn them into
+  flaky tests rather than failing ones.
+- `test_search.jl` also pins the chunk-size drift and duplicate/harmonic-collapse
+  behaviour on this signal, and `crossval/` uses it as the default `COHERENT_FFT`.
+  The oracle regenerates its reference arrays from whatever file it is given, so
+  the cross-validation itself is indifferent to the change.
+
+So: regenerate, then re-check those thresholds deliberately rather than nudging
+them until green.
+
 ## Environment gotchas (Julia 1.12)
 
 - `SortingNetworks.jl` and `StatProfilerHTML`'s HTML writer are **broken on
