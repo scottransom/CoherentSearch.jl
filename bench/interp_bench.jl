@@ -66,12 +66,16 @@ end
 
 bench_direct(out, n, step, m) = CS.finterp_direct!(out, R0, n, step, amps, m)
 
-# The FFT path is measured through the production, allocation-free
-# `interp_tile!` on a prebuilt `FFTScratch` (MEASURE plans, kernel cached) so it
-# is not penalised for the allocating convenience wrapper.
+# The FFT arm is now measured through `finterp_fft`, the *reference* kernel that
+# `reference_profiles` uses and the Python oracle is pinned to.  It allocates its
+# grid, where the retired production `interp_tile!` reused prebuilt FFTW buffers,
+# so this arm is a little pessimistic — which does not matter for its only
+# remaining purpose, recording the order-of-magnitude gap that motivated the
+# direct interpolator in the first place.  Do not quote it as a production
+# figure; the settled number is the 3.8x in Summary_and_Future_Work.md.
 """FFT-correlation onto a `nb`-per-bin grid, then linear interpolation."""
-function bench_fft_linear(out, n, step, m, nb, sc, coeffs, lobin, numbins)
-    grid = CS.interp_tile!(sc, coeffs, lobin, numbins, nb, amps, m)
+function bench_fft_linear(out, n, step, m, nb, lobin, numbins, fftlen)
+    grid = finterp_fft(lobin, numbins, nb, amps, m; fftlen=fftlen)
     @inbounds for k in 1:n
         out[k] = CS.uniform_linear_interp(R0 + (k - 1) * step, lobin, nb, grid)
     end
@@ -79,23 +83,20 @@ function bench_fft_linear(out, n, step, m, nb, sc, coeffs, lobin, numbins)
 end
 
 """Cost of the FFT-correlation alone, i.e. per *grid* point."""
-bench_fft_grid(m, nb, sc, coeffs, lobin, numbins) =
-    CS.interp_tile!(sc, coeffs, lobin, numbins, nb, amps, m)
+bench_fft_grid(m, nb, lobin, numbins, fftlen) =
+    finterp_fft(lobin, numbins, nb, amps, m; fftlen=fftlen)
 
 function fft_setup(n, step, m, nb)
     lobin = floor(Int, R0)
     numbins = floor(Int, R0 + (n - 1) * step) - lobin + 2
     fftlen = next_smooth((numbins + m) * nb)
-    sc = CS.FFTScratch(fftlen)
-    coeffs = CS.finterp_fft_coeffs(nb, m, fftlen) ./ fftlen
-    return (sc, coeffs, lobin, numbins, fftlen, numbins * nb)
+    return (lobin, numbins, fftlen, numbins * nb)
 end
 
 # The search's own tabulated hot loop, driven through a real Workspace.
 function direct_table_setup(n, step, m, nharms)
-    params = SearchParams(nharms=nharms, m=m, interp=:direct)
-    hplans = CS.build_harmonic_plans(params, n)
-    ws = CS.Workspace(params, hplans, n)
+    params = SearchParams(nharms=nharms, m=m)
+    ws = CS.Workspace(params, n)
     dplans = CS.build_direct_plans(params, R0 / nharms)
     return (params, ws, dplans[nharms])       # top harmonic: step = hidr = 0.5
 end
@@ -122,17 +123,17 @@ const STEP = 0.5     # bins per requested point (the search's top-harmonic step)
 function run_row(m, nb, n; want_table::Bool)
     out = Vector{ComplexF64}(undef, n)
     ref = Vector{ComplexF64}(undef, n)
-    sc, coeffs, lobin, numbins, fftlen, ngrid = fft_setup(n, STEP, m, nb)
+    lobin, numbins, fftlen, ngrid = fft_setup(n, STEP, m, nb)
 
     bench_reference(ref, n, STEP, m)
     t_ref = @belapsed bench_reference($out, $n, $STEP, $m) samples=12 evals=1
     t_dir = @belapsed bench_direct($out, $n, $STEP, $m) samples=12 evals=1
     bench_direct(out, n, STEP, m)
     err_dir = maximum(abs.(out .- ref) ./ abs.(ref))
-    t_fft = @belapsed bench_fft_linear($out, $n, $STEP, $m, $nb, $sc, $coeffs, $lobin, $numbins) samples=12 evals=1
-    bench_fft_linear(out, n, STEP, m, nb, sc, coeffs, lobin, numbins)
+    t_fft = @belapsed bench_fft_linear($out, $n, $STEP, $m, $nb, $lobin, $numbins, $fftlen) samples=12 evals=1
+    bench_fft_linear(out, n, STEP, m, nb, lobin, numbins, fftlen)
     err_fft = maximum(abs.(out .- ref) ./ abs.(ref))
-    t_grid = @belapsed bench_fft_grid($m, $nb, $sc, $coeffs, $lobin, $numbins) samples=12 evals=1
+    t_grid = @belapsed bench_fft_grid($m, $nb, $lobin, $numbins, $fftlen) samples=12 evals=1
 
     t_tab = NaN
     if want_table

@@ -948,6 +948,44 @@ gather is the piece that has not been prototyped.
 The boxcar metric work is **47%** across the two metric rows — the largest single
 target left, and larger than the interpolation it was long assumed to sit behind.
 
+#### Retirements (2026-08-16)
+
+Two paths were removed outright rather than left as options, because both had
+become strictly dominated and both were still costing something to carry:
+
+- **The production `:fft` interpolator** (`interp_tile!`, `fill_harmonic_row!`,
+  `FFTScratch`, `HarmonicPlan`/`build_harmonic_plans`/`harmonic_plan_report`,
+  `harmonic_numbetween`, and the `interp`/`fftsizing`/`align` parameters with
+  their CLI flags). It had been superseded on 2026-08-08 by the direct kernel —
+  3.8× slower and ~1e-2 accurate against ~1e-10 — and survived only as "the
+  machine-precision equivalence gate". That role is now filled better: the FFT
+  correlation lives on in `fourierinterp.jl` and `reference_profiles(...;
+  kernel=:fft)`, which is what the Python oracle actually pins, while the
+  end-to-end gate runs `chunk_metrics` against `block_metrics(...;
+  kernel=:direct)` — **the exact kernel on both sides, agreeing at 8.4e-16**.
+  The old gate agreed at 7e-16 too, but only because both sides shared an
+  interpolator carrying a ~1e-2 error, so it could not have caught that
+  interpolator being wrong. Dropping `FFTScratch` also removed the `S` type
+  parameter and the `scratch::Dict` from `Workspace`, along with `hplans` from
+  `fill_chunk_profiles!`, `_search_region!`, `_plans!` and `SearchCache`.
+
+- **The `:non`/`:sd2` on-pulse metrics.** Upstream replaced `snr_metric` with the
+  boxcar matched filter as its only metric, so these had no oracle left; they had
+  no user either, `:boxcar` having been the default since it was written. Their
+  removal took `_profile_snr`, `xsignal`, `pexp` and a branch out of the hot loop
+  and out of `decim_pass!`, `chunk_metrics` and `block_metrics`.
+
+`src/` went 3798 → 3514 lines (`search.jl` 2281 → 1995) with candidate output
+byte-identical and warm `-t 1` wall clock unchanged in an interleaved A/B (29.4 s
+vs 28.6 s, pre vs post, on a machine with background load).
+
+One subtlety worth keeping: the pooled block `σ̂` is an exact MAD in Python and a
+`_BOXCAR_SIGMA_SAMPLES` subsample in the production search. `snr_metrics` now
+defaults to the exact estimator (oracle-faithful) and takes `sigma_samples`, which
+`block_metrics` sets to the production value (equivalence-faithful). Previously
+both were the same accidental constant, which would have started lying silently
+the moment either moved.
+
 Open question, and the natural next piece of work: **how should large-scale
 searches actually be driven?** The candidates are (a) one single-threaded
 process per DM, maximising throughput and letting the batch scheduler handle

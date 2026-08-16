@@ -22,23 +22,24 @@ for multi-threaded performance and is numerically pinned to the Python original.
 
 - `src/fourierinterp.jl` — Fourier interpolation kernels (Eqn. 30 of
   astro-ph/0204349). Heavily indexing-tested (0-based Python ↔ 1-based Julia).
-- `src/directinterp.jl` — **the default interpolator** (`--interp direct`).
-  Evaluates Eqn. 30 exactly at each trial: the coefficients factor as
-  `A(dr)/(dr-j)` with *real* `1/(dr-j)`, and only `q = 2·nharms` distinct `dr`
-  occur in a whole search, so the weights are tabulated once per harmonic and
-  indexed by an exact integer residue. No FFT, no fine grid, no linear interp.
-  ~3.8× faster than the FFT path *and* ~1e-10 vs its ~1e-2 accuracy.
-  `--interp fft` keeps the old FFT-correlation path (the Python original's
-  method) as a fallback and as the machine-precision equivalence gate.
+  **Reference only** — `fourier_interp` (exact, per point) and `finterp_fft`
+  (FFT-correlation onto a fine grid, the Python original's method) are what
+  `reference_profiles` and the cross-validation use. Nothing here runs in a
+  search.
+- `src/directinterp.jl` — **the interpolator.** Evaluates Eqn. 30 exactly at each
+  trial: the coefficients factor as `A(dr)/(dr-j)` with *real* `1/(dr-j)`, and
+  only `q = 2·nharms` distinct `dr` occur in a whole search, so the weights are
+  tabulated once per harmonic and indexed by an exact integer residue. No FFT, no
+  fine grid, no linear interp. ~3.8× faster than the FFT-correlation path it
+  replaced *and* ~1e-10 vs its ~1e-2 accuracy.
 - `src/fileio.jl` — mmap'd PRESTO `.fft` reader + `.inf` parser. Amplitudes are
   `ComplexF32`; element 1 packs DC.re + Nyquist.im.
 - `src/search.jl` — the core. **Two paths that must agree:**
   - a simple *reference* path (`block_metrics`/`reference_profiles`) kept
     deliberately unoptimised and pinned to the Python oracle at ~1e-15;
   - an *optimised* production `search`: chunk-parallel (`@spawn`, one private
-    `Workspace` per task), per-harmonic cached FFTW plans + interpolation
-    kernels, a batched inverse FFT, and harmonic decimation for cheap
-    multi-frequency search.
+    `Workspace` per task), cached per-harmonic interpolation tables, a batched
+    inverse FFT, and harmonic decimation for cheap multi-frequency search.
 - `src/candidate.jl`, `bin/plotting.jl` — per-candidate profile reconstruction
   and CairoMakie plots (loaded lazily; ordinary runs/tests never pay for it).
 - `bin/sift_candidates.py` — cross-observation/cross-DM candidate sifter (a
@@ -54,19 +55,28 @@ for multi-threaded performance and is numerically pinned to the Python original.
   one `SearchCache`, and defers all plotting to a single pass at the end.
 
 **Correctness discipline (do not break this):** every optimisation must keep the
-oracle/equivalence pins green. There are now two, one per interpolator:
+oracle/equivalence pins green. There are three, and they chain:
 
-- **`:fft`** — the `align=false` tests in `test/test_search.jl` pin the optimised
-  path to `block_metrics` at machine precision. They must be run with
-  `interp=:fft, fftsizing=:pow2`, which is exactly what `block_metrics` does.
-- **`:direct`** — pinned to `fourier_interp` (the exact Eqn.-30 kernel, itself
-  oracle-pinned to Python at ~3e-16) at ~1e-8, plus a bit-exact chunk-invariance
-  test. This is a *stronger* statement than the `:fft` pin, since it is agreement
-  with the exact kernel rather than with an approximating path.
+- **Python oracle** (`crossval/crossval_accuracy.jl`, needs the sibling repo and
+  a Python that can import it): `finterp_fft` at 3.9e-16, `reference_profiles`
+  at 1.4e-16, and `snr_metrics` (the boxcar matched filter) at 7.0e-17. Run it
+  after touching anything in `fourierinterp.jl`, `reference_profiles`, or the
+  metric. **The oracle prefers the sibling repo's `src/` over any installed copy
+  and prints the path it used** — a stale non-editable install once pinned this
+  comparison to a superseded metric with no visible sign.
+- **End-to-end equivalence**: `chunk_metrics` (the whole optimised machinery)
+  against `block_metrics(...; kernel=:direct)`, at **8.4e-16**. Both sides
+  evaluate the exact Eqn.-30 kernel — the reference point by point, the
+  production path through its tabulation — so the residual is rounding, not
+  method. The same testset also asserts the `kernel=:fft` reference is orders of
+  magnitude further away, which is the accuracy the production interpolator buys.
+- **Interpolator**: `fill_harmonic_row_direct!` against `fourier_interp` at
+  ~1e-11, plus a **bit-exact** chunk-invariance test (a chunk starting at global
+  trial `t0` must reproduce one long chunk exactly).
 
-The two interpolators cannot agree bit-for-bit — `:fft` carries a
-linear-interpolation error — so a `:direct` change is checked by candidate-list
-comparison (same survivors, metrics within ~1%), not byte-identical diff.
+A change that should not move results is checked by `diff` on the `.cohout`, not
+by eyeball: the production path is deterministic and chunk-invariant, so
+byte-identical candidates is the normal standard.
 
 ## Commands
 
@@ -84,10 +94,8 @@ julia --sysimage sysimage/coherent_search.so --project=. -t auto bin/coherent_se
 # Heavy multi-frequency config (the standard perf test):
 julia --project=. -t 4 bin/coherent_search.jl --threshold 6 \
       --maxdecim 6 -o out.txt --noplot FILE.fft
-# Per-harmonic interpolation plan (fftlen, numbetween, m, padding, linterp)
+# Trial grid, chunking and interpolation phase-cycle lengths
 julia --project=. bin/coherent_search.jl --verbose ... FILE.fft
-# The old FFT-correlation interpolator (fallback / equivalence gate)
-julia --project=. bin/coherent_search.jl --interp fft --fftsizing pow2 ... FILE.fft
 # Narrowed profile stage (measured a loss at every thread count -- see below)
 julia --project=. bin/coherent_search.jl --precision f32 ... FILE.fft
 
@@ -183,9 +191,10 @@ the hot loop. See `Summary_and_Future_Work.md` (§3) for the roadmap.
   dispatch) — together ~1.6× warm single-thread, results unchanged. See §2 of
   `Summary_and_Future_Work.md`.
 - **Done (2026-08-08):** direct `O(m)` interpolation replacing the FFT
-  correlation (`src/directinterp.jl`, `--interp direct`, now the default). The
-  interp FFTs — 76% of the chunk fill, ~50% of runtime — are gone; **1.64×
-  end-to-end** and ~1e-10 accuracy where the FFT path had ~1e-2.
+  correlation (`src/directinterp.jl`). The interp FFTs — 76% of the chunk fill,
+  ~50% of runtime — are gone; **1.64× end-to-end** and ~1e-10 accuracy where the
+  FFT path had ~1e-2. (The `--interp fft` fallback it left behind was deleted on
+  2026-08-16; see the retirement entry below.)
 - **Done (2026-08-09): default `m` 32 → 16, plus a `--m` flag.** Justified by the
   Monte Carlo in `../coherent_search/examples/interp_accuracy_vs_m.md`: the
   recovered signal-power fraction is `S_m = Σ sinc²(dr−k)`, so the loss is
@@ -394,19 +403,18 @@ the hot loop. See `Summary_and_Future_Work.md` (§3) for the roadmap.
 - **Twice now, a plausible mechanism with an order-of-magnitude estimate that
   *matched the measured total* has been wrong** (smooth `fftlen`; `_block_sigma`'s
   `idiv`). Split the function and measure the phases before optimising one.
-- **Smooth `fftlen` sizing: re-examined, still rejected — but measure in situ,
-  not per size.** Per transform it really is 1.26× (`next_pow_of_2` wastes a mean
-  1.38× in length, and we choose the length). In a real search it is a wash to
-  −7%: specific smooth lengths (`3^k`-heavy: 6561, 13122, 15309) are *worse* than
-  the power of two, and `:pow2`'s 4 shared `FFTScratch` sets stay cache-warm
-  where 8–16 smooth ones do not. `fftsizing=:pow2` stays the default; `:smooth`
-  is available. **Lesson: an isolated per-size FFT benchmark does not predict
-  this workload.**
-- **`ComplexF32` interpolation is largely moot.** It existed to halve the
+- **Smooth `fftlen` sizing: moot since 2026-08-16** (it sized the interpolation
+  transforms, which no longer exist), but the *lesson* stands and is why the
+  in-situ phase timers exist: per transform it really was 1.26×, and in a real
+  search it was a wash to −7%, because specific smooth lengths (`3^k`-heavy: 6561,
+  13122, 15309) are worse than the power of two and the shared `:pow2` scratch
+  sets stayed cache-warm where 8–16 smooth ones did not. **An isolated per-size
+  FFT benchmark does not predict this workload.**
+- **`ComplexF32` interpolation is settled, not open.** It existed to halve the
   bandwidth of transforms that no longer run; the direct path already reads
-  `ComplexF32` bins natively and accumulates in `Float64`. What remains is one
-  isolated question — `Float32` weights/planes in the direct inner loop — worth
-  measuring, not architecting.
+  `ComplexF32` bins natively. The one remaining question — `Float32` weights in
+  the direct inner loop — was measured on 2026-08-16 at **1.64× slower**; see the
+  entry above for why (the per-trial horizontal reduce, not the data width).
 - **HPK / KFR (see `~/programming/fft_tests/HPK_JULIA_HANDOFF.md`): deferred.**
   Its own prerequisite was to profile the FFT fraction first; done, and FFTW now
   falls to the ~4% batched profile `brfft`. 1.5× on 4% does not justify a

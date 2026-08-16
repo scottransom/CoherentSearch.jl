@@ -35,15 +35,13 @@ struct Arm
     params::SearchParams
     ws::Any
     dplans::Vector{<:DirectPlan}
-    hplans::Vector{CS.HarmonicPlan}
 end
 
 function arm(prec)
     params = mkparams(prec)
-    hplans = CS.build_harmonic_plans(params, NPROF)
-    ws = CS.Workspace(params, hplans, NPROF)
+    ws = CS.Workspace(params, NPROF)
     dplans = CS.build_direct_plans(params, rstart)
-    Arm(prec, params, ws, dplans, hplans)
+    Arm(prec, params, ws, dplans)
 end
 
 # The three phases, callable in isolation.

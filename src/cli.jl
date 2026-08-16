@@ -101,24 +101,10 @@ function parse_cmdline(argv)
             arg_type = Float64
             default = 0.5
         "--m"
-            help = "Fourier bins summed by the interpolation kernel (even). Cost is linear in m for --interp direct; the signal-power loss is ~0.2/m averaged over sub-bin offset (1.3% at m=16), against ~6.5% already lost to the --hidr trial grid"
+            help = "Fourier bins summed by the interpolation kernel (even). Cost is linear in m; the signal-power loss is ~0.2/m averaged over sub-bin offset (1.3% at m=16), against ~6.5% already lost to the --hidr trial grid"
             arg_type = Int
             default = 16
             range_tester = x -> x > 0 && iseven(x)
-        "--numbetween"
-            help = "Minimum points to interpolate between Fourier bins (--interp fft only)"
-            arg_type = Int
-            default = 16
-        "--interp"
-            help = "Fourier interpolator: 'direct' (exact O(m) summation, default) or 'fft' (FFT-correlation onto a fine grid + linear interpolation; the Python original's method, ~3x slower and ~1e-2 accurate)"
-            arg_type = String
-            default = "direct"
-            range_tester = x -> x in ("direct", "fft")
-        "--fftsizing"
-            help = "Padded transform length for --interp fft: 'pow2' (next power of two, the Python original's rule; default) or 'smooth' (next 2*3*5*7-smooth — less padding, but measured no faster in situ)"
-            arg_type = String
-            default = "pow2"
-            range_tester = x -> x in ("smooth", "pow2")
         "--precision"
             help = "Element type of the profile stage (interpolated harmonic amplitudes, the batched inverse FFT, and the folded profiles the metric reads): 'f64' (default) or 'f32'. Everything reported stays Float64; f32 halves the bandwidth of the bulk arrays and is a win once several threads contend for memory"
             arg_type = String
@@ -140,9 +126,6 @@ function parse_cmdline(argv)
             help = "Max harmonic number when removing harmonically-related candidates"
             arg_type = Int
             default = 16
-        "--noalign"
-            help = "Use a fixed numbetween for all harmonics (disable per-harmonic tuning)"
-            action = :store_true
         "--noremove"
             help = "Do not collapse near-identical (duplicate) candidates"
             action = :store_true
@@ -156,7 +139,7 @@ function parse_cmdline(argv)
             help = "Do not print a progress meter"
             action = :store_true
         "--verbose", "-v"
-            help = "Report the per-harmonic interpolation plan (numbetween, m, FFT length and padding, whether linear interpolation is needed) before searching"
+            help = "Report the trial grid, chunking and interpolation phase-cycle lengths before searching"
             action = :store_true
         "--metricstats"
             help = "Report per-block, per-decimation metric stats (min/median/mean/std/max) to help set --threshold; writes a full per-block table to <stem>_metricstats.txt"
@@ -224,13 +207,9 @@ function main(argv)
     params = SearchParams(
         nharms = nharms,
         m = a["m"],
-        numbetween = a["numbetween"],
         hidr = a["hidr"],
         threshold = a["threshold"],
-        align = !a["noalign"],
         decimations = decimations,
-        interp = Symbol(a["interp"]),
-        fftsizing = Symbol(a["fftsizing"]),
         precision = Symbol(a["precision"]),
     )
 
@@ -279,7 +258,7 @@ Search one FFT file with the parsed options `a`, reusing `cache`'s plans and
 workspaces, and return its top `--ncands` candidates best-metric first.
 """
 function search_one(ft::FFTFile, params::SearchParams, a, cache::SearchCache)
-    @info "Searching" file=ft.path T=ft.T nharms=params.nharms decimations=params.decimations interp=params.interp threads=nthreads()
+    @info "Searching" file=ft.path T=ft.T nharms=params.nharms decimations=params.decimations threads=nthreads()
 
     progress = a["noprogress"] ? :none : (a["progressbar"] ? :bar : :text)
     mstats = a["metricstats"] ? MetricStats() : nothing

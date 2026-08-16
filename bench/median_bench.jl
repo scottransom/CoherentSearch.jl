@@ -18,12 +18,11 @@ params = SearchParams(nharms=nharms, threshold=6.0,
 Nprof = 2048
 lodr  = params.hidr / params.nharms
 rstart = 10.0 * ft.T
-hplans = CS.build_harmonic_plans(params, Nprof)
-ws     = CS.Workspace(params, hplans, Nprof)
-# `:direct` (the default interpolator) needs the per-harmonic phase tables and a
+ws     = CS.Workspace(params, Nprof)
+# The interpolator needs the per-harmonic phase tables and a
 # *global* trial index; this bench treats `rstart` as global trial 0.
-dplans = params.interp === :direct ? CS.build_direct_plans(params, rstart) : nothing
-CS.fill_chunk_profiles!(ws, hplans, ft, params, rstart, lodr, Nprof; dplans=dplans, t0=0)  # real profiles
+dplans = CS.build_direct_plans(params, rstart)
+CS.fill_chunk_profiles!(ws, dplans, ft, params, rstart, lodr, Nprof; t0=0)  # real profiles
 
 # --- median strategies (all return the mean of the two central order stats) ---
 

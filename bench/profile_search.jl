@@ -98,7 +98,6 @@ function classify(sf)
      fn == "_boxcar_psum!")                            && return "boxcar-metric"
     fn == "_block_sigma"                               && return "block-sigma"
     fn == "boxcar_widths"                              && return "boxcar-setup"
-    (fn == "interp_tile!" || fn == "fill_harmonic_row!") && return "interp (fft-correlate)"
     (fn == "fill_harmonic_row_direct!" ||
      fn == "_fill_row_direct_slow!")                   && return "interp (direct O(m))"
     fn == "decim_pass!"                                && return "decim (gather+brfft)"

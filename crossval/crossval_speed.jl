@@ -17,7 +17,7 @@ using JSON
 using Printf
 using Base.Threads: nthreads
 
-const DEFAULT_PY = "/home/sransom/python_venvs/pixiPSR/.pixi/envs/default/bin/python"
+const DEFAULT_PY = "/data1/environments/pixiPSR/.pixi/envs/default/bin/python3"
 const DEFAULT_FFT = joinpath(@__DIR__, "..", "..", "coherent_search",
                              "examples", "harmonics_hi.fft")
 

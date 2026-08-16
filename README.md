@@ -376,7 +376,7 @@ conventions are correct.
 Kernels, file I/O, CLI, tests, and Python-oracle cross-validation are in place
 and passing. The search is chunk-parallel with cached FFTW plans and
 interpolation kernels, an allocation-free hot loop, a batched inverse FFT, and
-per-harmonic interpolation tuning (`--noalign` to disable).
+exact per-trial Fourier interpolation.
 
 The detection metric is the **peak boxcar matched filter**: each profile is
 correlated with a geometric bank of top-hat widths and scored
@@ -402,28 +402,25 @@ multiples of each fundamental, pinned by a test that every decimation pass
 reproduces the native reduced-harmonic fold. A progress meter prints to stderr
 (`--progressbar`, `--noprogress`).
 
-### Interpolation (`--interp`)
+### Interpolation
 
-Two interpolators are available and produce the same physics by different means:
+Harmonic amplitudes come from the Eqn.-30 kernel evaluated *exactly* at each
+trial frequency. Factoring the coefficients as `A(dr)/(dr-j)` makes the weights
+real, so a point costs `m` real multiply-adds and reads only `m` consecutive
+bins; the handful of distinct `dr` values a whole search visits are tabulated
+once per harmonic and indexed by exact integer arithmetic. There is no fine
+grid, no `numbetween`, and no linear interpolation.
 
-- **`--interp direct` (default)** evaluates the Eqn.-30 kernel *exactly* at each
-  trial frequency. Factoring the coefficients as `A(dr)/(dr-j)` makes the weights
-  real, so a point costs `m` real multiply-adds and reads only `m` consecutive
-  bins; the handful of distinct `dr` values a search visits are tabulated once.
-  There is no fine grid, no `numbetween`, and no linear interpolation.
-- **`--interp fft`** is the FFT-correlation method ported from the Python
-  original: build a uniform fine grid of `numbetween` points per Fourier bin with
-  two transforms, then linearly interpolate it at the trial frequencies. It is
-  what the Python oracle and the machine-precision equivalence tests are pinned
-  to. Its padded transform length is chosen by `--fftsizing`: `pow2` (the
-  default, reproducing the original exactly) or `smooth` (next `2·3·5·7`-smooth —
-  much less padding, but measured no faster in an actual search).
+The FFT-correlation method ported from the Python original — build a uniform
+fine grid of `numbetween` points per Fourier bin with two transforms, then
+linearly interpolate it — survives only as the *reference* path
+(`reference_profiles(...; kernel=:fft)`, `finterp_fft`), which is what the Python
+oracle is pinned to. It was retired from the search because it is both slower
+(~3.8× on the interpolation) and an approximation: its linear interpolation is
+worth up to ~5% in amplitude at high harmonics with `numbetween=16`.
 
-The direct path is both faster and far more accurate: the linear interpolation
-in the FFT path is an approximation worth up to ~5% in amplitude at high
-harmonics with the default `numbetween=16`, which the direct path removes
-entirely. `--verbose` prints the per-harmonic plan (`numbetween`, `m`, transform
-length and padding, fine-grid oversampling, whether linear interpolation is
-needed), and `bench/interp_bench.jl` compares the two on throughput and accuracy.
+`bench/interp_bench.jl` compares the two on throughput and accuracy, and
+`--verbose` prints the trial grid, chunking and interpolation phase-cycle
+lengths.
 
 See `Summary_and_Future_Work.md` and `decimation_design.md` for details.

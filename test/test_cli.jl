@@ -103,31 +103,31 @@ mktempdir() do dir
     @testset "SearchCache rebuilds when params or blocksize change" begin
         cache = SearchCache()
         search(ft, params; cache = cache, kw...)
-        hp1, ws1 = cache.hplans, cache.workspaces
+        ws1 = cache.workspaces
 
         # Same params object, same Nprof: the very same objects come back.
-        hp, ws = _plans!(cache, params, 64, 1)
-        @test hp === hp1 && ws === ws1
+        ws = _plans!(cache, params, 64, 1)
+        @test ws === ws1
 
         # A different blocksize invalidates: Workspaces are sized by Nprof, and
         # reusing an undersized one would silently corrupt the chunk fill.
-        hp2, _ = _plans!(cache, params, 128, 1)
-        @test hp2 !== hp1
+        ws2 = _plans!(cache, params, 128, 1)
+        @test ws2 !== ws1
         @test cache.Nprof == 128
 
         # Different params, likewise.  Reuse is keyed on object identity, so an
         # equal-but-distinct SearchParams also rebuilds (conservative, correct).
         other = SearchParams(nharms = 8, hidr = 0.25)
-        hp3, _ = _plans!(cache, other, 128, 1)
-        @test hp3 !== hp2
+        ws3 = _plans!(cache, other, 128, 1)
+        @test ws3 !== ws2
         @test cache.params === other
 
         # More tasks than before tops the vector up rather than rebuilding.
-        _, ws4 = _plans!(cache, other, 128, 3)
+        ws4 = _plans!(cache, other, 128, 3)
         @test length(ws4) >= 3
         @test all(w isa Workspace for w in ws4)
         # …and the extra workspaces persist for a later, smaller request.
-        _, ws5 = _plans!(cache, other, 128, 1)
+        ws5 = _plans!(cache, other, 128, 1)
         @test ws5 === ws4
     end
 end

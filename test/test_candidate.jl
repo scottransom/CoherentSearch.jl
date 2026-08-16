@@ -29,7 +29,7 @@ const EXAMPLE_FFT = joinpath(@__DIR__, "..", "..", "coherent_search",
 
             # Matched kernel (m=32) + a fine reference grid (numbetween=256) so the
             # only remaining difference is exact- vs linear-interpolation error.
-            p = SearchParams(nharms=nh, m=32, numbetween=256, align=false)
+            p = SearchParams(nharms=nh, m=32, numbetween=256)
             ref = reference_profiles(ft, [rbest], p)[:, 1]
             cand = candidate_profile(ft, rbest, nh; m=32)
 

@@ -2,7 +2,10 @@
 
 **What this is.** In August 2026 the Fourier interpolation in CoherentSearch.jl
 was rewritten from FFT-correlation onto a fine grid to direct `O(m)` summation at
-exactly the frequencies wanted. It was 1.64× faster end to end and about six
+exactly the frequencies wanted.  (The FFT-correlation arm was kept as a runtime
+option for a week and then deleted on 2026-08-16; it survives as the *reference*
+kernel `finterp_fft`, which is what the Python oracle is pinned to.  Everything
+below is unchanged — the comparison was made when both ran in the search.) It was 1.64× faster end to end and about six
 orders of magnitude more accurate. That is a surprising result — an FFT
 correlation is `O(N log N)` and direct summation is `O(N m)` — so this document
 records *why* it happened, and, more usefully, **the conditions under which it
@@ -383,14 +386,13 @@ multiply, a faster FFT library buys less than its headline number.
 # Writes bench/interp_bench_{throughput,crossover}.png and bench/interp_bench.csv
 julia --project=bench -t 1 bench/interp_bench.jl FILE.fft
 
-# Per-harmonic plan: numbetween, m, transform length and padding, grid
-# oversampling, whether linear interpolation is needed
+# Trial grid, chunking and interpolation phase-cycle lengths
 julia --project=. bin/coherent_search.jl --verbose ... FILE.fft
 
-# End-to-end, the two interpolators
+# End-to-end (the FFT-correlation arm was retired from the search on 2026-08-16;
+# `bench/interp_bench.jl` still measures both, through the reference kernel)
 julia --project=. -t 1 bin/coherent_search.jl --threshold 6 --maxdecim 6 \
-      --lofreq 5 --hifreq 30 --noplot --interp direct FILE.fft
-julia --project=. -t 1 bin/coherent_search.jl ... --interp fft --fftsizing pow2 FILE.fft
+      --lofreq 5 --hifreq 30 --noplot FILE.fft
 
 # Hot-loop self-time by bucket
 julia --project=bench -t 1 bench/profile_search.jl FILE.fft

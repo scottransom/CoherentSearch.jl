@@ -26,11 +26,11 @@ include("fileio.jl")
 # --- Search ---
 export SearchParams, Candidate, search, search_block, block_metrics, coherent_profiles,
        reference_profiles, snr_metrics, chunk_ngoodbins, remove_duplicates,
-       remove_harmonics, chunk_metrics, build_harmonic_plans, harmonic_numbetween,
+       remove_harmonics, chunk_metrics,
        decimation_set, boxcar_widths, boxcar_best_width, BlockMetricStats, MetricHistogram, MetricStats,
        SearchCache,
        metricstats_summary, metricstats_windows, hist_quantile,
-       MetricNorm, build_metricnorm, harmonic_plan_report,
+       MetricNorm, build_metricnorm,
        proftype, phase_reset!, phase_times, PHASE_NAMES
 include("search.jl")
 
