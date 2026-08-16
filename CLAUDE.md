@@ -420,6 +420,41 @@ the hot loop. See `Summary_and_Future_Work.md` (§3) for the roadmap.
   falls to the ~4% batched profile `brfft`. 1.5× on 4% does not justify a
   proprietary binary-only dependency. Revisit only if `:direct` is backed out.
 
+## Retired, on purpose — do not reintroduce
+
+Both of these were removed on 2026-08-16 after a review pass; each had been
+strictly dominated for a while and was still costing something to carry.
+
+- **The production `:fft` interpolator** and everything that planned it
+  (`interp_tile!`, `fill_harmonic_row!`, `FFTScratch`, `HarmonicPlan`,
+  `build_harmonic_plans`, `harmonic_plan_report`, `harmonic_numbetween`, and the
+  `interp`/`fftsizing`/`align` params with their CLI flags). The FFT correlation
+  itself lives on in `src/fourierinterp.jl` (`finterp_fft`) and in
+  `reference_profiles(...; kernel=:fft)`, which is what the Python oracle is
+  pinned to — **that is a different thing from the deleted search path, despite
+  the shared name.** Removing it also dropped `Workspace`'s `S` parameter and
+  `scratch::Dict`, and `hplans` from `fill_chunk_profiles!`/`_search_region!`/
+  `_plans!`/`SearchCache`.
+- **The `:non`/`:sd2` on-pulse metrics** (`_profile_snr`, `xsignal`, `pexp`,
+  `--metric`). Upstream replaced `snr_metric` with the boxcar matched filter as
+  its *only* metric, so they had no oracle left, and `:boxcar` had been the
+  default here since it was written.
+
+`src/` went 3798 → 3514 lines; candidate output stayed byte-identical and warm
+`-t 1` wall clock was a wash in an interleaved A/B.
+
+**Two traps this exposed, worth remembering:**
+
+- `prime_wisdom` builds a `Workspace` purely for its FFTW-planning side effect,
+  and nothing tested it, so it silently kept calling a deleted function. It has a
+  test now. When changing a constructor, grep for callers that use it only for
+  effect.
+- The pooled block `σ̂` is an exact MAD in Python and a `_BOXCAR_SIGMA_SAMPLES`
+  subsample in the search. `snr_metrics` defaults to the exact estimator
+  (oracle-faithful); `block_metrics` passes `sigma_samples` to match the
+  production one (equivalence-faithful). Previously both were the same accidental
+  constant, which would have started lying silently the moment either moved.
+
 ## Environment gotchas (Julia 1.12)
 
 - `SortingNetworks.jl` and `StatProfilerHTML`'s HTML writer are **broken on

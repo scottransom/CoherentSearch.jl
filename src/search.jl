@@ -14,8 +14,8 @@
 #         across threads (one private `Workspace` per task — no shared mutable
 #         state, no `threadid()` indexing);
 #       - loop #2 over harmonics, each filling one row of an `(nharms+1)×Nprof`
-#         amplitude array via cached-plan, cached-coefficient Fourier
-#         interpolation at a per-harmonic `numbetween` matched to `deltar_h`;
+#         amplitude array by evaluating the Eqn.-30 kernel directly at the trial
+#         frequencies, from a per-harmonic table of tabulated weights;
 #       - loop #3 a single *batched* complex→real inverse FFT of all `Nprof`
 #         profiles at once, then a width-sensitive S/N metric per profile.
 #
@@ -190,27 +190,6 @@ struct Candidate
 end
 Candidate(freq, metric, r, nharm) = Candidate(freq, metric, r, nharm, NaN)
 
-"""
-    uniform_linear_interp(r, lobin, numbetween, amps) -> ComplexF64
-
-Linear interpolation of the complex `amps` (sampled on the uniform fine grid
-`lobin .+ (0:K-1)/numbetween`) at real-valued Fourier frequency `r`.  Equivalent
-to `np.interp(r, trs, amps)`, including its clamp-to-endpoints edge behaviour.
-"""
-@inline function uniform_linear_interp(r::Real, lobin::Integer, numbetween::Integer,
-                                       amps::AbstractVector{<:Complex})
-    K = length(amps)
-    p = (r - lobin) * numbetween          # 0-based fractional index into amps
-    if p <= 0
-        return ComplexF64(amps[1])
-    elseif p >= K - 1
-        return ComplexF64(amps[K])
-    end
-    i0 = floor(Int, p)
-    f = p - i0
-    @inbounds return ComplexF64(amps[i0 + 1]) * (1 - f) + ComplexF64(amps[i0 + 2]) * f
-end
-
 # ---------------------------------------------------------------------------
 # Detection metric (port of `snr_metric` from coherent_search.py)
 # ---------------------------------------------------------------------------
@@ -221,7 +200,7 @@ end
 The number of harmonics that carry real Fourier data for a chunk of trial
 fundamentals whose mean Fourier frequency is `rmean`: `min(Nyquist/rmean,
 nharms)`.  Recorded per block in [`BlockMetricStats`](@ref) as the diagnostic
-`ngoodbins`; the `:boxcar` metric measures its own noise level and does not use
+`ngoodbins`; the metric measures its own noise level and does not use
 it.  Matches `min(ft.N/2/rstosearch.mean(), args.nharms)` in the Python code.
 """
 @inline chunk_ngoodbins(ft::FFTFile, nharms::Integer, rmean::Real) =
@@ -382,7 +361,7 @@ end
 const _NO_MEDPAIRS = Tuple{Int,Int}[]
 
 # ---------------------------------------------------------------------------
-# Boxcar matched-filter metric (:boxcar)
+# Boxcar matched-filter metric
 #
 # A cleaner alternative to the on-pulse-selection metric above, whose adaptive
 # on-pulse set gives the pure-noise metric a non-analytic ~√nbins floor (so the
@@ -431,7 +410,7 @@ bin does not bias it.  Returns `0.0` for a degenerate (flat) block.
 
 The subsample indices depend only on `(nbins, n)`, and `M` enters only through the
 ratio the caller forms (`excess/σ`), so the unnormalised `brfft` and normalised
-`irfft` paths yield the identical scale-free S/N (the `align=false` pin holds).
+`irfft` paths yield the identical scale-free S/N.
 """
 function _block_sigma(M::AbstractMatrix{T}, nbins::Int, n::Int, buf::Vector{T}) where {T<:AbstractFloat}
     # The linear indexing below is only the intended (i, j) if the profile axis is
@@ -507,7 +486,7 @@ end
 Width of the boxcar in the geometric bank that best matches the pulse profile
 `prof`, and the corresponding duty cycle `w / length(prof)`.
 
-This is the width behind a `:boxcar` candidate's reported S/N, recovered after
+This is the width behind a candidate's reported S/N, recovered after
 the fact: `_boxcar_scan` keeps only the peak S/N because it runs once per trial
 (~1e8 times a search) and only reported candidates need the width.
 
@@ -583,7 +562,7 @@ const _BC_BATCH = 32              # profiles per SIMD tile; see bench/boxcar_ben
 """
     BoxcarBatch{T}
 
-Scratch for the batched `:boxcar` gate over `_BC_BATCH` profiles at a time.
+Scratch for the batched boxcar gate over `_BC_BATCH` profiles at a time.
 `tile` and `psT` are flat vectors with a *static* row stride `B = _BC_BATCH`, so
 element `(b, i)` lives at `[(i-1)*B + b]` and the `b` loops compile to plain
 contiguous vector ops.  `mvals` holds one metric per trial of the chunk.
@@ -834,6 +813,27 @@ coherent_profiles(ftprofs::AbstractMatrix{<:Complex}, nbins::Integer) =
     irfft(ftprofs, nbins, 1)
 
 """
+    uniform_linear_interp(r, lobin, numbetween, amps) -> ComplexF64
+
+Linear interpolation of the complex `amps` (sampled on the uniform fine grid
+`lobin .+ (0:K-1)/numbetween`) at real-valued Fourier frequency `r`.  Equivalent
+to `np.interp(r, trs, amps)`, including its clamp-to-endpoints edge behaviour.
+"""
+@inline function uniform_linear_interp(r::Real, lobin::Integer, numbetween::Integer,
+                                       amps::AbstractVector{<:Complex})
+    K = length(amps)
+    p = (r - lobin) * numbetween          # 0-based fractional index into amps
+    if p <= 0
+        return ComplexF64(amps[1])
+    elseif p >= K - 1
+        return ComplexF64(amps[K])
+    end
+    i0 = floor(Int, p)
+    f = p - i0
+    @inbounds return ComplexF64(amps[i0 + 1]) * (1 - f) + ComplexF64(amps[i0 + 2]) * f
+end
+
+"""
     reference_profiles(ft, rfund, params; kernel=:fft) -> Matrix{Float64}
 
 Build the `(2*nharms, L)` real coherent-fold pulse profiles (one column per
@@ -981,11 +981,11 @@ struct DecimBuf{B,P<:AbstractFloat,V<:AbstractMatrix{<:Complex}}
     dprofs::Matrix{P}             # (2*Hk, Nprof)
     medbuf::Vector{P}             # (2*Hk,)
     brfftplan::B                   # plan_brfft(src, 2*Hk, 1)
-    bcwidths::Vector{Int}          # :boxcar width bank for 2*Hk-bin profiles
-    bcpsum::Vector{P}              # :boxcar prefix-sum scratch (2*Hk + wmax + 1)
-    bcsig::Vector{P}               # :boxcar per-block σ subsample scratch
+    bcwidths::Vector{Int}          # boxcar width bank for 2*Hk-bin profiles
+    bcpsum::Vector{P}              # prefix-sum scratch (2*Hk + wmax + 1)
+    bcsig::Vector{P}               # per-block σ subsample scratch
     medpairs::Vector{Tuple{Int,Int}}  # sorting-network median pairs (empty ⇒ quickselect)
-    bcbatch::BoxcarBatch{_BC_TILE}    # :boxcar cross-profile SIMD gate scratch + metrics
+    bcbatch::BoxcarBatch{_BC_TILE}    # cross-profile SIMD gate scratch + metrics
 end
 
 # `ftprofs` is the workspace array this buffer decimates; the plan is built
@@ -1026,11 +1026,11 @@ struct Workspace{B, D<:DecimBuf, P<:AbstractFloat}
     profs::Matrix{P}              # (2*nharms, Nprof)
     medbuf::Vector{P}             # (2*nharms,) scratch for the per-profile median
     brfftplan::B                   # plan_brfft(ftprofs, 2*nharms, 1)
-    bcwidths::Vector{Int}          # :boxcar width bank for the base 2*nharms-bin profiles
-    bcpsum::Vector{P}              # :boxcar prefix-sum scratch (2*nharms + wmax + 1)
-    bcsig::Vector{P}               # :boxcar per-block σ subsample scratch
+    bcwidths::Vector{Int}          # boxcar width bank for the base 2*nharms-bin profiles
+    bcpsum::Vector{P}              # prefix-sum scratch (2*nharms + wmax + 1)
+    bcsig::Vector{P}               # per-block σ subsample scratch
     medpairs::Vector{Tuple{Int,Int}}  # sorting-network median pairs (empty ⇒ quickselect; nbins=120 default)
-    bcbatch::BoxcarBatch{_BC_TILE}    # :boxcar cross-profile SIMD gate scratch + metrics
+    bcbatch::BoxcarBatch{_BC_TILE}    # cross-profile SIMD gate scratch + metrics
     decims::Vector{D}              # one per decimation factor k > 1
     # The chunk's bin window, de-interleaved into real/imaginary planes.  Kept at
     # `Float32`, the storage type of the `.fft` file: widening on load is exact,
@@ -1116,11 +1116,14 @@ trials counted (decimation trials whose `k·rf` reaches Nyquist are excluded, so
 Collected only when [`search`](@ref) is passed a `metricstats` sink.
 
 These exist to expose how the metric's noise floor depends on the profile bin
-count.  With the default `:non`/`pexp=0.5` penalty the pure-noise metric scales
-~`√nbins = √(2·Hk)`, so the low-`k` (more-bin) decimations sit at a
-systematically higher floor and dominate the candidate list at a fixed
-`threshold`.  Comparing the per-`k` distributions is how one should choose a
-`--threshold` (and see that it is *not* comparable across decimations).
+count.  They were written for the retired on-pulse metrics, whose noise floor
+scaled ~`√nbins = √(2·Hk)`, so the low-`k` (more-bin) decimations sat at a
+systematically higher floor and dominated the candidate list at a fixed
+`threshold` — the defect the boxcar matched filter was written to fix, since its
+per-trial statistic is `N(0,1)` at every width and so has a `k`-independent
+floor.  They remain the way to *check* that on real data (red noise and RFI are
+not white, so the analytic flatness is a claim about the noise model, not about a
+given observation) and to choose a `--threshold` from measured distributions.
 """
 struct BlockMetricStats
     block::Int
@@ -1479,7 +1482,6 @@ function decim_pass!(out::Vector{Candidate}, ws::Workspace, db::DecimBuf, ft::FF
     @phase 7 @phase _decim_brfft_slot(k) mul!(db.dprofs, db.brfftplan, db.src)
 
     rmean = rstart + (n - 1) * lodr / 2
-    ngood = chunk_ngoodbins(ft, Hk, k * rmean)     # diagnostic only (BlockMetricStats)
     nyq = ft.N / 2
     # Valid decimated trials are the prefix j = 1..nvalid (k·rf increases with j).
     nvalid = 0
@@ -1515,6 +1517,9 @@ function decim_pass!(out::Vector{Candidate}, ws::Workspace, db::DecimBuf, ft::FF
         # Valid trials are the prefix j=1..length(mbuf) (r_dec increases with j).
         flo = k * rstart / ft.T
         fhi = k * (rstart + (length(mbuf) - 1) * lodr) / ft.T
+        # `ngoodbins` is a recorded diagnostic, not an input to the metric, so it
+        # is computed here rather than every chunk.
+        ngood = chunk_ngoodbins(ft, Hk, k * rmean)
         push!(stats, _block_stats(block, k, Hk, nbins, ngood, flo, fhi, mbuf))
     end
     return
@@ -1607,7 +1612,6 @@ function _search_region!(ft::FFTFile, params::SearchParams,
                 rstart = r_lo + i0 * lodr
                 fill_chunk_profiles!(ws, dplans, ft, params, rstart, lodr, n; t0=i0)
                 rmean = rstart + (n - 1) * lodr / 2
-                ngood = chunk_ngoodbins(ft, params.nharms, rmean)   # diagnostic only
                 # one robust σ per block
                 @phase 3 begin
                     sig = _block_sigma(ws.profs, nbins, n, ws.bcsig)
@@ -1635,6 +1639,7 @@ function _search_region!(ft::FFTFile, params::SearchParams,
                 if collect_stats
                     flo = rstart / ft.T
                     fhi = (rstart + (n - 1) * lodr) / ft.T
+                    ngood = chunk_ngoodbins(ft, params.nharms, rmean)   # diagnostic only
                     push!(stats, _block_stats(c, 1, params.nharms, nbins, ngood, flo, fhi, mbuf[1:n]))
                 end
                 # Harmonic-decimation multi-frequency passes (k > 1), re-using the

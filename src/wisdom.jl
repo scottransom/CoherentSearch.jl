@@ -83,8 +83,7 @@ function prime_wisdom(params::SearchParams = SearchParams();
     _PLAN_RIGOR[] = UInt32(rigor)
     try
         Nprof = max(1, Int(blocksize))
-        hplans = build_harmonic_plans(params, Nprof)
-        Workspace(params, hplans, Nprof)         # constructs every FFTW plan at `rigor`
+        Workspace(params, Nprof)                 # constructs every FFTW plan at `rigor`
     finally
         _PLAN_RIGOR[] = old
     end

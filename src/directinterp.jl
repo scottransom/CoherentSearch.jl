@@ -1,13 +1,15 @@
 # Direct O(m) Fourier interpolation.
 #
-# The FFT-correlation interpolator (`finterp_fft`, `interp_tile!`) evaluates the
+# The FFT-correlation interpolator (`finterp_fft`, still in `fourierinterp.jl` as
+# the reference kernel and as what the Python oracle is pinned to) evaluates the
 # sinc/phase kernel on a *uniform fine grid* of `numbetween` points per Fourier
 # bin and then linearly interpolates that grid at the trial frequencies.  It
 # exists because the Python original could only go fast by vectorising, and an
 # FFT is the only way to vectorise a correlation in numpy.  It costs two
 # transforms of ~`numbetween*(numbins+m)` points to produce `Nprof` values, and
-# the final linear interpolation is an *approximation* — at the production
-# `numbetween=16` it is wrong by up to ~5% in amplitude at high harmonics.
+# the final linear interpolation is an *approximation* — at `numbetween=16` it is
+# wrong by up to ~5% in amplitude at high harmonics.  It was the search's
+# interpolator until 2026-08-08 and was deleted from the search on 2026-08-16.
 #
 # This module evaluates Eqn. 30 directly at exactly the frequencies wanted.  Two
 # observations make that cheaper than the FFT here, not more expensive:

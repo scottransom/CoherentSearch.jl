@@ -1,4 +1,5 @@
 using Test
+using FFTW: FFTW
 using CoherentSearch
 using CoherentSearch: output_path, plot_stem, main, _plans!, Workspace
 using Logging: with_logger, NullLogger
@@ -130,6 +131,22 @@ mktempdir() do dir
         ws5 = _plans!(cache, other, 128, 1)
         @test ws5 === ws4
     end
+end
+
+@testset "prime_wisdom builds every plan the search uses" begin
+    # `prime_wisdom` constructs a `Workspace` purely for its FFTW-planning side
+    # effect, so it is the one caller that breaks silently when the Workspace
+    # constructor's signature changes — which is exactly how it broke: nothing
+    # exercised it, and it kept calling a `build_harmonic_plans` that had been
+    # deleted.  Cheap to cover, so cover it.
+    path = tempname()
+    params = SearchParams(nharms = 8, decimations = decimation_set(8, 2))
+    got = prime_wisdom(params; blocksize = 64, rigor = FFTW.MEASURE, path = path)
+    @test got == path
+    @test isfile(path) && filesize(path) > 0
+    # And the wisdom it wrote is loadable, which is the whole point of writing it.
+    @test import_wisdom!(path)
+    rm(path; force = true)
 end
 
 @testset "main: multi-file run writes one .cohout per input" begin
