@@ -57,7 +57,7 @@ end
 mktempdir() do dir
     fftpath, T = write_synthetic_fft(dir, "synth")
     ft = FFTFile(fftpath)
-    params = SearchParams(nharms = 8, metric = :boxcar)
+    params = SearchParams(nharms = 8)
     kw = (lofreq = 200 / T, hifreq = 240 / T, blocksize = 64,
           threshold = 0.0, progress = :none, wisdom = false)
 
@@ -117,7 +117,7 @@ mktempdir() do dir
 
         # Different params, likewise.  Reuse is keyed on object identity, so an
         # equal-but-distinct SearchParams also rebuilds (conservative, correct).
-        other = SearchParams(nharms = 8, metric = :sd2)
+        other = SearchParams(nharms = 8, hidr = 0.25)
         hp3, _ = _plans!(cache, other, 128, 1)
         @test hp3 !== hp2
         @test cache.params === other

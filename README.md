@@ -192,8 +192,7 @@ Two collapses run on the candidate list, both on by default:
 `#Harm` is the harmonic count that found the candidate (`k = nharms ÷ #Harm`
 identifies the decimation). `Ducy(%)` is the duty cycle of the best-fitting
 boxcar — `width / profile bins`, exactly as riptide's `rseek` defines `ducy`, so
-the two searches can be compared directly. It is `-` for the `non`/`sd2`
-metrics, which scan no width bank.
+the two searches can be compared directly. It is `-` when unmeasured.
 
 The search's hot loop deliberately discards *which* boxcar width won (it runs
 ~1e8 times and only reported candidates need it), so the width is recovered
@@ -377,20 +376,22 @@ conventions are correct.
 Kernels, file I/O, CLI, tests, and Python-oracle cross-validation are in place
 and passing. The search is chunk-parallel with cached FFTW plans and
 interpolation kernels, an allocation-free hot loop, a batched inverse FFT, and
-per-harmonic interpolation tuning (`--noalign` to disable). The detection metric
-sums the on-pulse flux and divides by a selectable width penalty (`--metric`):
-`non` = `N_on^p` (duty cycle; `p=1/2` is a calibrated matched filter, larger `p`
-suppresses broad/RFI-like signals) or `sd2` = `Σd²^p` (phase spread). It is a
-port of the Python `snr_metric`, oracle-pinned to machine precision for both
-penalties.
+per-harmonic interpolation tuning (`--noalign` to disable).
 
-> **Note (defaults under review).** On real data the default
-> `--metric non --pexp 0.5` empirically produces *many* more false-positive
-> candidates than `--metric sd2`, and many of those false positives do not look
-> pulsar-like at all — their reconstructed profiles resemble random noise rather
-> than the narrow-duty-cycle pulse most real pulsars show. This suggests the
-> default CLI options may need to change (e.g. to `sd2`, and/or a larger `pexp`).
-> See `Summary_and_Future_Work.md` for the follow-up.
+The detection metric is the **peak boxcar matched filter**: each profile is
+correlated with a geometric bank of top-hat widths and scored
+`max_{w,phase} (boxcar sum over the median-subtracted profile) / (σ̂ √w)`, with
+one robust per-bin `σ̂` per block. Because the widths are fixed a priori, every
+(phase, width) trial is `N(0,1)` under noise, so the pure-noise distribution is
+analytic and — unlike the older on-pulse sums — flat across harmonic
+decimations: one `--threshold` means one false-alarm rate at every `k`. It is a
+port of the Python `snr_metric`, oracle-pinned to machine precision.
+
+> The earlier width-penalised on-pulse metrics (`--metric non` = `N_on^p`,
+> `--metric sd2` = `Σd²^p`) were retired here and upstream. On real data `non`
+> produced many more false positives than `sd2`, and their noise floors scaled
+> with the profile bin count, which biased a fixed threshold toward the
+> low-decimation passes — the problem the boxcar metric was written to fix.
 
 Near-identical candidates are collapsed by default (`--noremove`
 disables it, `--drtol` sets the tolerance), and harmonically-related candidates

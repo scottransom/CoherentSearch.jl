@@ -92,13 +92,11 @@ using PrecompileTools: @setup_workload, @compile_workload
              "-o", joinpath(_dir, "synthetic.cohout")]
 
     @compile_workload begin
-        # `search` directly, over both metric kernels (they compile separately).
-        for _metric in (:boxcar, :sd2)
-            _p = SearchParams(nharms = 8, metric = _metric)
-            _cache = SearchCache()
-            search(_ft, _p; lobin = 200, hifreq = 210 / _ft.T, blocksize = 64,
-                   threshold = 1e9, progress = :none, wisdom = false, cache = _cache)
-        end
+        # `search` directly, then the CLI below, so both entry points are cached.
+        _p = SearchParams(nharms = 8)
+        _cache = SearchCache()
+        search(_ft, _p; lobin = 200, hifreq = 210 / _ft.T, blocksize = 64,
+               threshold = 1e9, progress = :none, wisdom = false, cache = _cache)
         # …then the whole CLI, so ArgParse's table and `main` are cached too.
         # Silenced: the workload's @info output would otherwise be echoed as
         # package-precompilation noise.

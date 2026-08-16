@@ -21,17 +21,14 @@ function parse_cmdline(argv)
         description = "Search PRESTO-style FFT files for pulsations using coherent harmonic folding.",
         epilog = """
         The input FFT file MUST be normalized (Fourier powers with mean ~ 1); the
-        width-sensitive S/N metric assumes unit-variance noise, so an un-normalized
-        FFT produces meaningless (hugely inflated) S/N values.  Normalize an
-        un-normalized FFT with PRESTO's `rednoise` routine, which also removes red
-        noise.  The FFT should also be barycentered and have known RFI zapped.  The
-        detection metric (--metric) defaults to 'boxcar', the peak boxcar
-        matched-filter S/N over a geometric bank of top-hat widths, whose pure-noise
-        distribution is analytic and (unlike the others) flat across harmonic
-        decimations, so one --threshold means one false-alarm rate for every k.  The
-        older width-penalised on-pulse sums are also available: 'non' = N_on^p (duty
-        cycle; p=1/2 is a calibrated equivalent-σ, larger p suppresses broad/RFI-like
-        signals) or 'sd2' = Σd²^p (phase spread).
+        S/N metric assumes unit-variance noise, so an un-normalized FFT produces
+        meaningless (hugely inflated) S/N values.  Normalize an un-normalized FFT
+        with PRESTO's `rednoise` routine, which also removes red noise.  The FFT
+        should also be barycentered and have known RFI zapped.  The detection
+        metric is the peak boxcar matched-filter S/N over a geometric bank of
+        top-hat widths, whose pure-noise distribution is analytic and flat across
+        harmonic decimations, so one --threshold means one false-alarm rate for
+        every k.
         Near-identical candidates are collapsed by default (--noremove disables it),
         as are harmonically-related ones -- the f/2, 2f, 3f/2, ... family of a real
         signal (--noharmremove disables it, --numharm sets the max harmonic).
@@ -127,19 +124,6 @@ function parse_cmdline(argv)
             arg_type = String
             default = "f64"
             range_tester = x -> x in ("f64", "f32")
-        "--xsignal"
-            help = "Peak fraction bounding the on-pulse signal sum in the S/N metric"
-            arg_type = Float64
-            default = 0.2
-        "--metric"
-            help = "Detection metric: 'boxcar' (peak boxcar matched-filter S/N; analytic noise, flat across decimations; default), 'non' (N_on^p, duty cycle), or 'sd2' (Σd²^p, phase spread)"
-            arg_type = String
-            default = "boxcar"
-            range_tester = x -> x in ("non", "sd2", "boxcar")
-        "--pexp"
-            help = "Width-penalty exponent p (1/2 = calibrated matched filter for 'non')"
-            arg_type = Float64
-            default = 0.5
         "--blocksize"
             help = "Trial fundamentals per parallel chunk (Nprof)"
             arg_type = Int
@@ -244,9 +228,6 @@ function main(argv)
         hidr = a["hidr"],
         threshold = a["threshold"],
         align = !a["noalign"],
-        xsignal = a["xsignal"],
-        metric = Symbol(a["metric"]),
-        pexp = a["pexp"],
         decimations = decimations,
         interp = Symbol(a["interp"]),
         fftsizing = Symbol(a["fftsizing"]),
@@ -326,10 +307,9 @@ function search_one(ft::FFTFile, params::SearchParams, a, cache::SearchCache)
     if length(cands) > a["ncands"]
         cands = cands[1:a["ncands"]]
     end
-    # Measure each reported candidate's best-fitting boxcar duty cycle.  Only
-    # meaningful for the :boxcar metric — the others do not scan a width bank —
-    # and only affordable here, on the reported handful (see `measure_ducy`).
-    if params.metric === :boxcar && !isempty(cands)
+    # Measure each reported candidate's best-fitting boxcar duty cycle — only
+    # affordable here, on the reported handful (see `measure_ducy`).
+    if !isempty(cands)
         cands = measure_ducy(ft, cands, params)
     end
     return cands
@@ -346,7 +326,7 @@ function write_candidates(cands::Vector{Candidate}, outfile::AbstractString, thr
     # where a fixed number of decimal places would lose precision).
     # `Ducy(%)` is the best-fitting boxcar's duty cycle, defined as riptide's
     # `rseek` defines it (width / profile bins) so the two are directly
-    # comparable; it is `-` for the non-boxcar metrics, which scan no width bank.
+    # comparable; `-` means it was never measured (see `measure_ducy`).
     header = ["#       'S/N'      Frequency (Hz)        Period (ms)    #Harm  Ducy(%)"]
     lines = [@sprintf("%-4d  %8.2f  %18.12f  %18.12f   %3d   %6s",
                       i, c.metric, c.freq, 1000.0 / c.freq, c.nharm,
@@ -437,7 +417,7 @@ function report_metricstats(ms::MetricStats, base::String, params, threshold)
 
     # --- band-wide per-decimation summary to stderr ---
     println(stderr)
-    println(stderr, "Metric statistics by decimation  (metric=$(params.metric), pexp=$(params.pexp), threshold=$(threshold))")
+    println(stderr, "Metric statistics by decimation  (peak boxcar S/N, threshold=$(threshold))")
     println(stderr, "  Pure-noise floor scales ~sqrt(nbins); a fixed threshold picks a DIFFERENT false-alarm rate per k.")
     @printf(stderr, "  %-3s %4s %5s %10s %7s %7s %7s | metric at single-trial FAP =\n",
             "k", "Hk", "nbins", "ntrials", "mean", "std", "max")
@@ -475,7 +455,7 @@ function report_metricstats(ms::MetricStats, base::String, params, threshold)
     blockfile = string(base, "_metricstats.txt")
     open(blockfile, "w") do io
         println(io, "# Per-block, per-decimation metric statistics")
-        println(io, "# metric=$(params.metric) pexp=$(params.pexp) xsignal=$(params.xsignal) nharms=$(params.nharms) threshold=$(threshold)")
+        println(io, "# metric=boxcar nharms=$(params.nharms) threshold=$(threshold)")
         println(io, "# nbins = 2*Hk; the pure-noise metric floor scales ~sqrt(nbins).")
         @printf(io, "#%-7s %3s %4s %5s %10s %14s %14s %8s %9s %9s %9s %9s %9s\n",
                 "block", "k", "Hk", "nbins", "ngoodbins", "f_lo(Hz)", "f_hi(Hz)",
@@ -491,7 +471,7 @@ function report_metricstats(ms::MetricStats, base::String, params, threshold)
     fapfile = string(base, "_metricfap.txt")
     open(fapfile, "w") do io
         println(io, "# Per-(decimation, frequency-window) empirical false-alarm thresholds")
-        println(io, "# metric=$(params.metric) pexp=$(params.pexp) xsignal=$(params.xsignal) nharms=$(params.nharms)")
+        println(io, "# metric=boxcar nharms=$(params.nharms)")
         println(io, "# fap_X = metric value whose single-trial, single-decimation false-alarm prob is X (in-window)")
         @printf(io, "#%-3s %4s %5s %4s %13s %13s %10s %8s %8s %8s | %s\n",
                 "k", "Hk", "nbins", "win", "f_lo(Hz)", "f_hi(Hz)", "ntrials",
@@ -511,7 +491,7 @@ function report_metricstats(ms::MetricStats, base::String, params, threshold)
     histfile = string(base, "_metrichist.txt")
     open(histfile, "w") do io
         println(io, "# Per-(decimation, frequency-window) metric histograms (one streaming pass)")
-        println(io, "# metric=$(params.metric) pexp=$(params.pexp) xsignal=$(params.xsignal) nharms=$(params.nharms)")
+        println(io, "# metric=boxcar nharms=$(params.nharms)")
         println(io, "# bin = left edge of a bin of width $((ms.hist_hi - ms.hist_lo) / ms.hist_nb); count = trials in [bin, bin+width)")
         @printf(io, "#%-3s %4s %4s %13s %13s %12s %14s\n",
                 "k", "Hk", "win", "f_lo(Hz)", "f_hi(Hz)", "bin", "count")

@@ -45,7 +45,7 @@ end
 
 const OPT = parseargs(ARGS)
 
-mkparams(prec) = SearchParams(nharms=OPT.nharms, threshold=OPT.threshold, metric=:boxcar,
+mkparams(prec) = SearchParams(nharms=OPT.nharms, threshold=OPT.threshold,
                               decimations=decimation_set(OPT.nharms, OPT.maxdecim),
                               precision=prec)
 

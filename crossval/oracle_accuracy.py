@@ -4,9 +4,15 @@ Generate Python "oracle" reference data for cross-validating CoherentSearch.jl.
 
 This imports the original Python `coherent_search` package and computes:
   1. A `finterp_FFT` kernel reference (the indexing-critical path).
-  2. An end-to-end coherent-fold metric reference over a block of trial
+  2. An end-to-end coherent-fold profile reference over a block of trial
      fundamental frequencies (the same algorithm CoherentSearch.search_block
      implements).
+  3. The peak boxcar matched-filter detection metric on those profiles.
+
+`coherent_search` is imported from the sibling repo's `src/` in preference to
+whatever is installed, and the resolved path is printed: an oracle has to track
+the checked-out source, and a stale non-editable install once pinned this
+comparison to a superseded metric with no visible sign that it had.
 
 Outputs are written to <outdir>/oracle.json plus raw little-endian binary
 arrays, which crossval_accuracy.jl reads back and compares.
@@ -14,17 +20,29 @@ arrays, which crossval_accuracy.jl reads back and compares.
 Usage:
     python oracle_accuracy.py FILE.fft OUTDIR
 """
+import os
 import sys
 import json
+
+# Prefer the sibling repo's working tree over an installed copy (see above).
+_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                    "..", "..", "coherent_search", "src")
+if os.path.isdir(_SRC):
+    sys.path.insert(0, os.path.abspath(_SRC))
+
 import numpy as np
 import coherent_search.utils as utils
 import coherent_search.fourierinterp as fi
+import coherent_search.coherent_search as cs_mod
 from coherent_search.coherent_search import snr_metric
 
 
 def main():
     fftfile = sys.argv[1]
     outdir = sys.argv[2]
+
+    # Provenance, always: which copy of the oracle is actually being compared.
+    print(f"oracle: coherent_search from {os.path.dirname(cs_mod.__file__)}")
 
     ft = utils.fftfile(fftfile)
 
@@ -61,20 +79,19 @@ def main():
             ftprofs[:, h] = re + 1j * im
     profs = np.fft.irfft(ftprofs, axis=1)   # (L, nbins), normalised
 
-    # Dump the raw profiles BEFORE the metric mutates them (snr_metric subtracts
-    # the per-profile median in place).  The Julia side reads these back and runs
-    # its own snr on identical inputs, isolating the metric port from any FFT /
+    # Dump the raw profiles first.  The Julia side reads these back and runs its
+    # own metric on identical inputs, isolating the metric port from any FFT /
     # indexing convention differences (which the profiles + kernel checks guard).
     profs.astype(np.float64).tofile(f"{outdir}/profs_ref.bin")
 
-    # Width-sensitive detection metric, exactly as coherent_search.py computes it.
-    # Dump both width penalties (non / sd2) so the Julia port is pinned for each.
-    ngoodbins = min(ft.N / 2 / rfund.mean(), nharms)
-    xsignal, pexp = 0.2, 0.5
-    snr_metric(profs.copy(), ngoodbins, xsignal, "non", pexp).astype(np.float64).tofile(
-        f"{outdir}/metric_non_ref.bin")
-    snr_metric(profs.copy(), ngoodbins, xsignal, "sd2", pexp).astype(np.float64).tofile(
-        f"{outdir}/metric_sd2_ref.bin")
+    # Peak boxcar matched-filter S/N, exactly as coherent_search.py computes it.
+    # This is now the *only* metric on either side; the older on-pulse penalties
+    # (non / sd2) were retired upstream and here.  Note the pooled block sigma is
+    # a full MAD over every bin of every profile, which is what the Julia
+    # `snr_metrics` reference reproduces -- the production search subsamples it.
+    fsp, maxfrac = 1.5, 0.3
+    snr_metric(profs.copy(), fsp, maxfrac).astype(np.float64).tofile(
+        f"{outdir}/metric_boxcar_ref.bin")
 
     rfund.astype(np.float64).tofile(f"{outdir}/rfund.bin")
 
@@ -86,9 +103,8 @@ def main():
         "numbetween": numbetween,
         "nharms": nharms,
         "nbins": 2 * nharms,
-        "ngoodbins": float(ngoodbins),
-        "xsignal": xsignal,
-        "pexp": pexp,
+        "boxcar_fsp": fsp,
+        "boxcar_maxfrac": maxfrac,
         "kernel": {"lobin": k_lobin, "numbins": k_numbins, "len": int(kernel_ref.size)},
         "e2e": {"r0": r0, "lodr": lodr, "L": L},
     }

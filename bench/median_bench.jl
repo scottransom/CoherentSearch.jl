@@ -1,5 +1,5 @@
 # Compare exact-median strategies on COLD, varied small columns — the real
-# access pattern of _profile_snr (a different profile every call), not the
+# access pattern of the per-trial profile median (a different profile every call), not the
 # same-column hot loop that flatters the radix sort.
 #
 #     julia --project=bench -t 1 bench/median_bench.jl [FILE.fft]
@@ -13,7 +13,7 @@ const FILE = length(ARGS) >= 1 ? ARGS[1] : "PM0063_034C1_DM445.0_red.fft"
 
 ft = FFTFile(FILE)
 nharms = 60
-params = SearchParams(nharms=nharms, threshold=6.0, metric=:boxcar,
+params = SearchParams(nharms=nharms, threshold=6.0,
                       decimations=decimation_set(nharms, 6))
 Nprof = 2048
 lodr  = params.hidr / params.nharms

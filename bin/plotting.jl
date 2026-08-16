@@ -30,7 +30,7 @@ function _page_header(ft::FFTFile, params, threshold, page, npages)
     obj = something(ft.inf.object, "?")
     dm = ft.inf.DM === nothing ? "?" : @sprintf("%.2f", ft.inf.DM)
     cfg = params === nothing ? "" :
-          @sprintf("   nharms=%d   metric=%s   pexp=%g", params.nharms, params.metric, params.pexp)
+          @sprintf("   nharms=%d   metric=boxcar", params.nharms)
     thr = threshold === nothing ? "" : @sprintf("   threshold=%.1f", threshold)
     return string(
         @sprintf("%s      Candidate pulse profiles", basename(ft.path)),

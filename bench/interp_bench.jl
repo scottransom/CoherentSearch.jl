@@ -93,7 +93,7 @@ end
 
 # The search's own tabulated hot loop, driven through a real Workspace.
 function direct_table_setup(n, step, m, nharms)
-    params = SearchParams(nharms=nharms, m=m, metric=:boxcar, interp=:direct)
+    params = SearchParams(nharms=nharms, m=m, interp=:direct)
     hplans = CS.build_harmonic_plans(params, n)
     ws = CS.Workspace(params, hplans, n)
     dplans = CS.build_direct_plans(params, R0 / nharms)

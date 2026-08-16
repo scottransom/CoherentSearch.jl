@@ -30,60 +30,6 @@ const PIN_PROFT = PIN_PRECISION === :f32 ? Float32 : Float64
     @test all(harmonic_numbetween(h, nh, hidr, minnb) >= minnb for h in 1:nh)
 end
 
-@testset "snr_metrics: N_on^p and Σd²^p detection metrics" begin
-    nbins = 64
-    ngood = 32.0
-    invrms = sqrt(2 * ngood + 1)
-
-    # A lone spike: the on-pulse set is just the peak, so N_on=1 and Σd²=0 -> both
-    # penalties floor to 1 and the metric is peak*invrms for any metric/exponent.
-    spike = zeros(nbins); spike[10] = 5.0
-    for met in (:non, :sd2), p in (0.5, 1.0)
-        @test snr_metrics(reshape(spike, nbins, 1), ngood; metric=met, pexp=p)[1] ≈
-              5.0 * invrms rtol=1e-12
-    end
-
-    # Equal-area, different width: the narrower pulse scores higher (width penalty).
-    narrow = zeros(nbins); narrow[20] = 8.0                 # N_on=1
-    wide   = zeros(nbins); wide[20:27] .= 1.0               # N_on=8, same area
-    @test snr_metrics(reshape(wide,   nbins, 1), ngood)[1] <
-          snr_metrics(reshape(narrow, nbins, 1), ngood)[1]
-
-    # The design distinction: Σd² penalizes phase SEPARATION; N_on does not.
-    close = zeros(nbins); close[20] = 4.0; close[21] = 4.0   # two adjacent bins
-    far   = zeros(nbins); far[20]   = 4.0; far[50]   = 4.0   # two well-separated bins
-    non_close = snr_metrics(reshape(close, nbins, 1), ngood; metric=:non)[1]
-    non_far   = snr_metrics(reshape(far,   nbins, 1), ngood; metric=:non)[1]
-    sd2_close = snr_metrics(reshape(close, nbins, 1), ngood; metric=:sd2)[1]
-    sd2_far   = snr_metrics(reshape(far,   nbins, 1), ngood; metric=:sd2)[1]
-    @test non_close ≈ non_far rtol=1e-12    # N_on only counts lit bins, ignores where
-    @test sd2_far < sd2_close               # Σd² down-weights the separated pair
-
-    # The exponent p sets the width-penalty strength (and does nothing at N_on=1).
-    wlo = snr_metrics(reshape(wide, nbins, 1), ngood; metric=:non, pexp=0.5)[1]
-    whi = snr_metrics(reshape(wide, nbins, 1), ngood; metric=:non, pexp=1.0)[1]
-    @test whi < wlo
-    @test snr_metrics(reshape(narrow, nbins, 1), ngood; metric=:non, pexp=1.0)[1] ≈
-          snr_metrics(reshape(narrow, nbins, 1), ngood; metric=:non, pexp=0.5)[1] rtol=1e-12
-
-    # Modular wrap: a pulse straddling phase 0/1 is contiguous, not edge-split.
-    wrap = zeros(nbins); wrap[nbins] = 4.0; wrap[1] = 4.0
-    adj  = zeros(nbins); adj[30] = 4.0; adj[31] = 4.0
-    @test snr_metrics(reshape(wrap, nbins, 1), ngood; metric=:sd2)[1] ≈
-          snr_metrics(reshape(adj,  nbins, 1), ngood; metric=:sd2)[1] rtol=1e-12
-
-    # brfft (unnormalised, nbins×) vs irfft-scaled: the 1/nbins `scale` recovers
-    # the same value from an unnormalised profile.
-    got = snr_metrics(reshape(spike, nbins, 1), ngood)[1]
-    medbuf = Vector{Float64}(undef, nbins)
-    scaled = reshape(spike .* nbins, nbins, 1)
-    fast = CoherentSearch._profile_snr(scaled, 1, medbuf, nbins, invrms, 1.0 / nbins, 0.2, :non, 0.5)
-    @test fast ≈ got rtol=1e-12
-
-    # An unknown metric is rejected.
-    @test_throws ArgumentError snr_metrics(reshape(spike, nbins, 1), ngood; metric=:bogus)
-end
-
 @testset "boxcar_widths: geometric bank capped at maxfrac*nbins" begin
     w = boxcar_widths(64; fsp=1.5, maxfrac=0.3)
     @test w == [1, 2, 3, 4, 6, 9, 13, 19]        # riptide's wₖ₊₁=max(⌊1.5wₖ⌋,wₖ+1)
@@ -96,32 +42,36 @@ end
 
 @testset "boxcar metric: scale-invariant, robust, detects a pulse" begin
     nbins = 64
-    @test SearchParams().metric === :boxcar      # :boxcar is now the default metric
 
     # A ratio of two linear-in-amplitude quantities: invariant to overall scale
     # (this is why the unnormalised brfft hot path and the normalised reference
     # irfft yield the identical value, with no `scale`/`ngoodbins` correction).
     ramp = collect(1.0:nbins)
-    m1 = snr_metrics(reshape(ramp, nbins, 1), 32.0; metric=:boxcar)[1]
-    m2 = snr_metrics(reshape(ramp .* 7.0, nbins, 1), 32.0; metric=:boxcar)[1]
+    m1 = snr_metrics(reshape(ramp, nbins, 1))[1]
+    m2 = snr_metrics(reshape(ramp .* 7.0, nbins, 1))[1]
     @test m1 ≈ m2 rtol=1e-12
     @test m1 > 0
 
     # A flat profile has zero MAD -> guarded to 0.0, not NaN/Inf.
-    @test snr_metrics(reshape(fill(3.0, nbins), nbins, 1), 32.0; metric=:boxcar)[1] == 0.0
+    @test snr_metrics(reshape(fill(3.0, nbins), nbins, 1))[1] == 0.0
 
     # A narrow pulse on Gaussian noise scores far above the noise-only profile,
     # and the pure-noise peak-over-trials sits at a few sigma (analytic EVD).
     noise = randn(MersenneTwister(1234), nbins)
-    snr_noise = snr_metrics(reshape(copy(noise), nbins, 1), 32.0; metric=:boxcar)[1]
+    snr_noise = snr_metrics(reshape(copy(noise), nbins, 1))[1]
     sig = copy(noise); sig[30] += 20.0
-    snr_sig = snr_metrics(reshape(sig, nbins, 1), 32.0; metric=:boxcar)[1]
+    snr_sig = snr_metrics(reshape(sig, nbins, 1))[1]
     @test snr_sig > snr_noise + 10
     @test 0 < snr_noise < 8
     @test snr_sig > 15
 
-    # ngoodbins is ignored for :boxcar (it measures its own noise level).
-    @test snr_metrics(reshape(copy(noise), nbins, 1), 5.0; metric=:boxcar)[1] ≈ snr_noise
+    # σ̂ subsampling: the default is the exact pooled MAD (what the Python oracle
+    # computes), and it must agree with the production estimator whenever the block
+    # is small enough that no subsampling happens.  This is the relationship
+    # `block_metrics` relies on to be both oracle-faithful and an exact
+    # equivalence partner for `chunk_metrics`.
+    small = randn(MersenneTwister(7), nbins, 4)         # nbins*L well under the cap
+    @test snr_metrics(small) == snr_metrics(small; sigma_samples=CoherentSearch._BOXCAR_SIGMA_SAMPLES)
 end
 
 @testset "remove_duplicates collapses clusters" begin
@@ -167,34 +117,14 @@ if isfile(EXAMPLE_FFT)
     ft = FFTFile(EXAMPLE_FFT)
 
     @testset "optimised path reproduces the reference (align=false)" begin
-        # With a fixed numbetween and one chunk, the production path uses the
-        # same grids as block_metrics, so it should match to ~machine precision.
-        # Pinned on :non, the oracle-validated (Python-pinned) reference metric.
-        # interp=:fft + fftsizing=:pow2 is what `block_metrics` itself does, so
-        # this stays the strict equivalence gate; the default :direct path is a
-        # *different* (exact) interpolator and is pinned separately below.
-        params = SearchParams(nharms=32, m=32, numbetween=16, align=false, metric=:non,
-                              interp=:fft, fftsizing=:pow2)
-        lodr = params.hidr / params.nharms
-        rstart = 10010.0
-        n = 256
-        rfund = rstart .+ (0:n-1) .* lodr
-
-        ref = block_metrics(ft, rfund, params)
-        opt = chunk_metrics(ft, params, rstart, n; lodr=lodr)
-
-        relerr = maximum(abs.(opt .- ref)) / maximum(abs.(ref))
-        @info "align=false reference agreement" relerr
-        # Both paths compute identical profiles to ~1e-10; the snr metric is a
-        # continuous function of them except at the (rare) half-max threshold tie.
-        @test relerr < PIN_TOL
-    end
-
-    @testset "boxcar metric: optimised path reproduces the reference (align=false)" begin
-        # Same equivalence pin as above, for :boxcar.  The metric is scale-free,
-        # so the unnormalised brfft (chunk_metrics) and the normalised irfft
-        # (block_metrics) must agree to ~machine precision on identical grids.
-        params = SearchParams(nharms=32, m=32, numbetween=16, align=false, metric=:boxcar,
+        # With a fixed numbetween and one chunk, the production path uses the same
+        # grids as `block_metrics`, so it should match to ~machine precision.  The
+        # metric is scale-free, so the unnormalised brfft (chunk_metrics) and the
+        # normalised irfft (block_metrics) agree despite the missing 1/nbins.
+        # interp=:fft + fftsizing=:pow2 is what `block_metrics` itself does, so this
+        # is the strict equivalence gate; the default :direct path is a *different*
+        # (exact) interpolator and is pinned separately below.
+        params = SearchParams(nharms=32, m=32, numbetween=16, align=false,
                               interp=:fft, fftsizing=:pow2)
         lodr = params.hidr / params.nharms
         rstart = 10010.0
@@ -215,7 +145,7 @@ if isfile(EXAMPLE_FFT)
         # statement than the FFT path's equivalence, which inherits that path's
         # linear-interpolation error.
         nharms = 60
-        params = SearchParams(nharms=nharms, m=32, metric=:boxcar, interp=:direct)
+        params = SearchParams(nharms=nharms, m=32, interp=:direct)
         lodr = params.hidr / nharms
         # Low enough that harmonic 60 stays inside the (small) bundled test FFT,
         # so the per-point reference can be evaluated for every harmonic.
@@ -237,7 +167,7 @@ if isfile(EXAMPLE_FFT)
 
         # ... and the FFT path is *much* further from exact, which is the
         # accuracy the direct path buys (not a defect of this test).
-        pf = SearchParams(nharms=nharms, m=32, metric=:boxcar, interp=:fft)
+        pf = SearchParams(nharms=nharms, m=32, interp=:fft)
         hf = build_harmonic_plans(pf, n)
         wf = CoherentSearch.Workspace(pf, hf, n)
         CoherentSearch.fill_chunk_profiles!(wf, hf, ft, pf, rstart, lodr, n)
@@ -260,7 +190,7 @@ if isfile(EXAMPLE_FFT)
         # the same trials.  This is the property that a naive float-accumulated
         # `rstart` would drift on.
         nharms = 32
-        params = SearchParams(nharms=nharms, m=32, metric=:boxcar, interp=:direct)
+        params = SearchParams(nharms=nharms, m=32, interp=:direct)
         lodr = params.hidr / nharms
         r_lo = 10010.0
         dplans = build_direct_plans(params, r_lo)
@@ -291,8 +221,8 @@ if isfile(EXAMPLE_FFT)
         # They are different algorithms (one approximate), so they cannot be
         # bit-identical — but the metric they produce must track closely, and the
         # candidate they find must be the same one.
-        params_d = SearchParams(nharms=32, m=32, metric=:boxcar, interp=:direct)
-        params_f = SearchParams(nharms=32, m=32, metric=:boxcar, interp=:fft)
+        params_d = SearchParams(nharms=32, m=32, interp=:direct)
+        params_f = SearchParams(nharms=32, m=32, interp=:fft)
         lodr = params_d.hidr / params_d.nharms
         rstart = 10010.0
         n = 256
@@ -305,7 +235,7 @@ if isfile(EXAMPLE_FFT)
     end
 
     @testset "boxcar metric detects the 10.0123 Hz pulsar" begin
-        params = SearchParams(nharms=32, m=32, numbetween=16, metric=:boxcar)
+        params = SearchParams(nharms=32, m=32, numbetween=16)
         cands = search(ft, params; lofreq=9.5, hifreq=10.5, threshold=8.0)
         @test !isempty(cands)
         best = cands[argmax(c.metric for c in cands)]
@@ -321,9 +251,9 @@ if isfile(EXAMPLE_FFT)
         # `medcut = -Inf`, i.e. the exact scalar path for every trial — so the
         # two runs must produce byte-identical candidates.  This is the pin for
         # both the gate itself and the cross-profile SIMD batching behind it.
-        gated = SearchParams(nharms=60, m=32, metric=:boxcar,
+        gated = SearchParams(nharms=60, m=32,
                              decimations=decimation_set(60, 4))
-        exact = SearchParams(nharms=60, m=32, metric=:boxcar,
+        exact = SearchParams(nharms=60, m=32,
                              decimations=decimation_set(60, 4),
                              boxcar_medmargin=Inf)
         kw = (lofreq=9.5, hifreq=10.5, threshold=6.0, blocksize=512)
@@ -343,7 +273,7 @@ if isfile(EXAMPLE_FFT)
         # exact; the bound that matters is that it stays far under
         # `boxcar_medmargin` (2.0), which is the slack the rescue reserves.
         CS = CoherentSearch
-        params = SearchParams(nharms=60, m=32, metric=:boxcar)
+        params = SearchParams(nharms=60, m=32)
         nbins = 2params.nharms
         Nprof = 500          # deliberately not a multiple of _BC_BATCH (tail path)
         lodr = params.hidr / params.nharms
@@ -396,7 +326,7 @@ if isfile(EXAMPLE_FFT)
     end
 
     @testset "detects the 10.0123 Hz pulsar" begin
-        params = SearchParams(nharms=32, m=32, numbetween=16, metric=:non)
+        params = SearchParams(nharms=32, m=32, numbetween=16)
         cands = search(ft, params; lofreq=9.5, hifreq=10.5, threshold=8.0)
         @test !isempty(cands)
         best = cands[argmax(c.metric for c in cands)]
@@ -417,15 +347,25 @@ if isfile(EXAMPLE_FFT)
     end
 
     @testset "chunk size does not change the detection" begin
-        # :non is a pure per-profile metric, so it is exactly chunk-invariant
-        # (:boxcar's per-block σ makes it only approximately so, by design).
-        params = SearchParams(nharms=32, m=32, numbetween=16, metric=:non)
-        c1 = search(ft, params; lofreq=9.5, hifreq=10.5, threshold=8.0, blocksize=512)
-        c2 = search(ft, params; lofreq=9.5, hifreq=10.5, threshold=8.0, blocksize=4096)
-        b1 = c1[argmax(c.metric for c in c1)]
-        b2 = c2[argmax(c.metric for c in c2)]
-        @test isapprox(b1.freq, b2.freq; atol=1e-3)
-        @test isapprox(b1.metric, b2.metric; rtol=1e-2)
+        # This used to run on `:non`, a pure per-profile metric that is *exactly*
+        # chunk-invariant.  The boxcar metric normalises by a per-*block* σ̂, so it
+        # is only approximately so — by design, and the approximation is what the
+        # test now has to state precisely rather than absorb into a tolerance:
+        #
+        #   * which trial wins is *exactly* chunk-invariant (asserted as equality,
+        #     which is the stronger claim the old `atol=1e-3` was hiding), and
+        #   * the metric drifts with block size because σ̂ is measured over the
+        #     block.  Measured 26.03 → 27.23 (4.6%) across blocksize 512 → 4096,
+        #     monotonically; 10% is the bound with room for the estimator's noise.
+        params = SearchParams(nharms=32, m=32, numbetween=16)
+        bests = map((512, 1024, 2048, 4096)) do bs
+            c = search(ft, params; lofreq=9.5, hifreq=10.5, threshold=8.0, blocksize=bs)
+            c[argmax(x.metric for x in c)]
+        end
+        @test allequal(b.freq for b in bests)
+        lo, hi = extrema(b.metric for b in bests)
+        @info "chunk-size metric drift (per-block σ̂)" lo hi rel=(hi - lo) / lo
+        @test (hi - lo) / lo < 0.10
     end
 
     @testset "decimation pass k reproduces the native Hk-harmonic fold" begin
@@ -437,7 +377,7 @@ if isfile(EXAMPLE_FFT)
             nharms = 60
             Hk = fld(nharms, k)
             params = SearchParams(nharms=nharms, m=32, numbetween=16, align=false,
-                                  decimations=[1, k], metric=:non,
+                                  decimations=[1, k],
                                   interp=:fft, fftsizing=:pow2)
             lodr = params.hidr / nharms
             rstart = 5000.0
@@ -445,7 +385,7 @@ if isfile(EXAMPLE_FFT)
             rfund = rstart .+ (0:n-1) .* lodr
 
             # Native reduced-harmonic fold at the multiplied frequencies.
-            pnat = SearchParams(nharms=Hk, m=32, numbetween=16, align=false, metric=:non,
+            pnat = SearchParams(nharms=Hk, m=32, numbetween=16, align=false,
                                 interp=:fft, fftsizing=:pow2)
             ref = block_metrics(ft, k .* rfund, pnat)
 
@@ -473,7 +413,7 @@ if isfile(EXAMPLE_FFT)
         # 1, then base harmonic j*k in row j+1.  Checked against an explicit
         # gather, since a silently mis-strided view would still transform fine and
         # simply fold the wrong harmonics.
-        params = SearchParams(nharms=60, metric=:boxcar, decimations=[1, 2, 3, 4, 5, 6])
+        params = SearchParams(nharms=60, decimations=[1, 2, 3, 4, 5, 6])
         n = 128
         lodr = params.hidr / params.nharms
         rstart = 5000.0
@@ -500,7 +440,7 @@ if isfile(EXAMPLE_FFT)
         # amplitude, so they agree to ~1e-6 relative — orders of magnitude below
         # the ~1.3% signal-power loss the m=16 kernel already accepts.
         f = 10.0123456789123
-        base = (nharms=32, threshold=6.0, metric=:boxcar)
+        base = (nharms=32, threshold=6.0)
         c64 = search(ft, SearchParams(; base..., precision=:f64);
                      lofreq=f - 0.05, hifreq=f + 0.05, progress=:none)
         c32 = search(ft, SearchParams(; base..., precision=:f32);
@@ -523,7 +463,7 @@ if isfile(EXAMPLE_FFT)
         nharms = 60
         for k in (2, 3)
             base_f = f / k                            # fundamental band that only k hits
-            params = SearchParams(nharms=nharms, decimations=decimation_set(nharms, k), metric=:non)
+            params = SearchParams(nharms=nharms, decimations=decimation_set(nharms, k))
             # harm_remove=false to isolate decimation: otherwise the whole f/k, 2f/k,
             # ... family (which decimation lights up) collapses to its single
             # strongest member, which need not be the direct-f (k-pass) detection.

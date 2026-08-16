@@ -82,7 +82,7 @@ julia --project=. -t auto bin/coherent_search.jl *_red.fft --noplot --threshold 
 julia --project=sysimage sysimage/build_sysimage.jl
 julia --sysimage sysimage/coherent_search.so --project=. -t auto bin/coherent_search.jl ...
 # Heavy multi-frequency config (the standard perf test):
-julia --project=. -t 4 bin/coherent_search.jl --threshold 6 --metric sd2 \
+julia --project=. -t 4 bin/coherent_search.jl --threshold 6 \
       --maxdecim 6 -o out.txt --noplot FILE.fft
 # Per-harmonic interpolation plan (fftlen, numbetween, m, padding, linterp)
 julia --project=. bin/coherent_search.jl --verbose ... FILE.fft
@@ -221,8 +221,8 @@ the hot loop. See `Summary_and_Future_Work.md` (§3) for the roadmap.
   **branch misprediction in `_select!`**: two 8192-sample quickselects were 93%+
   of the function, and a branchless Lomuto (`i += (x <= pivot)`, unconditional
   swap) is 3.62x at n=8192. It is **size-gated at `_SELECT_BRANCHLESS_MIN=256`**
-  because it is 0.94x at n=120 — the `:non`/`:sd2` per-trial median that runs
-  ~1e8 times. Selection returns a unique order statistic, so all medians are
+  because it is 0.94x at n=120 — the per-profile baseline median in
+  `_boxcar_exact`, run once per trial that clears the gate. Selection returns a unique order statistic, so all medians are
   bit-identical (verified vs the old partition on tied/all-equal/sorted inputs).
   **Note the profiler charges `_median!` to `median-select` regardless of caller**,
   which is why `_block_sigma` read as 3.7% while really being ~20%.

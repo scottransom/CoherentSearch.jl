@@ -18,7 +18,7 @@ using CoherentSearch
 using JSON
 using Printf
 
-const DEFAULT_PY = "/home/sransom/python_venvs/pixiPSR/.pixi/envs/default/bin/python"
+const DEFAULT_PY = "/data1/environments/pixiPSR/.pixi/envs/default/bin/python3"
 const DEFAULT_FFT = joinpath(@__DIR__, "..", "..", "coherent_search",
                              "examples", "harmonics_hi.fft")
 
@@ -73,19 +73,20 @@ function main()
     prel < 1e-9 || (failures += 1; @warn "end-to-end profile accuracy out of tolerance")
 
     # ---- 3) detection metric port (snr_metric) on identical profiles ----
-    # Feed Julia's snr the *Python* profiles so any difference is purely the
-    # metric implementation, not the FFT.  Both width penalties must agree to
-    # machine precision.
-    ngood = Float64(meta["ngoodbins"]); xsig = Float64(meta["xsignal"]); pex = Float64(meta["pexp"])
-    for m in (:non, :sd2)
-        metric_ref = read_f64(joinpath(outdir, "metric_$(m)_ref.bin"))
-        metric_jl = snr_metrics(profs_ref, ngood; xsignal=xsig, metric=m, pexp=pex)
-        merr = maximum(abs.(metric_jl .- metric_ref))
-        mrel = merr / maximum(abs.(metric_ref))
-        @printf("[metric]  snr(:%-3s)    max|Δ| = %.3e   rel = %.3e   (n=%d)\n",
-                m, merr, mrel, length(metric_ref))
-        mrel < 1e-9 || (failures += 1; @warn "snr metric port out of tolerance" metric=m)
-    end
+    # Feed Julia's metric the *Python* profiles so any difference is purely the
+    # metric implementation, not the FFT.  The peak boxcar matched filter is the
+    # only metric on either side now.  It is pinned on three separately
+    # fallible pieces at once — the width bank, the per-profile median baseline,
+    # and the pooled block σ̂ — so it is a stronger check than its one line
+    # suggests.
+    fsp = Float64(meta["boxcar_fsp"]); maxfrac = Float64(meta["boxcar_maxfrac"])
+    metric_ref = read_f64(joinpath(outdir, "metric_boxcar_ref.bin"))
+    metric_jl = snr_metrics(profs_ref; boxcar_fsp=fsp, boxcar_maxfrac=maxfrac)
+    merr = maximum(abs.(metric_jl .- metric_ref))
+    mrel = merr / maximum(abs.(metric_ref))
+    @printf("[metric]  snr(:boxcar) max|Δ| = %.3e   rel = %.3e   (n=%d)\n",
+            merr, mrel, length(metric_ref))
+    mrel < 1e-9 || (failures += 1; @warn "boxcar metric port out of tolerance")
 
     println()
     if failures == 0

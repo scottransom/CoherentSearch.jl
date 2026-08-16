@@ -6,7 +6,7 @@
 # The search is compiled on a tiny warm-up band first so the profile reflects
 # steady-state hot-loop cost, not JIT.  Output: bench/statprof/index.html.
 #
-# Defaults mirror the standard heavy configuration (`--metric boxcar --maxdecim 6`
+# Defaults mirror the standard heavy configuration (`--maxdecim 6`
 # ⇒ nharms=60, six decimation factors), over a clean mid-band sub-band so a
 # single-threaded run finishes in tens of seconds while still exercising every
 # code path (all harmonics, all decimations, the boxcar metric + per-block σ,
@@ -27,7 +27,6 @@ function build_params()
     SearchParams(
         nharms      = nharms,
         threshold   = 6.0,
-        metric      = :boxcar,
         decimations = decimation_set(nharms, 6),
     )
 end
@@ -99,8 +98,6 @@ function classify(sf)
      fn == "_boxcar_psum!")                            && return "boxcar-metric"
     fn == "_block_sigma"                               && return "block-sigma"
     fn == "boxcar_widths"                              && return "boxcar-setup"
-    (fn == "pow_body" || fn == "^")                    && return "pow(w^pexp)"
-    fn == "_profile_snr"                               && return "profile_snr-body"
     (fn == "interp_tile!" || fn == "fill_harmonic_row!") && return "interp (fft-correlate)"
     (fn == "fill_harmonic_row_direct!" ||
      fn == "_fill_row_direct_slow!")                   && return "interp (direct O(m))"

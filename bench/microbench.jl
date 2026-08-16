@@ -15,7 +15,7 @@ const FILE = length(ARGS) >= 1 ? ARGS[1] : "PM0063_034C1_DM445.0_red.fft"
 
 ft = FFTFile(FILE)
 nharms = 60
-params = SearchParams(nharms=nharms, threshold=6.0, metric=:boxcar,
+params = SearchParams(nharms=nharms, threshold=6.0,
                       decimations=decimation_set(nharms, 6))
 Nprof = 2048
 lodr  = params.hidr / params.nharms
@@ -31,7 +31,7 @@ dplans = params.interp === :direct ? CS.build_direct_plans(params, rstart) : not
 # The `:fft` interpolator kept alongside, so the FFT-path buckets below (which
 # poke at `interp_tile!` / `ws.scratch`, neither of which the direct path has)
 # still measure something, and so the two interpolators can be compared directly.
-params_fft = SearchParams(nharms=nharms, threshold=6.0, metric=:boxcar,
+params_fft = SearchParams(nharms=nharms, threshold=6.0,
                           decimations=decimation_set(nharms, 6), interp=:fft)
 hplans_fft = CS.build_harmonic_plans(params_fft, Nprof)
 ws_fft     = CS.Workspace(params_fft, hplans_fft, Nprof)

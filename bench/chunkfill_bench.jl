@@ -26,7 +26,7 @@ rstart = FREQ * ft.T
 
 const MAXDECIM = length(ARGS) >= 3 ? parse(Int, ARGS[3]) : 6
 
-mkparams(prec) = SearchParams(nharms=NHARMS, threshold=6.0, metric=:boxcar,
+mkparams(prec) = SearchParams(nharms=NHARMS, threshold=6.0,
                               decimations=decimation_set(NHARMS, MAXDECIM),
                               precision=prec)
 

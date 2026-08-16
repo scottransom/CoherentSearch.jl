@@ -82,7 +82,7 @@ const OPT = parse_args(ARGS)
 
 function run_worker()
     ft = FFTFile(OPT.file)
-    params = SearchParams(nharms=OPT.nharms, threshold=OPT.threshold, metric=:boxcar,
+    params = SearchParams(nharms=OPT.nharms, threshold=OPT.threshold,
                           decimations=decimation_set(OPT.nharms, OPT.maxdecim))
     go(hi) = search(ft, params; lofreq=OPT.lofreq, hifreq=hi, blocksize=2048,
                     threshold=params.threshold, progress=:none)
