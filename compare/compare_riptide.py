@@ -81,6 +81,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import shutil
 import re
@@ -274,6 +275,158 @@ def crossmatch(a, b, T, tol_bins):
 
 
 # ---------------------------------------------------------------------------
+# Work accounting
+#
+# The timing ratio is meaningless without knowing how much searching each side
+# did, and the two codes do NOT do the same amount.  What IS matched, exactly,
+# is the *frequency resolution rule*:
+#
+#   riptide's FFA at base period `b` samples emits `m = n/b` shifts spanning
+#   the periods `b` to `b+1` samples, so its trial spacing in Fourier bins is
+#       dr = n / ((m-1) * b^2) = 1/b   (verified numerically: 1/b to 2e-4)
+#   i.e. exactly one PHASE BIN of drift across the observation.  That is not a
+#   tunable -- it is what the transform produces.
+#
+#   Our `--hidr` is the step of the HIGHEST harmonic, so the fundamental steps
+#   by `hidr/nharms`; a decimation-`k` pass reports `k*rf`, hence
+#       dr = k*hidr/nharms = hidr/(nharms/k) = 1/nbins   at hidr = 0.5.
+#
+# So `--hidr 0.5` with `nharms = bmax/2` IS the FFA's native resolution, at
+# every k.  There is nothing to correct there.
+#
+# What differs is how many folds each code applies PER FREQUENCY:
+#
+#   * riptide folds each frequency ONCE, at the single `b` its downsampling
+#     ladder happens to land on -- sawtoothing 20..120 within each cycle, so
+#     the depth and the resolution at a given frequency are whatever the ladder
+#     gives (b=36 at 3 Hz, b=109 at 1 Hz on the reference observation).
+#   * we fold every frequency below `hifreq` SIX times (k=1..6, 120..20 bins),
+#     because each decimation covers [k*lofreq, k*hifreq] and those overlap.
+#     That is our harmonic-sum ladder, and it is not redundant: the 7.1185 Hz
+#     pulsar scores 12.97 at k=6 (10 harmonics) but only 11.89 with k=1 alone.
+#   * riptide's boxcar bank is built from `bins_min` and reused for every
+#     profile, so at b=120 it only reaches 6/120 = 5% duty; ours is built from
+#     each profile's own `nbins` and reaches `boxcar_maxfrac` = 30% everywhere.
+#     On the reference observation rseek is width-LIMITED on the one real
+#     pulsar (reports w=6, its maximum, ducy 6.5% for a ~10% pulse).
+#
+# Net on the reference observation: we evaluate ~2.8x the profiles and ~3.6x
+# the boxcar (bins x widths) work.  Quote the timing ratio against these.
+# ---------------------------------------------------------------------------
+def width_bank(nbins, maxfrac, fsp=1.5):
+    """Geometric boxcar bank -- identical rule in both codes.
+
+    riptide calls this with `bins_min` for every profile
+    (`generate_width_trials`); we call it with each profile's own `nbins`
+    (`boxcar_widths`).  Same formula, different argument.
+    """
+    wmax = max(1, int(maxfrac * nbins))
+    out, w = [], 1
+    while w <= wmax:
+        out.append(w)
+        w = int(max(w + 1, fsp * w))
+    return out
+
+
+def riptide_work(N, tsamp, pmin, pmax, bmin, bmax, ducy_max=0.3, wtsp=1.5):
+    """Port of riptide's `periodogram_length`, plus work counters.
+
+    Faithful to `cpp/periodogram.hpp`: the same downsampling ladder, the same
+    `ceilshift` row cut, the same `floor(n/f)` downsampled size.  Returns
+    profiles, folded profile bins, and boxcar (bins x widths) operations, plus
+    the (frequency -> foldbins) map needed to report `dr` versus frequency.
+    """
+    ds_ini = pmin / (tsamp * bmin)
+    ds_geo = (bmax + 1.0) / bmin
+    nds = math.ceil(math.log(pmax / pmin) / math.log(ds_geo))
+    nw = len(width_bank(bmin, ducy_max, wtsp))    # ONE bank, from bins_min
+    prof = 0
+    binsum = 0.0
+    bcops = 0.0
+    spans = []                                    # (flo, fhi, b) per FFA block
+    for ids in range(nds):
+        f = ds_ini * ds_geo ** ids
+        tau = f * tsamp
+        pmax_samples = pmax / tau
+        n = math.floor(N / f)
+        for b in range(bmin, min(bmax, n, int(pmax_samples)) + 1):
+            rows = n // b
+            if rows < 2:
+                continue
+            pceil = min(pmax_samples, b + 1.0)
+            rows_eval = min(rows, math.ceil(b * (rows - 1.0) * (1.0 - b / pceil)))
+            if rows_eval <= 0:
+                continue
+            prof += rows_eval
+            binsum += rows_eval * b
+            bcops += rows_eval * b * nw
+            fhi = 1.0 / (tau * b)
+            flo = 1.0 / (tau * b * b / (b - (rows_eval - 1) / (rows - 1.0)))
+            spans.append((flo, fhi, b))
+    return dict(profiles=prof, bins=binsum, bcops=bcops, nwidths=nw, spans=spans)
+
+
+def coherent_work(T, lofreq, hifreq, nharms, maxdecim, hidr, maxfrac=0.3, fsp=1.5):
+    """Work counters for our search, from the same quantities the CLI is given."""
+    lodr = hidr / nharms
+    ntrials = math.floor((hifreq * T - lofreq * T) / lodr) + 1
+    ks = [k for k in range(1, maxdecim + 1) if nharms // k >= 2]
+    binsum = 0.0
+    bcops = 0.0
+    stages = []
+    for k in ks:
+        nbins = 2 * (nharms // k)
+        nw = len(width_bank(nbins, maxfrac, fsp))
+        binsum += ntrials * nbins
+        bcops += ntrials * nbins * nw
+        stages.append((k, nbins, nw, k * lofreq, k * hifreq))
+    return dict(trials=ntrials, profiles=ntrials * len(ks), bins=binsum,
+                bcops=bcops, lodr=lodr, stages=stages)
+
+
+def print_work(rw, cw, fmax):
+    """Side-by-side work accounting, printed next to the timing so the ratio
+    is never quoted on its own."""
+    print("-" * 78)
+    print("WORK  (what each side actually searched -- read this beside the timing)")
+    print("-" * 78)
+    print(f"  {'':26} {'rseek':>16} {'coherent':>16} {'ours/rseek':>11}")
+    for lab, key in (("profiles evaluated", "profiles"),
+                     ("profile bins folded", "bins"),
+                     ("boxcar bins x widths", "bcops")):
+        a, b = rw[key], cw[key]
+        print(f"  {lab:26} {a:16,.0f} {b:16,.0f} {b / a:10.2f}x")
+    print(f"  boxcar widths: rseek {rw['nwidths']} for EVERY profile (bank built from"
+          f" bins_min);")
+    print("                 ours " + ", ".join(
+        f"{nw}@{nbins}b" for _, nbins, nw, _, _ in cw["stages"]) + " (bank per profile)")
+    print()
+    print("  Trial spacing is the SAME RULE on both sides: dr = 1/nbins Fourier bins,")
+    print("  i.e. one phase bin of drift across T.  For us that is --hidr/nharms per")
+    print(f"  fundamental ({cw['lodr']:.6g} bins) times k; for rseek it is 1/b, with b")
+    print("  set by its downsampling ladder rather than chosen.")
+    print()
+    print(f"  {'freq (Hz)':>12} {'rseek b':>9} {'rseek dr':>10} | "
+          f"{'our nbins':>10} {'our dr':>9} {'our folds':>10}")
+    spans = sorted(rw["spans"])
+    for probe in (0.2, 1.0, 3.0, 7.1185, 10.0, 30.0, 60.0, 120.0, 0.98 * fmax):
+        rb = next((b for flo, fhi, b in spans if flo <= probe <= fhi), None)
+        ours = [nb for _, nb, _, klo, khi in cw["stages"] if klo <= probe <= khi]
+        if rb is None or not ours:
+            continue
+        deep = max(ours)                      # deepest fold covering this frequency
+        print(f"  {probe:12.4g} {rb:9d} {1.0 / rb:10.5f} | "
+              f"{deep:10d} {1.0 / deep:9.5f} {len(ours):10d}")
+    print()
+    print("  'our folds' is how many decimations cover that frequency: every one of")
+    print("  them is a separate profile + boxcar scan, where rseek does exactly one.")
+    print("  That is where the work ratio above comes from -- NOT from a finer")
+    print("  frequency grid, which is matched exactly.  It buys sensitivity: the")
+    print("  shallow folds are our harmonic-sum ladder (see CLAUDE.md).")
+    print()
+
+
+# ---------------------------------------------------------------------------
 # Presets
 #
 # A comparison is only as good as the fraction of it that is actual searching.
@@ -320,6 +473,10 @@ def main(argv=None):
                     help="override the derived nharms (default: bmax/2)")
     ap.add_argument("--maxdecim", type=int, default=None,
                     help="override the derived maxdecim (default: bmax/bmin)")
+    ap.add_argument("--hidr", type=float, default=0.5,
+                    help="coherent_search trial step at the highest harmonic; 0.5 "
+                         "is exactly the FFA's own resolution (dr = 1/nbins) and is "
+                         "what makes the frequency grids match")
     ap.add_argument("--threads", type=int, default=0,
                     help="also run coherent_search with this many threads "
                          "(rseek is single-threaded, so -t 1 is the fair comparison)")
@@ -386,9 +543,10 @@ def main(argv=None):
     print(f"              N={N}  dt={dt:g} s  T={T:.2f} s  DM={dm}")
     print(f"rseek       : --Pmin {args.Pmin} --Pmax {args.Pmax} "
           f"--bmin {args.bmin} --bmax {args.bmax} --smin {args.smin}")
-    print(f"              searches {lofreq:.4g}-{hifreq:.4g} Hz, {args.bmin}-{args.bmax} phase bins")
+    print(f"              searches {lofreq:.4g}-{fmax:.4g} Hz, {args.bmin}-{args.bmax} phase bins")
     print(f"coherent    : --lofreq {lofreq:.6g} --hifreq {hifreq:.6g} "
-          f"--nharms {nharms} --maxdecim {maxdecim} --threshold {threshold}")
+          f"--nharms {nharms} --maxdecim {maxdecim} --hidr {args.hidr:g} "
+          f"--threshold {threshold}")
     nbins_hi, nbins_lo = 2 * nharms, 2 * (nharms // maxdecim)
     print(f"              fundamentals {lofreq:.4g}-{hifreq:.4g} Hz; decimation to k="
           f"{maxdecim} covers {lofreq:.4g}-{maxdecim * hifreq:.4g} Hz, "
@@ -405,6 +563,11 @@ def main(argv=None):
     print(f"              (both codes are limited to nbins <= P/tsamp = "
           f"{args.Pmin / dt:.0f} bins at the top of the band)")
     print()
+
+    # --- work accounting (cheap; printed before anything is timed) ----------
+    rwork = riptide_work(N, dt, args.Pmin, args.Pmax, args.bmin, args.bmax)
+    cwork = coherent_work(T, lofreq, hifreq, nharms, maxdecim, args.hidr)
+    print_work(rwork, cwork, fmax)
 
     # --- rseek -------------------------------------------------------------
     rcmd = [rseek, "--Pmin", str(args.Pmin), "--Pmax", str(args.Pmax),
@@ -430,6 +593,7 @@ def main(argv=None):
               os.path.join(REPO, "bin", "coherent_search.jl"),
               "--lofreq", repr(lofreq), "--hifreq", repr(hifreq),
               "--nharms", str(nharms), "--maxdecim", str(maxdecim),
+              "--hidr", repr(args.hidr),
               "--threshold", str(threshold), "--noprogress",
               "-o", out]
         if args.noharmremove:

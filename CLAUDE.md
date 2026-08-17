@@ -136,6 +136,11 @@ pulsar at S/N 12.97 vs riptide's 11.80, plus two candidates it does not report.
 riptide's two extra entries are the `f/2` and `2f` of the pulsar, which it does
 not filter and we collapse.
 
+That table is the **laptop**. The same command on the 20-core workstation
+(`fitzroy`) gives rseek 20.4 s, ours `-t 1` 32.3 s, `-t 20` 4.6 s — i.e. **1.59x
+slower**, not 1.24x. Quote the machine with the ratio; the two hosts disagree by
+more than any optimisation discussed below.
+
 - **Start-up is NOT what the comparison measures**, and the harness proves it
   per run: rseek 1.41 s start-up + 22.93 s searching, ours 1.48 s + 28.78 s, so
   the pure-compute ratio (1.26x) matches the wall ratio (1.24x). Our fixed cost
@@ -154,6 +159,48 @@ not filter and we collapse.
   first version of this section quoted 2.1x from exactly that mismatch.
 - **Decimation is a real advantage; configure it to be used.** `--maxdecim 6`
   against `--bmin 20` is the matched pair, not `--maxdecim 1`.
+- **The frequency grids are matched exactly, and this is not a coincidence
+  (settled 2026-08-16).** riptide's FFA at base period `b` samples emits
+  `m = n/b` shifts spanning periods `b`…`b+1`, so its trial step is
+  `dr = n/((m−1)·b²) = 1/b` Fourier bins — **one phase bin of drift across `T`**,
+  and *not a tunable*: it is what the transform produces. Our `--hidr` is the
+  step of the *highest* harmonic, so the fundamental steps by `hidr/nharms` and a
+  decimation-`k` pass (reporting `k·rf`, `nbins = 2·nharms/k`) steps by
+  `k·hidr/nharms = 1/nbins` at `hidr = 0.5`. **Same rule, at every `k`.**
+  Verified against riptide itself (`ffa_search` on random data, reading
+  `pgram.freqs`/`pgram.foldbins`): measured `dr·b = 1.0001–1.0002` at
+  `b = 20, 40, 60, 90, 120`. So `--hidr 0.5` with `nharms = bmax/2` *is* the
+  FFA's native resolution — **there is nothing to fix in the trial grid, and
+  lowering `hidr` to "be safe" would silently double the work for no reason.**
+- **What is NOT matched is folds per frequency, and it is worth ~2.8x.**
+  riptide folds each frequency **once**, at whatever `b` its downsampling ladder
+  lands on (sawtoothing 20→120 within each cycle: `b = 36` at 3 Hz, `b = 109` at
+  1 Hz, `b = 92` at 7.1 Hz — depth and resolution are what the ladder gives, not
+  a choice). We fold every frequency below `hifreq` **six times**, because
+  decimation `k` covers `[k·lofreq, k·hifreq]` and those overlap. On the bench
+  config that is **2.81x the profiles, 2.47x the folded bins, 3.59x the boxcar
+  (bins×widths) work** — measured, not estimated; `compare/compare_riptide.py`
+  now prints this table before it times anything, so the ratio is never quoted
+  bare. **Quote the timing ratio against the work ratio.**
+- **The overlap is our harmonic-sum ladder — do NOT "optimise" it away.** It
+  looks like pure redundancy below `hifreq` (a signal at 7 Hz is fully covered by
+  `k=1`), and restricting each `k` to a disjoint band would cut the `k≥2` work
+  2.94x — measured 31.7 s → ~22 s at `-t 1`, which would make us *faster* than
+  `rseek`. It also **costs real sensitivity**: measured `--maxdecim 6` vs
+  `--maxdecim 1` on PM0063, the 7.1185 Hz pulsar scores **12.97 at `k=6`
+  (`H=10`, a 20-bin fold) but only 11.89 from `k=1` alone** (`H=60`). The shallow
+  folds are exactly PRESTO's 1/2/4/8/16-harmonic ladder, and the boxcar scan on
+  the deep fold does *not* subsume them. The headline "we detect more strongly
+  than riptide" depends on them. (The `k≥2` passes cost 14.6 s of 31.7 s at
+  `-t 1` — 46%, matching the phase timers' decim-brfft + decim-metric.)
+- **riptide is width-limited at large `b`, and that is why its S/N is lower.**
+  `generate_width_trials` is called with **`bins_min`**, and `rseek` hardcodes
+  `ducy_max = 0.3`, so the bank is `[1,2,3,4,6]` for *every* profile regardless
+  of `b`. At `b = 92` that reaches only 6/92 = 6.5% duty — and on the reference
+  observation `rseek` reports the ~10%-duty pulsar at `w=6`, its maximum, ducy
+  6.52%. Our `boxcar_widths` takes each profile's own `nbins` (same `fsp=1.5`,
+  same `maxfrac=0.3`), so we reach 30% duty at every depth: 9 widths at 120 bins
+  against riptide's 5. Some of the S/N gap is this, not the algorithm.
 - **riptide's BLAS threading is a red herring**: pinning every thread pool to 1
   moved its median wall clock 4.68 -> 4.54 s over 6 interleaved pairs (nothing,
   against ~8% scatter) while dropping CPU 114% -> 99%. Left enabled by default.
