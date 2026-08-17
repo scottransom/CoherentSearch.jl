@@ -31,6 +31,15 @@ The two searches are different algorithms, so "matched" needs stating precisely:
     instead -- the obvious-looking choice -- would have us search 6x the band
     riptide does and lose the timing comparison for no reason.
 
+    **Matched coverage is not matched work, and the gap is 2.8x.**  riptide's
+    ``b`` sweep is how it TILES frequency: each period is covered exactly once,
+    at whatever ``b`` the downsampling ladder lands on.  Our ``k`` sweep does
+    double duty -- it extends the band AND it is a harmonic-depth ladder -- so
+    every frequency below ``hifreq`` is folded at all six depths.  Same set of
+    depths, very different multiplicity.  The WORK block prints the resulting
+    ratios; ``--preset matched`` removes the difference by running one depth
+    per side.
+
   * **Pushing to the sampling limit.** ``Pmin`` defaults to ``tsamp * bmin``,
     riptide's own floor, so both searches run the widest band the data support
     at the chosen bin range.  Lowering ``bmin`` (raising ``maxdecim``) buys both
@@ -74,6 +83,7 @@ changed that could plausibly move the ratio, not on every commit.
 Usage:
 
     python3 compare/compare_riptide.py FILE.fft                      # bench preset
+    python3 compare/compare_riptide.py --preset matched FILE.fft     # equal-work timing
     python3 compare/compare_riptide.py --preset quick FILE.fft       # ~1 min sanity check
     python3 compare/compare_riptide.py --repeat 3 --threads 4 FILE.fft
 """
@@ -418,11 +428,18 @@ def print_work(rw, cw, fmax):
         print(f"  {probe:12.4g} {rb:9d} {1.0 / rb:10.5f} | "
               f"{deep:10d} {1.0 / deep:9.5f} {len(ours):10d}")
     print()
-    print("  'our folds' is how many decimations cover that frequency: every one of")
-    print("  them is a separate profile + boxcar scan, where rseek does exactly one.")
-    print("  That is where the work ratio above comes from -- NOT from a finer")
-    print("  frequency grid, which is matched exactly.  It buys sensitivity: the")
-    print("  shallow folds are our harmonic-sum ladder (see CLAUDE.md).")
+    if len(cw["stages"]) > 1:
+        print("  'our folds' is how many decimations cover that frequency: every one of")
+        print("  them is a separate profile + boxcar scan, where rseek does exactly one.")
+        print("  That is where the work ratio above comes from -- NOT from a finer")
+        print("  frequency grid, which is matched exactly.  It buys sensitivity: the")
+        print("  shallow folds are our harmonic-sum ladder (see CLAUDE.md).")
+        print("  For a pure algorithm-vs-algorithm timing, use --preset matched, which")
+        print("  runs ONE depth on each side and equalises the work to a few percent.")
+    else:
+        print("  One fold per frequency on BOTH sides, at the same depth and the same")
+        print("  grid, so the wall clock below is a direct read on the two")
+        print("  implementations rather than on how much each chose to search.")
     print()
 
 
@@ -437,6 +454,29 @@ def print_work(rw, cw, fmax):
 # PM0063_034C1_DM445.0_red.fft (T=2097 s, 4-core i7-10510U): the two presets
 # agree on the ratio (2.11x vs 2.27x), which is the point of having both.
 #
+# `bench` and `matched` answer DIFFERENT questions, and both are worth having:
+#
+#   bench   -- "which code searches this observation, end to end, faster?"
+#              Coverage is matched (0.1-200 Hz both sides) but the work is not:
+#              we fold everything below hifreq six times and rseek folds it
+#              once, so we do ~2.8x the profiles.  Quote the work table with it.
+#
+#   matched -- "which code is faster at doing the SAME work?"  One fold depth
+#              on each side, so profiles / folded bins / boxcar ops agree to
+#              within a few percent and the wall clock is a clean read on the
+#              two implementations.
+#
+# `bench` also puts riptide OUTSIDE its own documented operating range:
+# `ffa_search`'s docstring says bins_max should be "approx. 10% larger" than
+# bins_min, and riptide's example pipeline config uses 240/260 and 480/520.
+# bmax/bmin = 6 makes its fold depth `b` sawtooth over the whole 20..120 range
+# within each downsampling cycle, which (a) drops its mean trial density to
+# ~43 per Fourier bin instead of ~b, and (b) leaves its boxcar bank -- built
+# once from bins_min -- undersized for every profile deeper than bmin.  That is
+# not sabotage, it is forced: one rseek invocation cannot reach 200 Hz on this
+# data with bins_min > 20.  It is simply not the regime riptide is written for,
+# which is exactly why `matched` exists.
+#
 # This is an occasional benchmark, not a development-loop tool: `bench` takes
 # ~5 minutes at --repeat 3.
 # ---------------------------------------------------------------------------
@@ -444,10 +484,23 @@ PRESETS = {
     # ~5 s/side.  Sanity check only; Pmin is raised well above the sampling
     # limit to keep it quick, which also makes it a narrow-band test.
     "quick": dict(Pmin=0.05, Pmax=10.0, bmin=30, bmax=120),
-    # The one to quote: the widest band the data support at 120..20 bins
-    # (Pmin defaults to tsamp*bmin).  ~24 s (rseek) / ~32 s (us, -t 1) on the
-    # reference observation -- compute-dominated, start-up under 4% either side.
+    # The one to quote for END-TO-END search speed: the widest band the data
+    # support at 120..20 bins (Pmin defaults to tsamp*bmin).  ~20 s (rseek) /
+    # ~32 s (us, -t 1) on the reference observation, workstation -- compute
+    # dominated, start-up under 4% either side.
     "bench": dict(Pmin=None, Pmax=10.0, bmin=20, bmax=120),
+    # The one to quote for ALGORITHM speed.  bmax/bmin < 2 makes the derived
+    # maxdecim 1, so we run a single 130-bin fold against rseek's 120-130 --
+    # same band (Pmin defaults to tsamp*120 = the deepest fold this data
+    # supports), the same dr = 1/nbins grid, and the same 9-width boxcar bank
+    # up to 30% duty, because at bins_min=120 riptide's bank finally matches
+    # ours.  Measured 2026-08-16 on PM0063, workstation, -t 1, interleaved:
+    # rseek 18.35/18.33 s, ours 17.86/16.45 s, against work counts that agree
+    # to 4-8% (we do slightly less: rseek's b runs 120-130, ours is fixed).
+    # So at equal work the two implementations are a wash, us ~1.05-1.11x
+    # ahead.  rseek wins the pulsar though: S/N 12.6 (w=13, ducy 10.3%) vs our
+    # 11.89 at the same depth -- our 12.97 in `bench` comes from the k=6 fold.
+    "matched": dict(Pmin=None, Pmax=10.0, bmin=120, bmax=130),
 }
 
 

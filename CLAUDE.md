@@ -193,6 +193,24 @@ more than any optimisation discussed below.
   the deep fold does *not* subsume them. The headline "we detect more strongly
   than riptide" depends on them. (The `k≥2` passes cost 14.6 s of 31.7 s at
   `-t 1` — 46%, matching the phase timers' decim-brfft + decim-metric.)
+- **`bench` puts riptide outside its own documented operating range, and
+  `--preset matched` is the fix.** `ffa_search`'s docstring says `bins_max`
+  should be "approx. 10% larger" than `bins_min`; riptide's example pipeline
+  config uses 240/260 and 480/520. Our `bmin 20 / bmax 120` is a factor of 6, so
+  `b` sawtooths across the whole range inside every downsampling cycle, dropping
+  its mean trial density to ~43 per Fourier bin instead of ~`b`. That is *forced*
+  — one `rseek` invocation cannot reach 200 Hz on this data with `bins_min > 20`
+  — but it is not the regime riptide is written for. **`--preset matched`
+  (`bmin 120 / bmax 130`, which derives `maxdecim = 1`, `nharms = 65`) runs one
+  fold depth per side over 0.1–33.3 Hz**: same band, same `dr = 1/nbins` grid,
+  and at `bins_min = 120` riptide's boxcar bank finally matches ours (9 widths,
+  30% duty). Work agrees to 4–8%. Measured 2026-08-16, workstation, `-t 1`,
+  interleaved: **rseek 18.35/18.33 s, ours 17.86/16.45 s — we are ~1.05–1.11x
+  FASTER at equal work.** The `bench` deficit is the ladder, not the code.
+  **But rseek wins the pulsar in that config: S/N 12.6 (`w=13`, ducy 10.3%) vs
+  our 11.89 at the same depth.** Our 12.97 comes from the `k=6` fold, so
+  "we detect more strongly" is a statement about the *ladder*, not about the
+  per-fold detector.
 - **riptide is width-limited at large `b`, and that is why its S/N is lower.**
   `generate_width_trials` is called with **`bins_min`**, and `rseek` hardcodes
   `ducy_max = 0.3`, so the bank is `[1,2,3,4,6]` for *every* profile regardless
