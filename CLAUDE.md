@@ -399,6 +399,48 @@ the hot loop. See `Summary_and_Future_Work.md` (§3) for the roadmap.
   9.98 → 7.92, `-t 8` 5.59 → 4.46, `-t 16` 3.36 → 2.66. It also deletes
   `Σₖ (Hₖ+1)·Nprof` complex words per workspace, which is why the win grows with
   thread count.
+- **Done (2026-08-16): the ladder's redundant `(k, W)` corners are pruned —
+  1.07x at `-t 1`, no measurable sensitivity cost** (`ladder_boxcar_widths`).
+  A `W`-bin boxcar on an `M`-bin profile weights harmonic `h` by the Dirichlet
+  kernel, which depends on `W` and `M` only through the duty `δ = W/M`. Since
+  `M = 2·nharms/k`, the *filter shape* is a function of `δ` alone and the fold
+  only sets where the harmonic sum truncates — so `(k, 2W)` and `(2k, W)` are the
+  same filter, differing only in the harmonics past the kernel's first null.
+  Both corners of the grid are therefore dead weight: **`W = 1` on any fold but
+  the deepest** (same duty as `W = 2` one rung deeper, at half the resolution)
+  and **wide `W` on any fold but the shallowest** (same duty, but dragging in
+  harmonics that carry noise and no signal). Keeping `2 ≤ W ≤ 6`, plus `W = 1`
+  on the deepest fold and the full tail on the shallowest, is 25 of 38 pairs at
+  the defaults: **0.65x the boxcar scan work at 0.00% modelled S/N loss.**
+  - **The model must use Gaussian pulses, not boxcars.** With a boxcar-shaped
+    *signal* the analysis comes out backwards (it declares the shallow folds
+    dominated) because a boxcar has harmonic content at every `h`, which is the
+    best possible case for a deep fold. Boxcars are the *filter* — chosen
+    because their noise statistics are tractable — not a profile any pulsar has.
+    Re-run over Gaussian, scattered-Gaussian (τ = 0.5–2× duty), two-component and
+    interpulse profiles at 60 duty cycles, the loss is 0.00% and the retained set
+    strictly contains the greedy zero-loss optimum. The same model puts a
+    `k=1`-only search **8.40%** below the full ladder against the **9.1%**
+    measured on the 7.1185 Hz pulsar — so it reproduces the one number we have.
+  - **Measured, and much smaller than the scan-work cut suggests:** interleaved
+    `-t 1` A/B with a warm-up between checkouts, PM0063 at the bench config,
+    32.35/32.80/33.57 s → 30.24/30.64/31.07 s, i.e. **1.07x**. A 0.65x cut to a
+    phase billed at 47% "should" have been ~1.2x; it is not, because the prefix
+    sums, the median/σ̂ and the gated exact rescan inside that 47% are untouched.
+    **Another projection-vs-measurement gap — the width scan is ~20% of runtime,
+    not 41%.**
+  - Candidates are **not** byte-identical, by design: everything above S/N 6.3 is
+    unchanged (the pulsar stays at 12.97), and the five that vanish are exactly
+    the pruned corners at S/N 6.0–6.3 — noise at a threshold of 6. Dropping them
+    lowers the trials factor, so it slightly *improves* the statistics.
+  - **The bank is derived from the decimation set, never hardcoded.** With
+    `decimations == [1]` nothing is pruned, which is what keeps the equivalence
+    gate byte-identical; a `k=1`-only search with a pruned bank would be 8.4%
+    worse. A sparse ladder (`[1, 6]`) is also left alone — the cap of one rung
+    must reach the floor of the next (`k′ ≤ 3k`) or a duty-cycle hole opens.
+    `block_metrics`/`snr_metrics` gained a `widths` kwarg so the reference path
+    can stand in for a pruned fold; `snr_metrics` still defaults to the full bank,
+    which is what the Python oracle is pinned to.
 - **In-situ phase timers are now permanent** (`phase_reset!` / `phase_times`,
   `PHASE_NAMES`; ~0.03% of runtime, one `time_ns` pair per phase per chunk).
   `bench/precision_ab.jl` prints them alongside a wall-clock A/B. Use them

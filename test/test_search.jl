@@ -30,6 +30,52 @@ const PIN_PROFT = PIN_PRECISION === :f32 ? Float32 : Float64
     @test boxcar_widths(64; maxfrac=0.5)[end] <= 32
 end
 
+@testset "ladder_boxcar_widths: prunes the redundant (k,W) corners" begin
+    nharms = 60
+    # No ladder => untouched.  This is what keeps the equivalence gate (which
+    # runs decimations=[1]) byte-identical, so it is a pin, not a nicety.
+    solo = SearchParams(nharms=nharms)
+    @test solo.decimations == [1]
+    @test ladder_boxcar_widths(2nharms, 1, solo) == boxcar_widths(2nharms)
+
+    p = SearchParams(nharms=nharms, decimations=decimation_set(nharms, 6))
+    @test p.decimations == 1:6
+    banks = Dict(k => ladder_boxcar_widths(2 * fld(nharms, k), k, p) for k in p.decimations)
+    # Deep fold keeps the narrow end (nothing deeper covers width 1) and drops
+    # the wide end (the shallow folds cover those duties without carrying 50
+    # harmonics of noise); shallow fold is the mirror image.
+    @test banks[1] == [1, 2, 3, 4, 6]
+    @test banks[6] == [2, 3, 4, 6]
+    for k in 2:6
+        @test 1 ∉ banks[k]                          # covered by W=2 one rung deeper
+    end
+    for k in 1:5
+        @test maximum(banks[k]) <= 6                # wide duties belong to k=6
+    end
+    # Only the shallowest fold reaches boxcar_maxfrac, and it must, or the
+    # widest duty cycles would go unsearched by the ladder as a whole.
+    @test maximum(banks[6]) == maximum(boxcar_widths(2 * fld(nharms, 6)))
+    # Every fold keeps a usable bank, and the pruning is a strict subset.
+    for k in p.decimations
+        full = boxcar_widths(2 * fld(nharms, k))
+        @test !isempty(banks[k]) && banks[k] ⊆ full
+    end
+    @test sum(2 * fld(nharms, k) * length(banks[k]) for k in p.decimations) <
+          sum(2 * fld(nharms, k) * length(boxcar_widths(2 * fld(nharms, k)))
+              for k in p.decimations)
+
+    # A sparse ladder leaves a duty-cycle hole between the cap of one rung and
+    # the floor of the next, so it must not be pruned at all.
+    sparse = SearchParams(nharms=nharms, decimations=[1, 6])
+    @test ladder_boxcar_widths(2nharms, 1, sparse) == boxcar_widths(2nharms)
+    @test ladder_boxcar_widths(2 * fld(nharms, 6), 6, sparse) ==
+          boxcar_widths(2 * fld(nharms, 6))
+    # ...but a ladder that only skips within the safe ratio still prunes.
+    @test ladder_boxcar_widths(2nharms, 1, SearchParams(nharms=nharms,
+                                                        decimations=[1, 2, 4])) !=
+          boxcar_widths(2nharms)
+end
+
 @testset "boxcar metric: scale-invariant, robust, detects a pulse" begin
     nbins = 64
 
@@ -342,9 +388,14 @@ if isfile(EXAMPLE_FFT)
             n = 64
             rfund = rstart .+ (0:n-1) .* lodr
 
-            # Native reduced-harmonic fold at the multiplied frequencies.
+            # Native reduced-harmonic fold at the multiplied frequencies.  The
+            # boxcar bank is passed explicitly: the ladder prunes the decimated
+            # fold's bank (see `ladder_boxcar_widths`), and this testset is about
+            # the harmonic gather and transform, not the width selection, so both
+            # sides must scan the same widths for the comparison to mean anything.
             pnat = SearchParams(nharms=Hk, m=32)
-            ref = block_metrics(ft, k .* rfund, pnat; kernel=:direct)
+            ref = block_metrics(ft, k .* rfund, pnat; kernel=:direct,
+                                widths=ladder_boxcar_widths(2Hk, k, params))
 
             # Decimated fold via the production path.
             ws = CoherentSearch.Workspace(params, n)
