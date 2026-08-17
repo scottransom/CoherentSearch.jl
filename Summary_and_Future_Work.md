@@ -1399,11 +1399,30 @@ and should not be re-derived:
   is written for. A fair population study should probably also run riptide the
   way its pipeline does — several narrow-`bins` ranges tiling the band — and
   report that as a third configuration.
-- **The S/N statistics are not the same quantity** (time-domain matched filter vs
-  coherent Fourier boxcar), so the comparable observables are **detection
-  fraction at fixed injected S/N** and the **recovered duty cycle**, which *is*
-  defined identically on both sides. Do not plot one code's S/N against the
-  other's.
+- **The S/N statistics ARE the same quantity, up to `√(1−duty)`** — an earlier
+  version of this note said otherwise and was wrong. Both are a boxcar matched
+  filter maximised over phase on a folded profile; they differ only in template
+  normalisation. riptide correlates against a *zero-mean, unit-L2* boxcar
+  (`cpp/snr.hpp:snr1`), so its per-phase statistic has variance exactly 1. We sum
+  `w` median-subtracted on-pulse bins and divide by `σ√w`, normalising as though
+  the baseline were known rather than estimated from the same profile — which
+  makes our per-phase variance `1 − duty`. Working the templates out gives
+  `ours = √(1 − w/nbins) × riptide's` pointwise, and on 200k pure-noise 120-bin
+  profiles the measured ratio matches that to four decimals at every width
+  (0.9962 at `w=1`, 0.8758 at `w=28`).
+  - So the paper **can** plot one against the other, after multiplying ours by
+    `1/√(1−ducy)`. Detection fraction at fixed injected S/N and the recovered
+    duty cycle remain the primary observables, but the S/N scales are now
+    reconcilable rather than incommensurable.
+  - **This is also an open item in its own right, not just a comparison detail.**
+    A fixed threshold on our metric is effectively `threshold/√(1−duty)` in
+    unit-variance terms — 8.0 at `w=1` but 9.6 at 30% duty — so the search is
+    systematically biased against broad pulses, by ~16% at the top of the bank
+    and exactly where the decimation ladder's shallow folds work (`nbins = 20`,
+    `w = 6`). The fix is a deterministic per-width factor in `_boxcar_scan`;
+    the cost is that it moves every reported S/N, so it wants doing deliberately
+    alongside the threshold-calibration work in §3, not as a drive-by. It also
+    interacts with the `Hₖ` threshold-comparability item recorded there.
 - **Injection mechanics.** We read `.fft`, riptide reads `.dat`; inject in the
   time domain once and hand each code its own view of the same realisation, so
   the noise is common and the comparison is paired rather than independent.

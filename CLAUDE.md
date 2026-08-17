@@ -211,6 +211,24 @@ more than any optimisation discussed below.
   our 11.89 at the same depth.** Our 12.97 comes from the `k=6` fold, so
   "we detect more strongly" is a statement about the *ladder*, not about the
   per-fold detector.
+- **Our S/N and riptide's are the SAME statistic, up to `√(1−duty)` — and that
+  factor is our bug, not a difference of definition (2026-08-16).** Both are a
+  boxcar matched filter maximised over phase on a folded profile. riptide
+  (`cpp/snr.hpp:snr1`) correlates against a *zero-mean, unit-L2* boxcar, so its
+  per-phase statistic has variance exactly 1. `_boxcar_scan` sums `w`
+  median-subtracted on-pulse bins and divides by `σ√w` — normalising as if the
+  baseline were known rather than estimated from the same profile — so **our
+  per-phase variance is `1 − duty`, not 1**, and the code comment claiming
+  "dividing by σ√w makes every trial unit-variance regardless of w or nbins" is
+  wrong at the wide end. Working the templates out: `ours = √(1 − w/nbins) ×
+  riptide's`, pointwise. Measured on 200k pure-noise 120-bin profiles, the ratio
+  of per-width means matches to four decimals: 0.9962 at `w=1` → 0.8758 at
+  `w=28`. Consequences: (a) the two codes' S/N are comparable after multiplying
+  ours by `1/√(1−ducy)`; (b) a fixed threshold is effectively `thr/√(1−duty)`,
+  i.e. 8.0 at `w=1` but 9.6 at 30% duty, so **we are systematically biased
+  against broad pulses** — worst exactly where the shallow decimation folds live
+  (`nbins=20`, `w=6`). Fix is a deterministic per-width factor, but it moves
+  every reported S/N; see `Summary_and_Future_Work.md` §3.2.
 - **riptide is width-limited at large `b`, and that is why its S/N is lower.**
   `generate_width_trials` is called with **`bins_min`**, and `rseek` hardcodes
   `ducy_max = 0.3`, so the bank is `[1,2,3,4,6]` for *every* profile regardless

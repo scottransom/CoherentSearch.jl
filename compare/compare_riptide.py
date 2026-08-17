@@ -70,11 +70,29 @@ The two searches are different algorithms, so "matched" needs stating precisely:
     alongside the median.  A first ``rseek`` run in a fresh shell also pays
     Python import cost; warm-up is done once before timing.
 
-Neither S/N is the other's S/N: riptide's is a matched-filter S/N of a
-time-domain fold, ours is the boxcar matched-filter S/N of a coherently
-summed Fourier fold.  They are on similar scales and worth comparing, but a
-difference of a few tenths is not meaningful.  The duty cycles, however, are
-defined identically (best boxcar width / profile bins) and are comparable.
+**The two S/N values ARE the same statistic, up to one exactly known factor.**
+Both are a boxcar matched filter maximised over phase on a folded profile.  They
+differ only in how the template is normalised:
+
+  * riptide (``cpp/snr.hpp``, ``snr1``) correlates against a **zero-mean,
+    unit-L2** boxcar -- height ``+h`` on the ``w`` on-pulse bins, ``-b`` on the
+    rest -- and divides by ``stdnoise``.  Unit L2 means the per-phase statistic
+    has variance exactly 1.
+  * ours (``_boxcar_scan``) sums the ``w`` median-subtracted on-pulse bins and
+    divides by ``sigma*sqrt(w)``, i.e. it normalises as though the baseline were
+    known rather than estimated from the same profile.
+
+Working the two templates out, ours = ``sqrt(1 - w/nbins)`` x riptide's,
+*pointwise* -- so under noise our per-phase statistic has variance ``1 - duty``,
+not 1.  Measured on 200k pure-noise 120-bin profiles the ratio of the two codes'
+per-width means matches ``sqrt(1 - duty)`` to four decimals at every width:
+0.9962 at w=1 up to 0.8758 at w=28.
+
+So they are directly comparable after multiplying ours by ``1/sqrt(1 - ducy)``,
+and a raw difference of a few tenths at small duty really is not meaningful --
+but at 30% duty ours reads ~16% low, which is a real and correctable bias
+against broad pulses, not a difference of definition.  The duty cycles are
+defined identically (best boxcar width / profile bins) and need no correction.
 
 This is an OCCASIONAL benchmark, not a development-loop tool: the default
 ``bench`` preset takes ~5 minutes at ``--repeat 3``.  Run it when something has
