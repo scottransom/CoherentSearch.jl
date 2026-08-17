@@ -1351,6 +1351,71 @@ That leaves (a) versus (b) as the real open question, and it is the same
     Besides the absolute σ, this yields the **base `loc`/`scale` numbers** the
     single-pass scheme above needs to escape the 2× penalty.
 
+### 3.2 Detection-efficiency Monte Carlo vs riptide (for the paper)
+
+**Planned, not started (noted 2026-08-16).** Everything measured against riptide
+so far is *one* real pulsar in *one* observation, plus timing. A paper needs a
+population: a large Monte Carlo of injected Gaussian-shaped pulses across the
+full frequency range and a realistic spread of duty cycles, at noise levels
+giving overall S/N ≈ 9–13, measuring **detection fraction as a function of
+(frequency, duty cycle, true S/N) for both codes, alongside the compute cost of
+getting it.** Sensitivity and cost have to be reported together — either one
+alone is trivially gamed by changing how much searching you do.
+
+Design points, all of which are already-settled results elsewhere in this repo
+and should not be re-derived:
+
+- **Gaussian pulses, never boxcars.** A boxcar-shaped *signal* has harmonic
+  content at every `h`, which is the best possible case for a deep harmonic sum
+  and inverts conclusions about which fold depth wins. Boxcars are the *filter*,
+  used because their noise statistics are tractable. This mistake was made once
+  already, in the `(k, W)` redundancy analysis, and was caught only because it
+  contradicted a measured detection. Include scattered (exponential tail,
+  τ ≈ 0.5–2 × duty), two-component and interpulse profiles — those are the
+  realistic harmonic-rich cases, and they are what makes the ladder pay.
+- **Duty cycles** spanning at least 1–30%, log-spaced. 30% is `boxcar_maxfrac`
+  and the top of riptide's `ducy_max`; below ~1% the fold resolution, not the
+  filter, is the limit.
+- **Run BOTH comparison configurations, and say which is which.**
+  `compare/compare_riptide.py --preset bench` matches *coverage* (0.1–200 Hz both
+  sides) but not work — we fold everything below `hifreq` six times and riptide
+  folds it once, 2.81x the profiles. `--preset matched` matches *work* to a few
+  percent by running one fold depth per side. The first answers "which code
+  searches an observation better", the second "which implementation is faster".
+  The harness prints the full work accounting (profiles, folded bins, boxcar
+  bins×widths, and `dr` vs frequency) before it times anything — quote it.
+- **The frequency grids are already matched exactly and this is worth stating in
+  the paper**: riptide's FFA emits trials at `dr = 1/b` Fourier bins (one phase
+  bin of drift across `T`, verified against `pgram.freqs` to 2e-4), and our
+  decimation-`k` pass steps by `k·hidr/nharms = 1/nbins` at `hidr = 0.5`. Same
+  rule, not a coincidence, and it means no tuning knob is quietly doing the work.
+- **Two known asymmetries to disclose rather than paper over.** (a) riptide
+  builds its boxcar bank once from `bins_min` and reuses it for every profile, so
+  at `b = 120` it only reaches 5% duty — it is width-limited on broad pulses, and
+  on the reference observation reports the ~10%-duty pulsar at `w = 6`, its
+  maximum. (b) `bmin 20 / bmax 120` is a factor of 6 where riptide's own
+  docstring asks for ~10% and its example pipeline uses 240/260 and 480/520; that
+  is forced if one invocation must reach 200 Hz, but it is not the regime riptide
+  is written for. A fair population study should probably also run riptide the
+  way its pipeline does — several narrow-`bins` ranges tiling the band — and
+  report that as a third configuration.
+- **The S/N statistics are not the same quantity** (time-domain matched filter vs
+  coherent Fourier boxcar), so the comparable observables are **detection
+  fraction at fixed injected S/N** and the **recovered duty cycle**, which *is*
+  defined identically on both sides. Do not plot one code's S/N against the
+  other's.
+- **Injection mechanics.** We read `.fft`, riptide reads `.dat`; inject in the
+  time domain once and hand each code its own view of the same realisation, so
+  the noise is common and the comparison is paired rather than independent.
+  `../coherent_search/examples/` has the generator lineage, and riptide's
+  `libffa.generate_signal` already builds von Mises pulses with a documented
+  amplitude → expected-S/N convention worth reusing so "injected S/N" means the
+  same thing to both codes.
+- **Also fixes the known fixture problem** recorded in `CLAUDE.md`: the bundled
+  `harmonics_hi.fft` test pulsar is far too bright and has harmonic content past
+  harmonic 60, which is why the default search reports it at `11f`. A Monte Carlo
+  at S/N 9–13 is the realistic regime that fixture is not.
+
 - **`:non`/`:sd2` produce many non-pulsar-like false positives (largely
   superseded by the `:boxcar` default).** This item motivated the `:boxcar`
   switch and is mostly of historical interest now; re-evaluate it for `:boxcar`.
