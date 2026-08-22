@@ -463,13 +463,25 @@ const _BOXCAR_SIGMA_SAMPLES = 8192     # bins subsampled per block to fix the no
 """
     _block_sigma(M, nbins, n, buf) -> Float64
 
-Robust per-bin noise scale (`1.4826 × MAD`) for one block, pooled over a strided
+Robust per-bin noise scale (`1.4826 × MAD`) for one block, pooled over a
 subsample of the `nbins × n` profile matrix `M[:, 1:n]` into `buf` (length
-`_BOXCAR_SIGMA_SAMPLES`).  A block carries thousands of noise bins, so this `σ̂`
-has sub-percent variance — unlike a per-profile MAD (`~0.76/√nbins`, i.e. ~17% at
-`nbins=20`), whose estimation noise multiplies straight into every boxcar S/N and
-inflates the small-`nbins` tail.  Median-based and pooled, so the rare signal/RFI
-bin does not bias it.  Returns `0.0` for a degenerate (flat) block.
+`_BOXCAR_SIGMA_SAMPLES`) — whole profiles, evenly spaced across the block, so
+every read is contiguous.  When `buf` is long enough for the whole matrix
+(`snr_metrics`' default) no subsampling happens at all.
+
+A block carries thousands of noise bins, so pooling beats a per-profile MAD
+(`~0.76/√nbins`, i.e. ~17% at `nbins=20`) by a wide margin: estimation noise here
+multiplies straight into every boxcar S/N, and a per-profile estimate inflates the
+small-`nbins` tail.  Median-based and pooled, so the rare signal/RFI bin does not
+bias it.  Returns `0.0` for a degenerate (flat) block.
+
+**It is not exact, and the residual is visible in reported S/N.**  Measured over
+24 chunks against the all-bins estimator, 8192 samples give an unbiased σ̂ with
+**~1% rms and ~3% worst case** at every fold depth — and the metric is `1/σ̂`, so
+that is the precision of any single reported S/N.  Raise
+`_BOXCAR_SIGMA_SAMPLES` (rms falls as `1/√cap`) if a use needs better; the
+contiguous gather below makes the traffic cheap but the two `_median!` calls are
+`O(cap)`.  See `Summary_and_Future_Work.md` §3.1.
 
 The subsample indices depend only on `(nbins, n)`, and `M` enters only through the
 ratio the caller forms (`excess/σ`), so the unnormalised `brfft` and normalised
@@ -485,23 +497,42 @@ function _block_sigma(M::AbstractMatrix{T}, nbins::Int, n::Int, buf::Vector{T}) 
     N == 0 && return zero(T)
     cap = length(buf)
     ns = 0
-    # `M` is column-major with `size(M, 1) == nbins`, so the (i, j) this used to
-    # reconstruct from `t` — `i = (t-1) % nbins + 1`, `j = (t-1) ÷ nbins + 1` — is
-    # *exactly* linear index `t`.  Indexing linearly gathers the identical samples
-    # in the identical order (so σ̂, and every metric, is bit-for-bit unchanged)
-    # while dropping two hardware integer divisions per sample.  At the 8192-sample
-    # cap that was ~16k `idiv`s at ~26 cycles apiece — ~140 µs per call, which was
-    # essentially the whole cost of this function.
+    # `M` is column-major with `size(M, 1) == nbins`, so linear index `t` *is*
+    # element (i, j) with `i = (t-1) % nbins + 1`, `j = (t-1) ÷ nbins + 1` — which
+    # is why neither branch below reconstructs (i, j) arithmetically.
     if N <= cap
+        # Every bin.  This is the estimator the Python oracle is pinned to
+        # (`snr_metrics` defaults to `sigma_samples = typemax(Int)`); the
+        # subsampled branch below must never leak into it.
         @inbounds for t in 1:N
             buf[t] = M[t]
         end
         ns = N
     else
-        s = N ÷ cap                               # stride ≥ 1; not a multiple of nbins in general
-        @inbounds for t in 1:s:N
-            ns == cap && break
-            ns += 1; buf[ns] = M[t]
+        # Subsample WHOLE COLUMNS, spread evenly across the block.  This replaced
+        # a flat stride-`N÷cap` walk of the linear index, for two reasons.
+        #
+        # Traffic: at `nbins=120, n=2048` that stride is 30 doubles = 240 B, so
+        # it pulled a fresh cache line for *every* sample and used 8 of its 64
+        # bytes — ~2.7 MB per chunk summed over the six fold depths, comparable
+        # to the gate's own read of the same arrays.  Whole profiles are
+        # contiguous and use every byte: ~0.4 MB for the same 8192 samples.
+        #
+        # Sampling: the flat stride visits bins `1, s+1, 2s+1, …` of every
+        # column, so whenever `s | nbins` it sees only `nbins/s` *distinct
+        # phases* — four of them, at five of the six default fold depths
+        # (k=1,2,3,5,6; only k=4's `s=7` is coprime with its `nbins=30`).  A
+        # per-phase artefact could therefore decide σ̂ outright.  Whole columns
+        # sample every phase.
+        ncol = min(n, max(1, cap ÷ nbins))        # profiles we can afford
+        @inbounds for c in 1:ncol
+            j = 1 + ((c - 1) * n) ÷ ncol          # evenly spaced over 1:n
+            base = (j - 1) * nbins
+            take = min(nbins, cap - ns)
+            take == 0 && break
+            for i in 1:take
+                ns += 1; buf[ns] = M[base + i]
+            end
         end
     end
     med = _median!(buf, ns)                       # destroys buf order (values preserved)
@@ -620,7 +651,12 @@ end
 # ---------------------------------------------------------------------------
 
 const _BC_TILE = Float32          # gate tile/accumulator type (see above)
-const _BC_BATCH = 32              # profiles per SIMD tile; see bench/boxcar_bench.jl
+const _BC_BATCH = 64              # profiles per SIMD tile; see bench/boxcar_bench.jl
+# 64, not 32: the tile+prefix pair is 63 KB at `nbins = 120`, which overflows the
+# 32 KB L1 — and is 1.20x FASTER than the 32 that fits, measured interleaved over
+# all six fold depths (32 → 64 → 96 → 128 gives 692/575/572/577 µs per chunk, so
+# 64 is the knee).  The batched kernel's per-profile arithmetic is independent of
+# `B`, so widening it is byte-identical, not an approximation.
 
 """
     BoxcarBatch{T}
@@ -647,9 +683,13 @@ function BoxcarBatch(nbins::Integer, wmax::Integer, Nprof::Integer,
 end
 
 # Transpose profile columns `j0+1 .. j0+B` into `tile` as (B, nbins), converting
-# to the tile's eltype.  The read is column-contiguous and the tile is tens of KB
-# (15 KB at B=32, nbins=120), so it is still L1/L2-resident for the scan that
-# follows.  ~20% of the batched gate, and the price of admission for the rest.
+# to the tile's eltype.  The inner loop walks *columns*, so it is a stride-`nbins`
+# gather — but a fully-used one (every byte of every line is read by some `i`),
+# and LLVM vectorises it: 4/8/16-bin row blocking and a column-major walk all
+# measured 0.56x/0.71x/0.85x/1.03x against it (`Summary_and_Future_Work.md` §3.1).
+# It is **48% of the batched gate** — 303 µs per chunk at B=64, moving 4.8 MB,
+# i.e. ~15.8 GB/s.  That is an L3 bandwidth wall, so the price of admission for
+# the rest is not going down without narrowing `profs` itself.
 @inline function _bc_transpose!(tile::Vector{T}, profs::AbstractMatrix{<:AbstractFloat},
                                 j0::Int, nbins::Int, ::Val{B}) where {T,B}
     @inbounds for i in 1:nbins

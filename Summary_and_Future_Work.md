@@ -948,6 +948,150 @@ gather is the piece that has not been prototyped.
 The boxcar metric work is **47%** across the two metric rows — the largest single
 target left, and larger than the interpolation it was long assumed to sit behind.
 
+#### The metric, taken apart (2026-08-22) — 1.13x on the metric, ~1.05x end to end
+
+The 47% above was one number covering four different things, so the first step
+was to split it. **`bench/metric_bench.jl`** does that, on the production
+`Workspace`/`DecimBuf` buffers holding a genuine chunk: per fold depth it times
+`_block_sigma`, the tile transpose, the prefix+width scan, the whole
+`_boxcar_gate!`, and the full `boxcar_metrics!` (gate + exact rescan), and prints
+the fraction of trials that clear `medcut`. On master that read, per chunk
+(µs, `nharms=60`, `Nprof=2048`, `maxdecim=6`):
+
+| | σ̂ | transpose | scan | gate | metric | rescan |
+|---|---|---|---|---|---|---|
+| total, k=1…6 | 369 | 455 | 410 | 944 | 1072 | 0.05–2.3% |
+
+Two things in that table were not what the code's own comments claimed. The
+transpose is **48% of the batched gate**, not the "~20%" the section comment in
+`search.jl` said. And `_block_sigma` — billed to `block-sigma` for `k=1` but
+hidden inside `decim-metric` for `k=2…6` — is **26% of all metric work**, which
+no phase timer had ever shown.
+
+**Landed: `_BC_BATCH` 32 → 64 (10.8% of the metric).** Interleaved over all six
+fold depths on real chunk data, `B = 32/48/64/96/128` gives
+**692/628/575/572/577 µs** per chunk: 1.20x from 32 to 64, then flat, so 64 is
+the knee. This is **byte-identical** output — the batched kernel's per-profile
+arithmetic and operation order do not depend on `B`, only the vector width the
+compiler sees does — and it was verified as such at every `B` in the sweep.
+Note what it disproves: at `B = 64` the `tile` + `psT` pair is **63 KB**, which
+overflows the 32 KB L1 that `B = 32`'s 34 KB nearly fits, and it is *faster*
+anyway. "Size the tile to L1" was the wrong model.
+
+**Landed: `_block_sigma` subsamples whole profiles (3.2% of the metric).** The
+old flat stride-`N÷cap` walk of the linear index stepped 240 B at
+`nbins=120, n=2048`, so it pulled a fresh cache line per sample and used 8 of its
+64 bytes — **2.7 MB per chunk** over the six depths, comparable to the gate's own
+read of the same arrays. Taking `cap÷nbins` whole columns, evenly spaced, is
+contiguous: **0.4 MB** for the same 8192 samples. It is also a better sample.
+The flat stride visits bins `1, s+1, 2s+1, …` of every column, so whenever
+`s | nbins` it sees only `nbins/s` **distinct phases** — four of them, at five of
+the six default fold depths (`k=1,2,3,5,6`; only `k=4`'s `s=7` is coprime with
+its `nbins=30`). σ̂ could be decided outright by a per-phase artefact. Whole
+columns sample every phase.
+
+This is oracle-safe by construction: `snr_metrics` defaults to
+`sigma_samples = typemax(Int)`, so the estimator the Python oracle is pinned to
+takes the `N <= cap` branch and never subsamples at all.
+
+**The measurements, and the gap between them.** In isolation the two changes take
+the metric from 1441 to 828 µs per chunk — **1.74x**. In situ they do not:
+
+| arm | metric phases, % of accounted total | metric time vs master |
+|---|---|---|
+| master | 36.0% | 1.000 |
+| σ̂ only | 35.3% | 0.968 |
+| `B=64` only | 33.4% | 0.892 |
+| both | 32.9% | 0.870 |
+
+(`-t 1`, two interleaved rounds, PM0063 at 0.1–33.3 Hz. Wall clock could not
+resolve this — ±10% run-to-run with visible within-round thermal drift, against a
+5% effect — so the arms are compared by each run's *own* metric-phase fraction,
+which is drift-robust because the untouched phases drift with it. At `-t 4` the
+same comparison gives 33.3% → 30.4%, i.e. **12.7%**, so the wider tile costs
+nothing threaded despite doubling the gate scratch to ~160 KB per workspace.)
+
+So: **13.0% off the metric, ~1.05x end to end** — against 1.74x in the
+microbenchmark. The reason is the same one this document keeps recording: the
+isolated bench re-runs on data it has just left hot, while in the search both
+`profs` and `dprofs` are read once by a phase that is competing for L3 with the
+transform that wrote them. The parts of the win that were bandwidth (most of σ̂'s)
+largely evaporate; the part that was vector width (`B`) survives.
+
+**Four things that did not work, all measured:**
+
+1. **Fusing the transpose away** — building `psT` straight from `profs` and
+   deleting the `tile` entirely. A wash at `B=32` (664 vs 644 µs over all folds)
+   and worse at `B=64`. The tile write/read is not the cost.
+2. **Full fusion** — prefix sum and every width in one pass over the profile,
+   with per-width running accumulators. **1.33x slower**: `nwidths × B/8` live
+   accumulator vectors plus the rolling prefix rows exceed the 16 AVX2 registers.
+3. **Blocking or reordering the transpose** — 4/8/16-bin row blocks, or a
+   column-major walk: **0.56x/0.71x/0.85x/1.03x** vs the current loop. The
+   stride-`nbins` gather already vectorises; at `B=64` the transpose moves
+   4.8 MB per chunk in 303 µs, which is **~15.8 GB/s** — an L3 bandwidth wall,
+   not a code defect. Nothing short of narrowing `profs` to `Float32` changes it,
+   and that is `--precision f32`, measured at 0.82x at `-t 1`.
+4. **A cheap upper bound to skip whole profiles.** Tempting because the gate only
+   has to *not underestimate* by more than `boxcar_medmargin`, so a profile that
+   provably cannot reach `medcut` needs no scan at all. But after the ladder
+   pruning the bank is `[1,2,3,4,6]`, all narrow: for Gaussian noise at
+   `nbins=120` even the tightest cheap bound (the sum of the `w` largest bins,
+   `≈14.5σ` at `w=6`) is `5.9` against `medcut = 4.0`. No bound is tight enough
+   to reject anything.
+
+**Where the metric time is now** (isolated, per chunk, `B=64`): transpose 303 µs,
+width scan 228, σ̂ 210, rescan + writeback 87. The transpose is a bandwidth wall,
+the scan runs at >1 vector op/cycle, and what is left of σ̂ is two quickselects.
+
+**Candidates are not byte-identical, by design** — σ̂ moved. At the riptide bench
+config the same three candidates come out at the same frequencies, with S/N
+12.97 → 13.27, 7.83 → 7.76, 7.33 → 7.22, and the pulsar's winning ladder rung
+moving `k=6` → `k=4` (`H=10` → `H=15`, a near-tie between adjacent rungs).
+
+**Chasing that +2.3% turned up something worth knowing about every S/N this code
+reports.** It is not the new sampling being better or worse — it is that the
+per-chunk σ̂ is *itself* a random variable with ~1% error, and reported S/N is
+exactly inversely proportional to it. Measured over 24 chunks against the exact
+all-bins σ̂ (245,760 samples), at 8192 samples:
+
+| fold | flat stride: bias / rms / max | whole columns: bias / rms / max |
+|---|---|---|
+| k=1 (120 bins) | +0.14% / 1.50% / 3.48% | −0.05% / 1.08% / 2.47% |
+| k=2 (60) | −0.47% / 1.39% / 2.69% | −0.25% / 1.15% / 2.58% |
+| k=3 (40) | +0.15% / 1.22% / 2.26% | +0.27% / 1.15% / 2.22% |
+| k=4 (30) | −0.09% / 1.24% / 3.09% | −0.11% / 0.88% / 1.97% |
+| k=5 (24) | +0.26% / 0.97% / 2.24% | −0.11% / 0.88% / 1.89% |
+| k=6 (20) | +0.17% / 1.13% / 2.18% | −0.06% / 1.03% / 2.87% |
+
+Both are unbiased; whole columns are modestly *less* noisy at every depth. In the
+one chunk that holds the 7.1185 Hz pulsar the draws happened to go the other way
+— at `k=4`, flat stride landed at 1.0004 of exact and whole columns at 0.9809, so
+the new number is ~1.9% high and the old one was ~0.04% high. Scoring the pulsar
+against the exact σ̂ puts it at **≈13.0**, with master's 12.97 (at `k=6`, where
+its draw was +0.8%) and the new 13.27 straddling it.
+
+**So the last two digits of "12.97 vs riptide's 11.80" are σ̂ estimation noise,
+and always were.** That claim is safe — the gap is 10%, the jitter is 1% — but a
+detection-efficiency Monte Carlo (§3.2) comparing S/N distributions at the
+percent level needs to either use the exact σ̂ or model this term. Raising
+`_BOXCAR_SIGMA_SAMPLES` is the knob (rms falls as `1/√cap`), and the contiguous
+gather makes the *traffic* affordable now, but the two quickselects are `O(cap)`:
+16384 samples would take rms to ~0.8% and give back most of this section's win.
+
+**Not done, and it needs a decision: fix the MAD's location at the structural
+zero.** `_block_sigma` spends two quickselects — one to find the median, one for
+the MAD around it. But the location is *known*: DC is held at zero, so every
+profile's bin mean is exactly 0 and the pooled distribution is symmetric about
+it. `1.4826 × median(|x|)` is then the same estimator with one quickselect
+instead of two, and is *statistically better* (it does not spend a degree of
+freedom on a location it already knows). Measured: the sample median sits within
+**±0.03σ** of zero at every depth, and σ̂ moves by ≤0.6%. It would take roughly
+half of what is left of σ̂, ~1% end to end. **It was not landed because it changes
+the un-subsampled branch too, and that is the branch `snr_metrics` uses — it
+would break the Python oracle pin at 7.0e-17.** Landing it means either
+re-pinning the oracle or teaching the Python side the same estimator.
+
 #### Retirements (2026-08-16)
 
 Two paths were removed outright rather than left as options, because both had
@@ -1376,6 +1520,13 @@ and should not be re-derived:
 - **Duty cycles** spanning at least 1–30%, log-spaced. 30% is `boxcar_maxfrac`
   and the top of riptide's `ducy_max`; below ~1% the fold resolution, not the
   filter, is the limit.
+- **Our reported S/N carries a ~1% per-chunk σ̂ jitter (measured 2026-08-22, see
+  §3.1).** `_block_sigma` estimates the noise scale from 8192 subsampled bins per
+  `(chunk, k)`, and the metric is exactly `1/σ̂`, so any single reported S/N is
+  good to ~1% rms and ~3% worst case. Detection *fraction* at a threshold is
+  barely affected (the jitter is small against the S/N 9–13 spread), but any
+  plot or claim that compares S/N *values* between the codes at the percent level
+  must either raise `_BOXCAR_SIGMA_SAMPLES` for the MC runs or model the term.
 - **Run BOTH comparison configurations, and say which is which.**
   `compare/compare_riptide.py --preset bench` matches *coverage* (0.1–200 Hz both
   sides) but not work — we fold everything below `hifreq` six times and riptide

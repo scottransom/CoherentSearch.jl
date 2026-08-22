@@ -268,7 +268,9 @@ re-deriving them.
   process**, wall clock plus the in-situ `phase_times` split — the first thing to
   run when a phase looks suspicious), `chunkfill_bench.jl` (splits
   `fill_chunk_profiles!` into zeroing / interp / transform, and times the
-  decimated transforms, on the production `Workspace`). Run single-threaded (`-t 1`)
+  decimated transforms, on the production `Workspace`), `metric_bench.jl` (the
+  same treatment for the metric: σ̂ / transpose / width scan / gate / gate+rescan,
+  per fold depth, plus the fraction of trials clearing `medcut`). Run single-threaded (`-t 1`)
   for clean profile attribution; warm up before timing to exclude JIT. Example
   FFT for longer runs: `PM0063_034C1_DM445.0_red.fft`.
 - **`bench/thread_scaling.jl` is the standard scaling check** (it replaced the
@@ -468,6 +470,59 @@ re-deriving them.
     `block_metrics`/`snr_metrics` gained a `widths` kwarg so the reference path
     can stand in for a pruned fold; `snr_metrics` still defaults to the full bank,
     which is what the Python oracle is pinned to.
+- **Done (2026-08-22): the metric, split and cut — 13.0% off the metric phases,
+  ~1.05x end-to-end.** `bench/metric_bench.jl` breaks the 47% "metric" into σ̂ /
+  transpose / width scan / gate / rescan per fold depth, and two of its numbers
+  contradicted the code's own comments: the tile transpose is **48% of the gate**
+  (the section comment said ~20%), and `_block_sigma` is **26% of all metric
+  work** — invisible because it is billed to `block-sigma` at `k=1` but hidden
+  inside `decim-metric` for `k=2…6`. Two changes landed:
+  - **`_BC_BATCH` 32 → 64**, worth 10.8% of the metric and **byte-identical**
+    (the per-profile arithmetic does not depend on `B`). Interleaved over all six
+    depths, `B = 32/48/64/96/128` → 692/628/575/572/577 µs per chunk; 64 is the
+    knee. **It disproves the L1 intuition**: at `B=64` the tile+prefix pair is
+    63 KB, overflowing the 32 KB L1 that `B=32` nearly fits, and wins anyway.
+  - **`_block_sigma` subsamples whole profiles**, evenly spaced, instead of a flat
+    stride through the linear index — 2.7 MB → 0.4 MB of gather per chunk, worth
+    3.2%. It is also a *better* sample: the flat stride hit only `nbins/s`
+    distinct phase bins whenever `s | nbins`, i.e. **four**, at five of the six
+    default depths. Oracle-safe because `snr_metrics` defaults to
+    `sigma_samples = typemax(Int)` and so takes the un-subsampled branch.
+  - **The isolated bench said 1.74x; in situ it is 1.13x** on the metric. Same
+    lesson as the smooth-`fftlen` and `_block_sigma` `idiv` cases: the
+    microbenchmark re-runs on hot data, the search reads `profs`/`dprofs` once
+    while competing with the transform that wrote them, so the *bandwidth* half
+    of the win evaporates and only the *vector-width* half survives.
+  - **Wall clock cannot resolve a 5% change on this laptop** (±10%, with
+    within-round thermal drift). Compare arms by each run's own metric-phase
+    *fraction* of accounted time — the untouched phases drift with it, so the
+    ratio is drift-robust. It gives 36.0% → 32.9% at `-t 1` and 33.3% → 30.4% at
+    `-t 4`, i.e. the same 13%, so the doubled gate scratch costs nothing threaded.
+  - **Candidates are not byte-identical** — σ̂ moved. Same three candidates at the
+    same frequencies; S/N 12.97 → 13.27, 7.83 → 7.76, 7.33 → 7.22, and the
+    pulsar's winning rung moves `k=6` → `k=4` (a near-tie between adjacent rungs).
+  - **That +2.3% is not the new sampling being better or worse — the per-chunk σ̂
+    is itself ~1% noisy, and reported S/N is exactly `1/σ̂`.** Measured over 24
+    chunks against the exact all-bins σ̂: both schemes are unbiased, with rms
+    1.0–1.5% (flat stride) vs 0.9–1.2% (whole columns), i.e. the new one is
+    modestly *better* at every depth — it just drew unluckily in the pulsar's own
+    chunk (0.9809 of exact at `k=4`, against the old scheme's 1.0004). Against the
+    exact σ̂ the pulsar is **≈13.0**, which 12.97 and 13.27 straddle.
+    **So the last two digits of "12.97 vs riptide's 11.80" are σ̂ noise, and
+    always were.** The 10% gap is safe; a percent-level S/N comparison (the §3.2
+    Monte Carlo) is not, and must use the exact σ̂ or model this term.
+  - **Four measured dead ends — do not re-guess them:** fusing the transpose away
+    (a wash at `B=32`, worse at 64); full fusion of prefix + widths (1.33x
+    *slower*, AVX2 register pressure); blocking or reordering the transpose
+    (0.56–1.03x — it is a ~15.8 GB/s L3 wall, not a code defect); and a cheap
+    upper bound to skip profiles outright (after ladder pruning the bank is all
+    narrow, and the tightest cheap bound sits at 5.9 against `medcut = 4.0`).
+  - **Open, needs a call:** fixing the MAD's location at the structural zero
+    (`1.4826 × median(|x|)`, one quickselect instead of two) is ~1% end-to-end
+    *and* statistically better — DC is held at 0, so the centre is known, and the
+    sample median measures within ±0.03σ of it. It was not landed because it
+    changes the un-subsampled branch, which is what `snr_metrics` — and hence the
+    Python oracle pin at 7.0e-17 — uses. See `Summary_and_Future_Work.md` §3.1.
 - **In-situ phase timers are now permanent** (`phase_reset!` / `phase_times`,
   `PHASE_NAMES`; ~0.03% of runtime, one `time_ns` pair per phase per chunk).
   `bench/precision_ab.jl` prints them alongside a wall-clock A/B. Use them
@@ -514,14 +569,16 @@ re-deriving them.
   the interp penalty. `bench/profile_search.jl` still defaults to 5–30 Hz; pass
   `FILE.fft 33.3333 0.1` to match the riptide bench config.
 - **Where the single-thread time is now** (`:f64`, PM0063, 0.1–33.3 Hz, `-t 1`,
-  29.5 s of phases): decim-metric 29%, interp 24%, decim-brfft 18%, gate+metric
-  18%, base brfft 9%. **The boxcar metric work is 47%** across the two metric
-  rows — the largest remaining target, and larger than the interpolation it was
-  long assumed to sit behind. For `interp` (24%), the identified structural cost
-  is the per-trial horizontal reduce, and the way out is vectorising across
-  *trials* (as the boxcar gate did for 2.77–4.05x), not a wider `m`-axis; see
-  §3.1 for the periodicity that makes a trial-ordered weight table possible and
-  for the part that has not been prototyped.
+  after the 2026-08-22 metric work): interp 33%, boxcar metric 33% (decim-metric
+  + gate+metric + block-sigma), decim-brfft 20%, base brfft 12%. **The metric and
+  the interpolation are now level**, where the metric used to be 47%.
+  For `interp`, the identified structural cost is the per-trial horizontal
+  reduce, and the way out is vectorising across *trials* (as the boxcar gate did
+  for 2.77–4.05x), not a wider `m`-axis; see §3.1 for the periodicity that makes
+  a trial-ordered weight table possible and for the part that has not been
+  prototyped. `decim-brfft` reads `ftprofs` with stride `k`, so each of the five
+  decimated passes touches essentially the whole 2 MB array to use `1/k` of it —
+  ~10 MB per chunk, unexamined.
 - **Historical (2026-08-15), superseded by the two entries above but kept because
   the *shape* of the curve was real:** with the gather still present, `Float32`
   was 0.88x at `-t 1`, 1.00x at `-t 4`, 1.14x at `-t 16`, doing 13% more CPU work

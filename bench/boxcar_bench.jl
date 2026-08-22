@@ -24,7 +24,7 @@ const CS = CoherentSearch
 const NHARMS = 60
 const MAXDECIM = 6
 const NPROF = 2048          # the production chunk size
-const BS = (4, 8, 16, 32, 64)
+const BS = (16, 32, 48, 64, 96, 128)   # 64 is the production knee; see §3.1
 
 # --- the scalar reference, per profile column -------------------------------
 function gate_scalar!(out::Vector{Float64}, profs::Matrix{Float64}, n::Int,
@@ -167,7 +167,7 @@ println("="^104)
 for T in (Float64, Float32)
     println("\ntile eltype = $T")
     println(rpad("nbins", 7), rpad("nw", 4), rpad("scalar", 9),
-            join(rpad("B=$b", 9) for b in BS), rpad("B=32 dyn", 10), "best")
+            join(rpad("B=$b", 9) for b in BS), rpad("B=$(CS._BC_BATCH) dyn", 10), "best")
     tot_scalar = 0.0
     tot = zeros(length(BS))
     for nbins in schedule
@@ -198,10 +198,10 @@ for T in (Float64, Float32)
             if T === Float64      # F64 batching must be bit-identical to the scalar path
                 @assert out2[1:nfull] == out1[1:nfull] "B=$B not bit-identical at nbins=$nbins"
             end
-            if B == 32
+            if B == CS._BC_BATCH
                 tdyn = minimum(@benchmark gate_batched_dyn!($out2, $profs, $NPROF, $tile,
                                                             $psT, $res, $mbuf, $widths,
-                                                            $nbins, $(one(T)), 32)).time
+                                                            $nbins, $(one(T)), CS._BC_BATCH)).time
             end
         end
         println(rpad(nbins, 7), rpad(length(widths), 4), us(ts), join(us(t) for t in row),
