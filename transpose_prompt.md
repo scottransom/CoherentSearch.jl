@@ -47,17 +47,62 @@ and dirty each for one 4-byte word. That is ~1/16 of the write bandwidth used.
 
 ## Ideas, in the order I would try them
 
-1. **Make the `brfft` write the tile layout directly.** Hand `mul!` a strided
-   *output view* so FFTW scatters its results into `(Nprof, nbins)`-ish order as
-   part of its final pass, and the transpose ceases to exist. **This is genuinely
-   untried**: dead end (2) in `CLAUDE.md` transposed the *whole* array including
-   the transform axis (`(Nprof, Hₖ+1)` transforming along dim 2) and was 2–3x
-   slower — a different experiment. Keeping the transform along dim 1 and changing
-   only where results land is the thing to test. Do a **feasibility check first**
-   (does `plan_brfft` accept the output view at all, and does PATIENT planning
-   find something sane for it?), because a yes here obviates ideas 2–4.
-   Note this interacts with `DecimBuf`: the decimated plans already transform a
-   stride-`k` input *view*, so they would become strided on both sides.
+1. **Make the `brfft` write the tile layout directly — ALREADY PROTOTYPED AND
+   MEASURED, 2026-08-22. Start here; most of the risk is gone.**
+
+   Scott was right that FFTW's guru interface strides its *outputs*
+   independently of its inputs, and FFTW.jl reaches it: `dims_howmany(X, Y, …)`
+   reads `strides(X)` and `strides(Y)` separately and hands both to
+   `fftw_plan_guru64_dft_c2r`. The typed two-array `rFFTWPlan` constructor
+   demands `StridedArray`, which `PermutedDimsArray` is *not* (it has the right
+   strides but is outside the type union), so the probe calls the guru entry
+   point directly — 12 lines. It is checked in as
+   **`bench/guru_transpose_probe.jl`**; run it first to reproduce.
+
+   The plan asks for input `(nh+1, Nprof)` column-major (transform-dim stride 1,
+   batch stride `nh+1`) and output **profile-major** `(Nprof, nbins)` (phase
+   stride `Nprof`, profile stride 1) — which *is* the gate's tile layout.
+   Measured at `k = 1`, `nbins = 120`, `Nprof = 2048`, `PATIENT`:
+
+   | | µs |
+   |---|---|
+   | dense `brfft` (`PRESERVE_INPUT`, as shipped) | 491.8 |
+   | guru profile-major `brfft` (`PRESERVE_INPUT`) | 662.5 (1.35x the dense plan) |
+   | today's scattered transpose → `Float32` tile | 499.4 |
+   | contiguous `Float64`→`Float32` narrowing | 128.5 |
+
+   * **today = 991.2 µs**
+   * **guru, `:f64` = 791.0 µs → 1.25x** (still needs the narrowing pass, but it
+     is now *contiguous* — 128.5 µs against the scattered 499.4 µs)
+   * **guru, `:f32` = 662.5 µs → 1.50x** — in `:f32` the guru output *is* the tile
+     type, so the transpose disappears outright with nothing to replace it
+
+   **`--precision f32` therefore stops being a marginal flag and becomes the
+   point.** Idea 3 below composes with this one rather than competing.
+
+   Three things the probe already establishes, so do not rediscover them:
+
+   * **`PRESERVE_INPUT` is mandatory and is not free.** FFTW's c2r destroys its
+     input by default (measured: max|Δ| = 53.8 without the flag), and the
+     decimated passes read stride-`k` views of `ftprofs` *after* the base
+     transform. FFTW.jl's `plan_brfft` sets it (`fft.jl:879`); the probe does too.
+     The 1.35x above is *with* it. An earlier number without it was optimistic.
+   * **The result is NOT bit-identical**: dense vs guru agree to 1.421e-14
+     relative, because `PATIENT` picks a different algorithm once the output
+     strides change. So **the `.cohout` byte-identity expectation below does not
+     apply to this idea** — it is a different transform, not a data move. Expect
+     last-digit S/N motion and check it the way the σ̂ change was checked (same
+     candidates at the same frequencies, S/N moving in the last printed digit).
+   * **Only `k = 1` has been probed.** The five decimated transforms already take
+     a stride-`k` *input* view, so under this scheme they become strided on both
+     sides. That is the case most likely to disappoint — measure it before
+     committing to the design.
+
+   Rough projection if the `k = 1` ratios hold across the ladder: the extra FFT
+   cost is ~35% of ~1412 µs of transform ≈ 494 µs, against 1516 µs of transpose
+   removed, so ~700 µs/chunk saved in `:f64` and ~1020 µs in `:f32` — call it
+   **~14% and ~21% of total runtime**. Treat those as upper bounds: every isolated
+   projection in this repo has shrunk in situ.
 
 2. **Blocked transpose with cache-line-filling inner blocks.** The previous
    blocking attempt is recorded as 0.56–1.03x, but at `B = 32/64`; `B` is 128 now
@@ -80,8 +125,11 @@ and dirty each for one 4-byte word. That is ~1/16 of the write bandwidth used.
 
 ## Gates and discipline
 
-* `.cohout` must be **byte-identical** — this is pure data movement, so anything
-  else is a bug. Diff it, do not eyeball it.
+* `.cohout` byte-identity is the right gate for ideas 2 and 4 (pure data
+  movement — anything else is a bug). **It is NOT the gate for idea 1**, which
+  changes the FFTW algorithm and moves results by ~1e-14 relative; there, check
+  that the candidate set and frequencies are unchanged and that S/N moves only in
+  the last printed digit. Diff either way; do not eyeball.
 * `Pkg.test()` (466 tests) and `julia --project=crossval
   crossval/crossval_accuracy.jl` (DEFAULT_PY is this machine's).
 * **Compare arms by phase-share of accounted time, not seconds.** On this host
