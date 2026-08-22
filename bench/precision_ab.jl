@@ -2,7 +2,7 @@
 #
 #     julia --project=bench -t 1 bench/precision_ab.jl [FILE.fft] [--lofreq 0.1]
 #         [--hifreq 33.3333] [--reps 3] [--nharms 60] [--maxdecim 6]
-#         [--threshold 6.3] [--arms f64,f32]
+#         [--threshold 6.3] [--m 16] [--arms f64,f32]
 #
 # Both precisions are compiled into one build (`Workspace{…,P}`), so the arms
 # alternate under identical cache/thermal conditions with no branch switching and
@@ -23,7 +23,7 @@ using Base.Threads: nthreads
 function parseargs(argv)
     file = "PM0063_034C1_DM445.0_red.fft"
     lofreq, hifreq, reps = 0.1, 33.3333, 3
-    nharms, maxdecim, threshold = 60, 6, 6.3
+    nharms, maxdecim, threshold, m = 60, 6, 6.3, 16
     arms = [:f64, :f32]
     i = 1
     while i <= length(argv)
@@ -32,6 +32,7 @@ function parseargs(argv)
         elseif a == "--hifreq";    hifreq = parse(Float64, argv[i += 1])
         elseif a == "--reps";      reps = parse(Int, argv[i += 1])
         elseif a == "--nharms";    nharms = parse(Int, argv[i += 1])
+        elseif a == "--m";         m = parse(Int, argv[i += 1])
         elseif a == "--maxdecim";  maxdecim = parse(Int, argv[i += 1])
         elseif a == "--threshold"; threshold = parse(Float64, argv[i += 1])
         elseif a == "--arms";      arms = Symbol.(split(argv[i += 1], ","))
@@ -40,12 +41,12 @@ function parseargs(argv)
         end
         i += 1
     end
-    return (; file, lofreq, hifreq, reps, nharms, maxdecim, threshold, arms)
+    return (; file, lofreq, hifreq, reps, nharms, maxdecim, threshold, m, arms)
 end
 
 const OPT = parseargs(ARGS)
 
-mkparams(prec) = SearchParams(nharms=OPT.nharms, threshold=OPT.threshold,
+mkparams(prec) = SearchParams(nharms=OPT.nharms, threshold=OPT.threshold, m=OPT.m,
                               decimations=decimation_set(OPT.nharms, OPT.maxdecim),
                               precision=prec)
 
@@ -69,8 +70,8 @@ med(v) = sort(v)[cld(length(v), 2)]
 function main()
     ft = FFTFile(OPT.file)
     @printf("precision A/B — %s  T=%.1f s   threads=%d\n", OPT.file, ft.T, nthreads())
-    @printf("  band %g–%g Hz, nharms=%d, maxdecim=%d, threshold=%g, reps=%d\n\n",
-            OPT.lofreq, OPT.hifreq, OPT.nharms, OPT.maxdecim, OPT.threshold, OPT.reps)
+    @printf("  band %g–%g Hz, nharms=%d, m=%d, maxdecim=%d, threshold=%g, reps=%d\n\n",
+            OPT.lofreq, OPT.hifreq, OPT.nharms, OPT.m, OPT.maxdecim, OPT.threshold, OPT.reps)
 
     allparams = Dict(a => mkparams(a) for a in OPT.arms)
     # Compile + page in every arm on a sliver of the same band (discarded).

@@ -108,7 +108,7 @@ function parse_cmdline(argv)
             arg_type = Float64
             default = 0.5
         "--m"
-            help = "Fourier bins summed by the interpolation kernel (even). Cost is linear in m; the signal-power loss is ~0.2/m averaged over sub-bin offset (1.3% at m=16), against ~6.5% already lost to the --hidr trial grid"
+            help = "Fourier bins summed by the interpolation kernel (even). Cost is linear in m; the signal-power loss is ~0.2/m averaged over sub-bin offset (1.3% at m=16, 0.63% at m=32), against ~6.5% already lost to the --hidr trial grid. Since the weights went Float32 the kernel is cheap enough that m=32 costs less than m=16 used to, so it is a reasonable choice when sensitivity matters more than wall clock"
             arg_type = Int
             default = 16
             range_tester = x -> x > 0 && iseven(x)

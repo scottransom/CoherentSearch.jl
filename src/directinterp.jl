@@ -118,12 +118,37 @@ A compile-time constant, not a plan field, because the kernel's accumulators are
 `NTuple{V}` — with a runtime `V` the `ntuple`s do not unroll and the whole win is
 lost (the same trap `_BC_BATCH` documents for the boxcar gate).
 
-16 measured fastest over a sweep of `V = 8/16/32/64`, which gave 121/99/107/157 µs
-for the sampled harmonics: below 16 there are too few lanes to hide the FMA
-latency, above it the extended window `m+Δ` grows (Δ ≈ V·h/q) and both the wasted
-FMAs and the table footprint (0.65/1.5/3.5/9.3 MB over 60 harmonics) run away.
+**`V` is tied to the weight type, and 32 is the knee for the `Float32` weights
+that [`build_direct_plans`](@ref) now defaults to.**  What sets the knee is not
+the register width but the number of FMAs kept in flight, which wants to be
+Skylake's latency × throughput = 4 cycles × 2/cycle = **8**.  A 256-bit register
+holds 4 `Float64` or 8 `Float32`, and the kernel keeps `V/lanes` accumulators
+each for `sre` and `sim` — so 8 in flight means `V = 16` in `Float64` and
+`V = 32` in `Float32`.  Below the knee there are too few lanes to hide the FMA
+latency; above it the extended window `m+Δ` grows (Δ ≈ V·h/q) and both the wasted
+FMAs and the table footprint run away.
+
+Measured in situ as the `interp` share of accounted time (PM0063, 0.1–33.3 Hz,
+`-t 1`, Xeon Silver 4114), each type at its own best `V`:
+
+    WT        V=8      V=16     V=32     V=64
+    Float64   21.2%   *17.5%*   18.1%    29.8%
+    Float32     —      15.5%   *13.3%*   16.8%
+
+`V` is one constant for both types rather than a function of `WT`, because the
+non-default `Float64` path is now only the reference/pin path: it pays 18.1%
+against its own best 17.5%, i.e. 3% of the interp phase and ~0.6% end to end, and
+that is not worth plumbing a type-dependent `Val` through the plan builder and
+the window sizing.
+
+**AVX-512 does not move any of this, on a machine that has it.**  `skylake-avx512`
+still compiles this kernel to **256-bit `ymm`** — LLVM sets `prefer-256-bit` for
+Skylake-SP because 512-bit code downclocks the core — so the lane counts above
+are the same as on the AVX2 laptop, and both hosts agree on the knee.  Confirm
+before re-guessing: `code_native(CoherentSearch._group_lanes, …)` counts 0 `zmm`
+against 38 `ymm`.
 """
-const DIRECT_GROUP_V = 16
+const DIRECT_GROUP_V = 32
 
 """
     DirectPlan
@@ -257,29 +282,65 @@ function build_group_table(::Type{WT}, m::Int, q::Int, s::Int, base_adv::Int,
 end
 
 """
-    build_direct_plans(params, r_lo) -> Vector{DirectPlan}
+    build_direct_plans(params, r_lo)     -> Vector{DirectPlan{Float32}}
     build_direct_plans(WT, params, r_lo) -> Vector{DirectPlan{WT}}
 
 Build the per-harmonic phase tables for a search whose *global* trial 0 sits at
 fundamental Fourier frequency `r_lo`.  Cheap (a few thousand divisions per
 harmonic) and done once, before the parallel region.
+
+The weight type defaults to **`Float32`**, which is a speed-over-precision trade
+worth ~24% of the interpolation phase for a worst-case 2.0e-7 relative error —
+five orders of magnitude below what the `m`-truncation already costs, and
+invisible in the candidate list.  Pass `Float64` explicitly for the reference and
+oracle paths, which pin the exact kernel at machine precision.  See the commentary
+below for the measurements, and [`DIRECT_GROUP_V`](@ref) for why the group width
+is tied to this choice.
 """
 # The interpolation working precision is deliberately **not** tied to
-# `params.precision`, and the search asks for `Float64`.
+# `params.precision` (which is the *profile* stage).  It defaults to `Float32`.
 #
-# **The standing reason for that is now obsolete and the question is reopened.**
-# A fully-`Float32` inner sum was measured on 2026-08-16 at **1.64x slower** than
-# `Float64` (Xeon Silver 4114, AVX-512, m=16, nharms=60, Nprof=2048), and the
-# diagnosis was the *per-trial horizontal reduce*: at `m = 16` a `Float32` sum is
-# exactly one 16-lane vector, so one FMA with no ILP followed by a four-stage
-# cross-lane reduce, against `Float64`'s two 8-lane accumulators and a three-stage
-# reduce.  The trials-axis kernel (2026-08-22) has **no cross-lane reduce at all**
-# — each vector lane is a different trial — so that mechanism cannot apply, and
-# `Float32` would now both double the lanes and halve a weight table that grew
-# from 395 KB to ~1.45 MB.  `build_direct_plans(WT, …)` still takes the type;
-# re-measure before quoting the 1.64x at anyone.
+# **`Float32` is the default because it is faster and costs nothing measurable.**
+# The old "`Float32` is 1.64x SLOWER" verdict (2026-08-16) is dead: it blamed the
+# per-trial horizontal reduce — at `m = 16` a `Float32` sum was exactly one
+# 16-lane vector, so one FMA with no ILP and then a four-stage cross-lane reduce,
+# against `Float64`'s two 8-lane accumulators and a three-stage reduce — and the
+# trials-axis kernel has no cross-lane reduce at all, so the mechanism went away
+# with it.  Re-measured 2026-08-22 on the same machine, in situ, as the `interp`
+# share of accounted time with each type at its own best `DIRECT_GROUP_V`:
+# `Float64` 17.5% at `V = 16` against `Float32` 13.3% at `V = 32`, i.e. **24% off
+# the interp phase**, ~4% end to end.  It also halves the weight table, which the
+# trials-axis rewrite had grown 395 KB → 1.45 MB.
+#
+# **The accuracy cost is real, named, and far below anything the search can see.**
+# Worst relative error against the exact point-by-point `fourier_interp` goes
+# 6.8e-11 → 2.0e-7.  Set against that: the `m = 16` truncation already discards
+# ~1.27% of the signal power and the `hidr = 0.5` trial grid ~6.5% at the top
+# harmonic, so 2e-7 is five orders of magnitude below the error budget's floor.
+# End to end it is not merely small but *absent* — on PM0063, 0.1–33.3 Hz, down to
+# threshold 6 (21 candidates), the `.cohout` is **byte-identical** between the two
+# weight types, frequencies to 12 decimals included, and it stays byte-identical
+# at `m = 16, 20, 24, 32`.  The 7.1185 Hz pulsar scores 13.27 either way.
+#
+# **What the speed buys back, if accuracy is ever wanted.**  Because `Float32` is
+# cheaper per kernel bin, it can afford a longer kernel: `m = 32` in `Float32`
+# costs 3.44 s of interp against `Float64`/`m = 16`'s 3.71 s.  So doubling `m` —
+# halving the truncation loss 1.27% → 0.63%, which is a *real* 0.3% of recovered
+# S/N, three orders of magnitude more than the rounding this trades away — is
+# available for less than today's default costs.  `m` stays 16 by default because
+# 0.3% of S/N is not worth 3% of wall clock in a blind search, but `--m 32` is now
+# the cheap option it was not before.
+#
+# **The pins do not move, and that is deliberate.**  2.0e-7 does not fit under
+# `test_search.jl`'s `worst < 1e-7` interpolator pin or the `PIN_TOL = 1e-8`
+# equivalence pins, and those are machine-precision statements about the *exact*
+# Eqn.-30 kernel: loosening them to ~1e-6 to swallow this would let a genuine
+# tabulation bug hide with it.  So the pins keep asking for `Float64` explicitly —
+# `build_direct_plans(Float64, params, rstart)` — exactly as `sigma_center =
+# :median` keeps the oracle pin honest across the σ̂ divergence, and a separate
+# testset pins `Float32` against `Float64` at the ~1e-6 it actually achieves.
 build_direct_plans(params::SearchParams, r_lo::Real) =
-    build_direct_plans(Float64, params, r_lo)
+    build_direct_plans(Float32, params, r_lo)
 
 function build_direct_plans(::Type{WT}, params::SearchParams, r_lo::Real) where {WT<:AbstractFloat}
     lodr = params.hidr / params.nharms

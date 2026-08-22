@@ -674,12 +674,25 @@ end
 # ---------------------------------------------------------------------------
 
 const _BC_TILE = Float32          # gate tile/accumulator type (see above)
-const _BC_BATCH = 64              # profiles per SIMD tile; see bench/boxcar_bench.jl
-# 64, not 32: the tile+prefix pair is 63 KB at `nbins = 120`, which overflows the
-# 32 KB L1 — and is 1.20x FASTER than the 32 that fits, measured interleaved over
-# all six fold depths (32 → 64 → 96 → 128 gives 692/575/572/577 µs per chunk, so
-# 64 is the knee).  The batched kernel's per-profile arithmetic is independent of
-# `B`, so widening it is byte-identical, not an approximation.
+const _BC_BATCH = 128             # profiles per SIMD tile; see bench/boxcar_bench.jl
+# 128, and emphatically not the 32 that fits in L1: the tile+prefix pair is 63 KB
+# at `nbins = 120` and `B = 64`, already over the 32 KB L1, and 126 KB at 128.
+# Widening past L1 wins anyway, on both machines this has been measured on.  The
+# batched kernel's per-profile arithmetic is independent of `B`, so this is
+# byte-identical, not an approximation — verified by `.cohout` diff.
+#
+# The knee is machine-dependent and the two hosts disagree, so `B` is set to the
+# value that is best on one and free on the other:
+#   * i7-10510U (AVX2, 4 cores): 32/48/64/96/128 → 692/628/575/572/577 µs per
+#     chunk.  64 is the knee; 128 is 0.3% behind it, i.e. a wash.
+#   * Xeon Silver 4114 (2×10 cores; nominally AVX-512, but LLVM emits 256-bit
+#     vectors on Skylake-SP by default — see `DIRECT_GROUP_V`): in situ, the metric's
+#     share of accounted time is 48.96/48.55/48.68/48.03/45.52% for
+#     32/48/64/96/128 and 47.67/45.42% for 192/256.  Everything from 32 to 96 is
+#     one flat plateau — the *absolute* spread across those four is whole-machine
+#     drift, which is why the share is the thing to read — and only 128 moves it,
+#     by 6.9% off the metric (~1.04x end to end at `-t 1`, reproduced twice).
+# So 128 costs the laptop ~0.3% and buys the workstation ~4%.
 
 """
     BoxcarBatch{T}
@@ -1680,15 +1693,22 @@ Eqn.-30 kernel — `block_metrics` point by point through
 [`reference_profiles`](@ref), this through the tabulated hot-loop path — so on
 identical grids they agree to ~1e-10, limited by the tabulation rather than by
 either being an approximation of the other.
+
+`weights` selects the interpolation weight type and defaults to `Float32`, as the
+search does.  The machine-precision equivalence pins pass `Float64` so that they
+keep measuring *tabulation* rounding rather than the deliberate `Float32` trade
+(see [`build_direct_plans`](@ref)); at `Float32` the same comparison lands at
+~2e-7, which a separate testset pins.
 """
 function chunk_metrics(ft::FFTFile, params::SearchParams, rstart::Real, n::Integer;
-                       lodr::Real = params.hidr / params.nharms)
+                       lodr::Real = params.hidr / params.nharms,
+                       weights::Type{<:AbstractFloat} = Float32)
     nh = params.nharms
     nbins = 2nh
     ws = Workspace(params, n)
     # This chunk *is* the whole "search", so its global trial index starts at 0
     # and the direct plans are built against `rstart` as `r_lo`.
-    dplans = build_direct_plans(params, rstart)
+    dplans = build_direct_plans(weights, params, rstart)
     fill_chunk_profiles!(ws, dplans, ft, params, rstart, lodr, n; t0=0)
     P = eltype(ws.profs)
     sigma = _block_sigma(ws.profs, nbins, n, ws.bcsig)
@@ -1995,6 +2015,13 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
                         minimum(dp.P for dp in dplans), maximum(dp.P for dp in dplans),
                         dplans[1].q)
             end
+        end
+        # The interpolation weight type is a deliberate speed/accuracy trade and
+        # is disclosed rather than left implicit.  Quote it against the two errors
+        # that actually dominate, so the number is read in proportion.
+        let WT = eltype(dplans[1].W)
+            @printf(stderr, "  interpolation: m=%d, %s weights (~%s relative); truncation loss ~%.2f%%, hidr grid ~6.5%%\n",
+                    params.m, WT, WT === Float32 ? "2e-7" : "7e-11", 100 * 0.203 / params.m)
         end
         println(stderr, "─"^96)
     end

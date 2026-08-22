@@ -170,11 +170,25 @@ if isfile(EXAMPLE_FFT)
         n = 256
         rfund = rstart .+ (0:n-1) .* lodr
 
+        # `weights=Float64` is what keeps this a machine-precision statement.
+        # The search itself defaults to `Float32` interpolation weights, a
+        # deliberate ~2e-7 speed trade (see `build_direct_plans`); measuring the
+        # optimised path at `Float32` here would fold that constant into a pin
+        # whose whole job is to catch tabulation bugs at 1e-8.  The `Float32`
+        # path has its own pin below.
         ref = block_metrics(ft, rfund, params; kernel=:direct)
-        opt = chunk_metrics(ft, params, rstart, n; lodr=lodr)
+        opt = chunk_metrics(ft, params, rstart, n; lodr=lodr, weights=Float64)
         relerr = maximum(abs.(opt .- ref)) / maximum(abs.(ref))
         @info "exact-kernel reference agreement" relerr
         @test relerr < 1e-8
+
+        # The shipped default, against the same reference.  Loose by the pin
+        # above's standards and tight by the search's: two orders of magnitude
+        # under the ~1.3% of signal power the m-truncation discards anyway.
+        optf32 = chunk_metrics(ft, params, rstart, n; lodr=lodr, weights=Float32)
+        relf32 = maximum(abs.(optf32 .- ref)) / maximum(abs.(ref))
+        @info "Float32-weight agreement (the shipped default)" relf32
+        @test relf32 < 1e-6
 
         # And the FFT-correlation reference — the Python-oracle form — is much
         # further away, which is the accuracy the production interpolator buys.
@@ -197,17 +211,23 @@ if isfile(EXAMPLE_FFT)
         # so the per-point reference can be evaluated for every harmonic.
         rstart = 5000.0
         n = 256
-        ws = CoherentSearch.Workspace(params, n)
-        dplans = build_direct_plans(params, rstart)
-        CoherentSearch.fill_chunk_profiles!(ws, dplans, ft, params, rstart, lodr, n; t0=0)
-        worst = 0.0
-        for h in (1, 2, 7, 15, 30, 59, 60), j in (1, 2, 97, n)
-            r = h * (rstart + (j - 1) * lodr)
-            v = fourier_interp(r, ft.amps, params.m)
-            worst = max(worst, abs(ws.ftprofs[h + 1, j] - v) / abs(v))
+        # Both weight types, against the same exact reference.  `Float64` is the
+        # machine-precision statement about the tabulation; `Float32` is the
+        # shipped default and its own documented trade, so it gets its own
+        # tolerance rather than relaxing the first one.
+        for (WT, tol) in ((Float64, 1e-7), (Float32, 1e-6))
+            ws = CoherentSearch.Workspace(params, n)
+            dplans = build_direct_plans(WT, params, rstart)
+            CoherentSearch.fill_chunk_profiles!(ws, dplans, ft, params, rstart, lodr, n; t0=0)
+            worst = 0.0
+            for h in (1, 2, 7, 15, 30, 59, 60), j in (1, 2, 97, n)
+                r = h * (rstart + (j - 1) * lodr)
+                v = fourier_interp(r, ft.amps, params.m)
+                worst = max(worst, abs(ws.ftprofs[h + 1, j] - v) / abs(v))
+            end
+            @info "direct interpolation vs exact fourier_interp" WT worst
+            @test worst < tol     # relative, and largest where |amp| ~ 0
         end
-        @info "direct interpolation vs exact fourier_interp" worst
-        @test worst < 1e-7        # relative, and largest where |amp| ~ 0
 
     end
 
@@ -447,7 +467,9 @@ if isfile(EXAMPLE_FFT)
 
             # Decimated fold via the production path.
             ws = CoherentSearch.Workspace(params, n)
-            dpl = build_direct_plans(params, rstart)
+            # Float64 weights: this pin is about the harmonic gather and the
+            # transform, so it must not absorb the Float32 default's ~2e-7.
+            dpl = build_direct_plans(Float64, params, rstart)
             CoherentSearch.fill_chunk_profiles!(ws, dpl, ft, params, rstart, lodr, n; t0=0)
             db = only(ws.decims)                      # decimations=[1,k] -> just k
             @test db.k == k && db.Hk == Hk
