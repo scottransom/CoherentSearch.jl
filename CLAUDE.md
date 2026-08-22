@@ -540,6 +540,44 @@ re-deriving them.
     would be silently biased and every reported S/N with it.
   - **Cumulative for the day: metric share 36.0% → 30.0%, i.e. 23.7% off the
     metric and ~1.09x end-to-end at `-t 1`.**
+- **Done (2026-08-22): the interpolator vectorises across TRIALS — 1.56x on the
+  interp phase, ~1.14x end-to-end, candidates byte-identical.** This is §3.1's
+  planned move, and the obstacle recorded there ("a same-window run is only ~`q/h`
+  trials long, so it vectorises well for low harmonics and barely at all for
+  `h > 15`") **turned out not to apply**, because the formulation never needs a
+  constant-`b` run. Substituting `j = δₖ + i` rewrites a group of `V` consecutive
+  trials as a matrix-vector product `sreₖ = Σⱼ Wx[k,j]·re[b₀+j]` against one
+  contiguous slice of the bin planes, with `Wx[k,j] = W[j-δₖ, pₖ]` depending only
+  on the residue the group *starts* at — so it is tabulated at plan time.
+  `re[b₀+j]` is then a broadcast scalar and `Wx[:,j]` a contiguous column:
+  **no gather and no horizontal reduce**, every lane a different trial.
+  - **It wins at every harmonic**, which the run-based approach could not:
+    1.7x at `h = 59` and 1.8x at `h = 60`, 2.0x at low `h`. The cost is
+    `(m+Δ)/m` wasted FMAs (`Wx` is zero off each row's `m` nonzeros,
+    `Δ ≈ V·h/q`) — 1.06x at `h=1`, 1.5x at `h=59` — bought back many times over.
+  - **`V = DIRECT_GROUP_V = 16`, and it is a `const`, not a plan field**: the
+    accumulators are an `NTuple{V}`, and with a runtime `V` the `ntuple`s do not
+    unroll. Same trap `_BC_BATCH` documents. Isolated sweep `V = 8/16/32/64` →
+    121/99/107/157 µs; in situ `V = 8/16/32` → interp share 28.5/25.4/30.7%.
+    **Both agree on 16**, which is not the usual outcome here.
+  - **A closure cost 2000x.** Writing the `ntuple` bodies inline made them capture
+    an assigned-in-loop local, which Julia boxes. They are top-level `@inline`
+    helpers taking everything as arguments. If this kernel ever reads as
+    inexplicably slow, check that first.
+  - **Bit-exact chunk invariance is preserved, and now actually tested.** Groups
+    are anchored to the **global** trial index; a chunk's two end groups may hang
+    off either side, and are computed in full and masked on store rather than
+    falling back to a second kernel — which is why the plane buffers are widened
+    to the *group* range and zero-filled outside the file. The range guard stays
+    on the **true** trial range, so where a harmonic gives up (past the
+    amplitudes, or past Nyquist) is unchanged. `test_search.jl` now runs the
+    invariance pin at chunk sizes 128/100/37/51 and asserts three of them really
+    do straddle groups.
+  - Measured `-t 1`: interp 4.93 → 3.02 s, share 34.8% → 25.5%. `-t 4`: share
+    28.9% → 20.6%. **Both are 36% off the interp**, so the table growing
+    395 KB → 1.45 MB (shared read-only) costs nothing threaded at 4.
+  - 460/460 tests, crossval unchanged (3.8e-16 / 2.1e-16 / 1.4e-16), `.cohout`
+    byte-identical — the ~5e-16 of resummation moved no reported S/N.
 - **In-situ phase timers are now permanent** (`phase_reset!` / `phase_times`,
   `PHASE_NAMES`; ~0.03% of runtime, one `time_ns` pair per phase per chunk).
   `bench/precision_ab.jl` prints them alongside a wall-clock A/B. Use them
@@ -561,16 +599,16 @@ re-deriving them.
   problem, and that problem has been fixed at its source, so the threaded win
   went with it. The deployment-model question (§3.1) therefore no longer decides
   anything.
-- **Fully-`Float32` interpolation is 1.64x SLOWER, and the reason generalises.**
-  Narrowing `DirectPlan`'s `W`/`A` and the accumulators (the last piece of "make
-  everything `Float32`") costs 1533 → 2482 µs per chunk, against the 1.09x that
-  narrowing only the *store* into `ftprofs` costs. At `m = 16` the `Float32` sum
-  is *exactly one* 16-lane vector — one FMA, no ILP, then a **four**-stage
-  cross-lane reduce — where `Float64` gets two independent 8-lane accumulators and
-  a three-stage reduce. **The per-trial horizontal reduce is what this loop pays
-  for**; narrowing *or* widening the `m`-axis both make it worse (this is the same
-  mechanism as the earlier 8-lane experiment). `build_direct_plans(WT, …)` keeps
-  the knob, but the search always asks for `Float64`.
+- **Historical: fully-`Float32` interpolation was 1.64x SLOWER (2026-08-16) —
+  and that verdict is now VOID, because its mechanism was removed on 2026-08-22.**
+  Narrowing `DirectPlan`'s `W`/`A` and the accumulators cost 1533 → 2482 µs per
+  chunk, and the diagnosis was the *per-trial horizontal reduce*: at `m = 16` a
+  `Float32` sum is exactly one 16-lane vector — one FMA, no ILP, then a
+  **four**-stage cross-lane reduce — where `Float64` got two independent 8-lane
+  accumulators and a three-stage reduce. The trials-axis kernel has **no
+  cross-lane reduce at all**, so that mechanism cannot apply; and `Float32` would
+  now also halve a weight table that grew 395 KB → 1.45 MB. **Re-measure before
+  quoting the 1.64x.** `build_direct_plans(WT, …)` still takes the type.
 - **Four plausible mechanisms for the decimated-transform regression, all
   measured, all wrong** — record them so they are not re-guessed: (1) *leading-dimension
   alignment* — `k=4` gives `Hₖ+1 = 16`, perfectly 64-byte aligned in `Float32`,
@@ -586,10 +624,12 @@ re-deriving them.
   the interp penalty. `bench/profile_search.jl` still defaults to 5–30 Hz; pass
   `FILE.fft 33.3333 0.1` to match the riptide bench config.
 - **Where the single-thread time is now** (`:f64`, PM0063, 0.1–33.3 Hz, `-t 1`,
-  after the 2026-08-22 metric work): interp ~34%, boxcar metric **30%**
-  (decim-metric + gate+metric + block-sigma), decim-brfft ~21%, base brfft ~12%.
-  **Interpolation is now the largest single phase**, where the metric was 47%
-  that morning.
+  after the whole 2026-08-22 pass): boxcar metric ~33%, interp **~25%**,
+  decim-brfft ~24%, base brfft ~14%. Over that one day the metric went 47% → 33%
+  and the interpolation 34% → 25%; **`decim-brfft` is now the phase that has
+  never been looked at**, and it is close to the top. It reads `ftprofs` with
+  stride `k`, so each of the five decimated passes touches essentially the whole
+  2 MB array to use `1/k` of it — ~10 MB per chunk.
   For `interp`, the identified structural cost is the per-trial horizontal
   reduce, and the way out is vectorising across *trials* (as the boxcar gate did
   for 2.77–4.05x), not a wider `m`-axis; see §3.1 for the periodicity that makes

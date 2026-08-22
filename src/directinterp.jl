@@ -111,6 +111,21 @@ to computing the `m` reciprocals per trial (same result, ~2x slower).
 const DIRECT_QMAX = 1 << 16
 
 """
+    DIRECT_GROUP_V
+
+Trials per group in the trials-axis kernel (see [`fill_harmonic_row_direct!`](@ref)).
+A compile-time constant, not a plan field, because the kernel's accumulators are an
+`NTuple{V}` — with a runtime `V` the `ntuple`s do not unroll and the whole win is
+lost (the same trap `_BC_BATCH` documents for the boxcar gate).
+
+16 measured fastest over a sweep of `V = 8/16/32/64`, which gave 121/99/107/157 µs
+for the sampled harmonics: below 16 there are too few lanes to hide the FMA
+latency, above it the extended window `m+Δ` grows (Δ ≈ V·h/q) and both the wasted
+FMAs and the table footprint (0.65/1.5/3.5/9.3 MB over 60 harmonics) run away.
+"""
+const DIRECT_GROUP_V = 16
+
+"""
     DirectPlan
 
 Per-harmonic recipe for the direct interpolator, built once at plan time and
@@ -150,6 +165,17 @@ struct DirectPlan{WT<:AbstractFloat}
     W::Matrix{WT}             # (m, P) real weights 1/(dr - j)
     A::Vector{Complex{WT}}    # (P,) conj(A(dr))
     carry::Vector{Bool}       # (P,)
+    # --- trials-axis group tables (see `fill_harmonic_row_direct!`) ----------
+    # A group is `DIRECT_GROUP_V` consecutive trials anchored to the *global*
+    # trial index.  Its weight block `gW` is the `(V, m+Δ)` matrix `Wx` with
+    # `Wx[k, j] = W[j - δₖ, pₖ]` (zero outside), `δₖ = bₖ - b₀`; it depends only
+    # on the residue the group starts at, of which there are `ngrp = q ÷
+    # gcd(V·s, q)`.  Empty when `P == 0` (no-table fallback).
+    grow::Vector{Int32}       # (q,) residue -> group index, 0 if not a group start
+    goff::Vector{Int32}       # (ngrp+1,) offsets into gW
+    gnj::Vector{Int32}        # (ngrp,) m+Δ, the extended window length
+    gW::Vector{WT}            # flat, group g is (V, gnj[g]) column-major at goff[g]
+    gA::Matrix{Complex{WT}}   # (V, ngrp) per-trial conj(A(dr))
 end
 
 """
@@ -173,6 +199,63 @@ function trial_grid_rational(lodr::Real)
     return (p, q)
 end
 
+# Tabulate the trials-axis group blocks for one harmonic.  Group `g` starts at
+# global trial `(g-1)*V`, hence at residue `(g-1)*V*s mod q`; there are
+# `ngrp = q ÷ gcd(V*s, q)` distinct such residues, and `grow` maps residue → group.
+#
+# Within a group the `k`-th trial reads the `m` bins starting at `bₖ`, and
+# `δₖ = bₖ - b₀ ∈ [0, Δ]` because `b` is non-decreasing with 0/1 steps (plus
+# `base_adv`).  Writing every trial's window as an offset into the *group's*
+# window turns the group into one `(V, m+Δ)` matvec against a single contiguous
+# slice of the bin planes — which is the whole point: no gather, and no per-trial
+# horizontal reduce.
+function build_group_table(::Type{WT}, m::Int, q::Int, s::Int, base_adv::Int,
+                           row::Vector{Int32}, W::Matrix{WT},
+                           A::Vector{Complex{WT}}, carry::Vector{Bool}) where {WT}
+    V = DIRECT_GROUP_V
+    CT = Complex{WT}
+    gstep = mod(V * s, q)
+    ngrp = gstep == 0 ? 1 : q ÷ gcd(gstep, q)
+    grow = zeros(Int32, q)
+    gnj = Vector{Int32}(undef, ngrp)
+    goff = Vector{Int32}(undef, ngrp + 1)
+    gA = Matrix{CT}(undef, V, ngrp)
+    blocks = Vector{Vector{WT}}(undef, ngrp)
+    res0 = 0
+    total = 0
+    ps = Vector{Int}(undef, V)
+    δs = Vector{Int}(undef, V)
+    for g in 1:ngrp
+        grow[res0 + 1] = Int32(g)
+        res = res0; B = 0; B0 = 0
+        for k in 1:V
+            p = Int(row[res + 1])
+            Bk = B + (carry[p] ? 1 : 0)
+            k == 1 && (B0 = Bk)
+            ps[k] = p; δs[k] = Bk - B0
+            gA[k, g] = A[p]
+            res += s; B += base_adv
+            if res >= q; res -= q; B += 1; end
+        end
+        nj = m + δs[V]
+        gnj[g] = Int32(nj)
+        blk = zeros(WT, V * nj)
+        for k in 1:V, i in 1:m
+            blk[(δs[k] + i - 1) * V + k] = W[i, ps[k]]
+        end
+        blocks[g] = blk
+        goff[g] = Int32(total)
+        total += V * nj
+        res0 = mod(res0 + gstep, q)
+    end
+    goff[ngrp + 1] = Int32(total)
+    gW = Vector{WT}(undef, total)
+    for g in 1:ngrp
+        copyto!(gW, Int(goff[g]) + 1, blocks[g], 1, length(blocks[g]))
+    end
+    return grow, goff, gnj, gW, gA
+end
+
 """
     build_direct_plans(params, r_lo) -> Vector{DirectPlan}
     build_direct_plans(WT, params, r_lo) -> Vector{DirectPlan{WT}}
@@ -182,16 +265,19 @@ fundamental Fourier frequency `r_lo`.  Cheap (a few thousand divisions per
 harmonic) and done once, before the parallel region.
 """
 # The interpolation working precision is deliberately **not** tied to
-# `params.precision`.  A fully-`Float32` inner sum was measured at **1.64x
-# slower** than `Float64` on the production configuration (Xeon Silver 4114,
-# AVX-512, m=16, nharms=60, Nprof=2048): at `m = 16` the sum is exactly one
-# 16-lane `Float32` vector, so there is a single FMA with no instruction-level
-# parallelism followed by a *four*-stage cross-lane reduce, against `Float64`'s
-# two independent 8-lane accumulators and a three-stage reduce.  The per-trial
-# horizontal reduction — not the width of the data — is what this loop is paying
-# for, and narrowing makes it worse.  `build_direct_plans(WT, …)` keeps the
-# experiment one argument away (and a machine with cheap cross-lane reduces, or a
-# GPU port, may well flip it), but the search always asks for `Float64`.
+# `params.precision`, and the search asks for `Float64`.
+#
+# **The standing reason for that is now obsolete and the question is reopened.**
+# A fully-`Float32` inner sum was measured on 2026-08-16 at **1.64x slower** than
+# `Float64` (Xeon Silver 4114, AVX-512, m=16, nharms=60, Nprof=2048), and the
+# diagnosis was the *per-trial horizontal reduce*: at `m = 16` a `Float32` sum is
+# exactly one 16-lane vector, so one FMA with no ILP followed by a four-stage
+# cross-lane reduce, against `Float64`'s two 8-lane accumulators and a three-stage
+# reduce.  The trials-axis kernel (2026-08-22) has **no cross-lane reduce at all**
+# — each vector lane is a different trial — so that mechanism cannot apply, and
+# `Float32` would now both double the lanes and halve a weight table that grew
+# from 395 KB to ~1.45 MB.  `build_direct_plans(WT, …)` still takes the type;
+# re-measure before quoting the 1.64x at anyone.
 build_direct_plans(params::SearchParams, r_lo::Real) =
     build_direct_plans(Float64, params, r_lo)
 
@@ -210,7 +296,9 @@ function build_direct_plans(::Type{WT}, params::SearchParams, r_lo::Real) where 
         if rq === nothing
             push!(plans, DirectPlan{WT}(h, m, 1, 0, 0, 1, rfloor0, dr0, 0,
                                         Int32[], Matrix{WT}(undef, m, 0),
-                                        CT[], Bool[]))
+                                        CT[], Bool[],
+                                        Int32[], Int32[], Int32[], WT[],
+                                        Matrix{CT}(undef, DIRECT_GROUP_V, 0)))
             continue
         end
         pnum, q = rq
@@ -248,8 +336,9 @@ function build_direct_plans(::Type{WT}, params::SearchParams, r_lo::Real) where 
             res += s
             res >= q && (res -= q)
         end
+        grow, goff, gnj, gW, gA = build_group_table(WT, m, q, s, base_adv, row, W, A, carry)
         push!(plans, DirectPlan{WT}(h, m, q, s, base_adv, pnum, rfloor0, dr0,
-                                    P, row, W, A, carry))
+                                    P, row, W, A, carry, grow, goff, gnj, gW, gA))
     end
     return plans
 end
@@ -277,14 +366,41 @@ end of the available amplitudes or past Nyquist (matching
 [`fill_harmonic_row!`](@ref)).
 
 The `m` bins each trial reads are de-interleaved once per chunk into the
-workspace's real/imaginary plane buffers, which turns the inner loop into two
-independent real dot products — the form the vectoriser handles best.
+workspace's real/imaginary plane buffers, which turns the inner sum into two
+independent real dot products.
+
+**The loop vectorises across *trials*, not across `m`.**  Summing over `m` per
+trial ends in a horizontal reduce, and with `m = 16` that reduce — not the
+arithmetic — was what the kernel spent its time on.  Instead, `V =
+DIRECT_GROUP_V` consecutive trials are handled together.  Substituting
+`j = δₖ + i` (with `δₖ = bₖ - b₀`, the `k`-th trial's bin offset within the
+group's window) rewrites the group as a matrix-vector product
+
+    sreₖ = Σⱼ Wx[k, j] · re[b₀ + j],     Wx[k, j] = W[j - δₖ, pₖ]
+
+against one contiguous `m+Δ` slice of the planes.  `Wx` depends only on the
+residue the group *starts* at, so it is tabulated at plan time ([`DirectPlan`](@ref)).
+The payoff is that `re[b₀+j]` is a broadcast scalar and `Wx[:, j]` a contiguous
+column, so there is **no gather and no horizontal reduce** — each lane of the
+accumulator is a different trial and stays live across the whole group.
+
+The cost is `(m+Δ)/m` wasted FMAs, since `Wx` is zero outside each row's `m`
+nonzeros.  `Δ ≈ V·h/q`, so it grows with harmonic and with `V`; at the defaults
+that is 1.06x at `h = 1` and 1.5x at `h = 59`, and the kernel still wins at
+*every* harmonic — 1.7x at the worst of them.  Measured in situ: **36% off the
+interpolation phase at both `-t 1` and `-t 4`.**
+
+Note that this obsoletes the reason a `Float32` weight table was rejected (see
+[`build_direct_plans`](@ref)): that verdict rested on the cross-lane reduce,
+which no longer exists here.
 
 The sum accumulates in the plan's weight type `WT`.  At `WT = Float64` the
 `Float32` planes widen exactly, so the result is bit-identical to `Float64`
-planes.  At `WT = Float32` the whole `m`-sum is single precision: twice the SIMD
-lanes and half the weight-table traffic, for a relative error of ~1e-6 against
-the ~1e-10 the `Float64` sum achieves.  That is far below the ~1.3% signal-power
+planes.  At `WT = Float32` the whole sum is single precision: twice the SIMD
+lanes and half the weight-table traffic — and the table is now `(V, m+Δ)` per
+group rather than `(m, P)`, i.e. ~1.45 MB over 60 harmonics against the old
+395 KB, so halving it is worth more than it used to be.  The accuracy cost is a
+relative error of ~1e-6 against the ~1e-10 the `Float64` sum achieves.  That is far below the ~1.3% signal-power
 loss the `m = 16` kernel already accepts and the ~6.5% the `hidr` grid costs at
 the top harmonic, so it is invisible in a detection — but it is *not* invisible
 to the equivalence pins, which is why `Float64` remains the default and the pins
@@ -303,18 +419,36 @@ function fill_harmonic_row_direct!(ws::Workspace, dp::DirectPlan{WT}, ft::FFTFil
         return _fill_row_direct_slow!(ws, dp, ft, params, t0, n)
     end
 
-    res, qint = direct_chunk_state(dp, t0)
+    # --- range guard, on the TRUE trial range -------------------------------
     # Julia bin range of trial t is  binstart : binstart+m-1  with
     # binstart = floor(h*r_t) + 2 - m2   (see `nearby_fourier_bin_range`).
+    # This is deliberately *not* widened to the group range below: the point at
+    # which a harmonic gives up (off the end of the amplitudes, or past Nyquist)
+    # must stay a property of the trials actually being searched, not of how the
+    # group grid happens to straddle them.
+    res, qint = direct_chunk_state(dp, t0)
     p0 = dp.row[res + 1]
-    lo = dp.rfloor0 + qint + dp.carry[p0] + 2 - m2
-    # State after the final trial, for the range check and the copy window.
+    lo_trial = dp.rfloor0 + qint + dp.carry[p0] + 2 - m2
     resl, qintl = direct_chunk_state(dp, t0 + n - 1)
     pl = dp.row[resl + 1]
-    hi = dp.rfloor0 + qintl + dp.carry[pl] + 1 + m2
-    (lo >= 1 && hi <= namps && (dp.rfloor0 + qintl) < Nhalf) || return
+    hi_trial = dp.rfloor0 + qintl + dp.carry[pl] + 1 + m2
+    (lo_trial >= 1 && hi_trial <= namps && (dp.rfloor0 + qintl) < Nhalf) || return
 
-    # De-interleave the chunk's bin window into real/imaginary planes.
+    # --- group grid, anchored to the GLOBAL trial index ----------------------
+    # Groups of `V` trials start at global trials 0, V, 2V, …, so which group a
+    # trial belongs to — and hence the exact arithmetic it gets — does not depend
+    # on where chunk boundaries fall.  A chunk's first and last groups may hang
+    # off either end; they are computed in full and masked on store, so the plane
+    # buffers are widened to the *group* range and zero-filled outside the file.
+    V = DIRECT_GROUP_V
+    T_first = fld(t0, V) * V
+    T_last = fld(t0 + n - 1, V) * V + V - 1
+    res_e, qint_e = direct_chunk_state(dp, T_first)
+    lo = dp.rfloor0 + qint_e + dp.carry[dp.row[res_e + 1]] + 2 - m2
+    resx, qintx = direct_chunk_state(dp, T_last)
+    hi = dp.rfloor0 + qintx + dp.carry[dp.row[resx + 1]] + 1 + m2
+
+    # De-interleave that window into real/imaginary planes.
     nw = hi - lo + 1
     re = ws.re
     im = ws.im
@@ -324,14 +458,26 @@ function fill_harmonic_row_direct!(ws::Workspace, dp::DirectPlan{WT}, ft::FFTFil
         "workspace plane buffers hold $(length(re)) bins but harmonic $(h) spans $nw " *
         "for a chunk of $n — the Workspace was built for a smaller Nprof"))
     amps = ft.amps
-    @inbounds @simd for i in 1:nw
+    # Split rather than branch per element, so the copy still vectorises: the
+    # head/tail are the (at most V-trial) overhang of the end groups past the
+    # file, and only ever run at the very ends of the band.
+    ihead = clamp(1 - lo, 0, nw)                    # entries with lo+i-1 < 1
+    itail = clamp(hi - namps, 0, nw - ihead)        # entries with lo+i-1 > namps
+    @inbounds @simd for i in 1:ihead
+        re[i] = 0.0f0
+        im[i] = 0.0f0
+    end
+    @inbounds @simd for i in (ihead + 1):(nw - itail)
         a = amps[lo + i - 1]
         re[i] = real(a)
         im[i] = imag(a)
     end
+    @inbounds @simd for i in (nw - itail + 1):nw
+        re[i] = 0.0f0
+        im[i] = 0.0f0
+    end
 
-    W = dp.W
-    A = dp.A
+    gW = dp.gW; gA = dp.gA; grow = dp.grow; goff = dp.goff; gnj = dp.gnj
     row = dp.row
     carry = dp.carry
     q = dp.q
@@ -339,29 +485,76 @@ function fill_harmonic_row_direct!(ws::Workspace, dp::DirectPlan{WT}, ft::FFTFil
     base_adv = dp.base_adv
     ftprofs = ws.ftprofs
     hrow = h + 1
-    @inbounds for k in 1:n
-        p = row[res + 1]
-        # Offset of this trial's first bin within the de-interleaved window.
-        b = dp.rfloor0 + qint + carry[p] + 2 - m2 - lo
-        sre = zero(WT)
-        sim = zero(WT)
-        # `Float32 -> WT` is exact for both `WT`, so at `WT = Float64` this
-        # accumulates identically to `Float64` planes while reading half the bytes,
-        # and at `WT = Float32` it is a no-op conversion.
-        @simd for i in 1:m
-            w = W[i, p]
-            sre = muladd(w, WT(re[b + i]), sre)
-            sim = muladd(w, WT(im[b + i]), sim)
+    res = res_e
+    qint = qint_e
+    T = T_first
+    vv = Val(V)
+    @inbounds while T <= T_last
+        g = Int(grow[res + 1])
+        b0 = dp.rfloor0 + qint + carry[row[res + 1]] + 2 - m2 - lo
+        o = Int(goff[g])
+        nj = Int(gnj[g])
+        j0 = T - t0                            # local column of lane 1, minus one
+        if j0 >= 0 && j0 + V <= n
+            _group_store!(ftprofs, hrow, j0, gW, o, nj, gA, g, re, im, b0, vv)
+        else
+            _group_store_masked!(ftprofs, hrow, j0, n, gW, o, nj, gA, g, re, im, b0, vv)
         end
-        ftprofs[hrow, k] = A[p] * complex(sre, sim)
-        res += s
-        qint += base_adv
-        if res >= q
-            res -= q
-            qint += 1
-        end
+        # advance V trials at once (exactly what V applications of the per-trial
+        # recurrence do: every wrap past q carries one bin).
+        tot = res + V * s
+        qint += V * base_adv + fld(tot, q)
+        res = mod(tot, q)
+        T += V
     end
     return
+end
+
+# One group: the (V, nj) weight block times the nj-long slice of the bin planes.
+# The accumulators are an `NTuple{V}` so they stay in vector registers — a scratch
+# `Vector` would put store-to-load forwarding in the FMA chain — and the two
+# `ntuple` helpers are top-level so their closures capture only their arguments.
+# Capturing an assigned-in-loop local instead boxes them: measured 2000x slower.
+@inline _grp_w(gW::Vector{T}, o::Int, ::Val{V}) where {T,V} =
+    ntuple(k -> @inbounds(gW[o + k]), Val(V))
+@inline _grp_fma(a::NTuple{V,T}, w::NTuple{V,T}, x::T) where {V,T} =
+    ntuple(k -> muladd(w[k], x, a[k]), Val(V))
+
+@inline function _group_lanes(gW::Vector{WT}, o::Int, nj::Int, re, im, b0::Int,
+                              ::Val{V}) where {WT,V}
+    ar = ntuple(_ -> zero(WT), Val(V))
+    ai = ntuple(_ -> zero(WT), Val(V))
+    @inbounds for j in 1:nj
+        rv = WT(re[b0 + j])
+        iv = WT(im[b0 + j])
+        w = _grp_w(gW, o + (j - 1) * V, Val(V))
+        ar = _grp_fma(ar, w, rv)
+        ai = _grp_fma(ai, w, iv)
+    end
+    return ar, ai
+end
+
+@inline function _group_store!(ftprofs, hrow::Int, j0::Int, gW::Vector{WT}, o::Int,
+                               nj::Int, gA, g::Int, re, im, b0::Int,
+                               ::Val{V}) where {WT,V}
+    ar, ai = _group_lanes(gW, o, nj, re, im, b0, Val(V))
+    @inbounds for k in 1:V
+        ftprofs[hrow, j0 + k] = gA[k, g] * complex(ar[k], ai[k])
+    end
+end
+
+# Partial end group: computed in full, stored only where it lands inside the
+# chunk.  The out-of-chunk lanes read the zero-padded ends of the planes, so they
+# are harmless — and computing them anyway is exactly what makes a trial's
+# arithmetic independent of where the chunk boundaries fall.
+@inline function _group_store_masked!(ftprofs, hrow::Int, j0::Int, n::Int,
+                                      gW::Vector{WT}, o::Int, nj::Int, gA, g::Int,
+                                      re, im, b0::Int, ::Val{V}) where {WT,V}
+    ar, ai = _group_lanes(gW, o, nj, re, im, b0, Val(V))
+    @inbounds for k in 1:V
+        j = j0 + k
+        (1 <= j <= n) && (ftprofs[hrow, j] = gA[k, g] * complex(ar[k], ai[k]))
+    end
 end
 
 # Fallback for a trial step that is not a small rational (see `DIRECT_QMAX`):
@@ -412,7 +605,9 @@ end
 Widest bin window any harmonic's chunk can span, i.e. how long the workspace's
 de-interleaved real/imaginary plane buffers must be.  The top harmonic steps by
 `hidr` bins per trial, so the span is `(Nprof-1)*hidr` bins plus the kernel's
-`m` bins, plus slack for the two end roundings.
+`m` bins, plus slack for the two end roundings — and plus up to `DIRECT_GROUP_V`
+trials of overhang at *each* end, because the trials-axis kernel computes the two
+partial end groups in full (see [`fill_harmonic_row_direct!`](@ref)).
 """
 direct_window_size(params::SearchParams, Nprof::Integer) =
-    ceil(Int, (Nprof - 1) * params.hidr) + params.m + 4
+    ceil(Int, (Nprof - 1 + 2 * DIRECT_GROUP_V) * params.hidr) + params.m + 4

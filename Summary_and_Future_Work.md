@@ -932,6 +932,11 @@ consecutive trials contiguous). The obstacle is that a same-window run is only
 `h > 15`; a version that handles the ±1 window slide with a permute rather than a
 gather is the piece that has not been prototyped.
 
+> **Done 2026-08-22 — and the obstacle in that last sentence was illusory.** See
+> "The interpolator, across trials" below: framing the group as a matrix-vector
+> product against an *extended* window removes the need for a same-window run
+> entirely, so it wins at every harmonic including `h = 59`.
+
 #### Where the single-thread time is now
 
 `Float64`, PM0063, 0.1–33.3 Hz, `-t 1`, 29.5 s of accounted phase time:
@@ -1121,6 +1126,83 @@ hide under the 1e-2 that this one deliberate difference costs.
 pins the *premise* separately — that the pooled median really sits at zero —
 because if that ever stopped holding, `:zero` would be silently biased and every
 reported S/N with it.
+
+#### The interpolator, across trials (2026-08-22) — 1.56x on interp, 1.14x end to end
+
+§3.1 had this move planned and had also recorded what looked like a blocking
+obstacle: the bin window `b` is constant only for runs of ~`q/h` trials, which is
+120 at `h = 1` but 2 at `h = 60`, so a run-based vectorisation would help low
+harmonics and nothing else — and every harmonic costs the same. **That obstacle
+was an artefact of insisting on a constant window.**
+
+Write the group's sum with the window index substituted, `j = δₖ + i`, where
+`δₖ = bₖ - b₀` is the `k`-th trial's bin offset within the *group's* window:
+
+    sreₖ = Σᵢ W[i, pₖ]·re[bₖ + i]  =  Σⱼ Wx[k, j]·re[b₀ + j],   Wx[k, j] = W[j - δₖ, pₖ]
+
+Now every trial in the group reads the *same* contiguous `m+Δ` slice of the
+planes, and the group is one `(V, m+Δ)` matrix-vector product. `re[b₀+j]` is a
+broadcast scalar; `Wx[:, j]` is a contiguous column; the accumulator has one lane
+per trial and stays live across the whole group. **No gather, and no horizontal
+reduce** — which was the thing this loop was actually paying for.
+
+`Wx` depends only on the residue the group *starts* at, of which there are
+`ngrp = q ÷ gcd(V·s, q)`, so it is tabulated once per harmonic at plan time.
+
+**Why it wins everywhere.** The price is `(m+Δ)/m` wasted FMAs, because `Wx` is
+zero off each row's `m` nonzeros, and `Δ ≈ V·h/q` grows with harmonic. That is
+1.06x at `h=1` and 1.5x at `h=59` — and the kernel still wins at the worst
+harmonic by 1.7x. Isolated, per 2048-trial chunk:
+
+| h | 1 | 7 | 16 | 30 | 41 | 59 | 60 |
+|---|---|---|---|---|---|---|---|
+| per-trial (µs) | 13.6 | 14.4 | 14.1 | 14.4 | 14.5 | 14.8 | 14.4 |
+| trials-axis, V=16 | 6.7 | 7.4 | 7.2 | 7.4 | 8.3 | 8.7 | 7.9 |
+| speed-up | 2.03x | 1.95x | 1.96x | 1.95x | 1.74x | 1.70x | 1.82x |
+
+**`V = 16`, and both benchmarks agree for once.** Isolated `V = 8/16/32/64` gives
+121/99/107/157 µs; in situ the interp share is 28.5/25.4/30.7% for `V = 8/16/32`.
+Below 16 there are too few lanes to hide FMA latency; above it `Δ` and the table
+footprint (0.65/1.5/3.5/9.3 MB over 60 harmonics) run away. `V` is a **`const`,
+not a plan field**, because the accumulators are an `NTuple{V}` and a runtime `V`
+stops the `ntuple`s unrolling — the same trap `_BC_BATCH` documents.
+
+**A closure cost 2000x.** With the `ntuple` bodies written inline they captured
+`o`, a local assigned inside the loop, and Julia boxed it: 24 ms against 12 µs.
+They are top-level `@inline` helpers taking everything as arguments. If this
+kernel ever reads as inexplicably slow, look there before anywhere else.
+
+**Bit-exact chunk invariance survives, and is now actually tested for it.**
+Groups are anchored to the **global** trial index, so which group a trial belongs
+to — and hence its exact arithmetic — cannot depend on where chunk boundaries
+fall. A chunk's first and last groups may hang off either end; they are computed
+*in full* and masked on store, rather than falling back to a second kernel that
+would sum in a different order. That is why the plane buffers are widened to the
+group range and zero-filled outside the file. The **range guard stays on the true
+trial range**, so where a harmonic gives up (off the end of the amplitudes, or
+past Nyquist) is unchanged — widening that guard would have silently dropped a
+whole harmonic for a chunk at the top of the band. The invariance pin now runs at
+chunk sizes 128/100/37/51 and asserts that three of them really do straddle
+groups; `worst == 0.0` still holds.
+
+**Measured in situ**, interleaved, PM0063 at 0.1–33.3 Hz:
+
+| | interp (s) | interp share | interp vs old |
+|---|---|---|---|
+| `-t 1` before | 4.93 | 34.8% | 1.00 |
+| `-t 1` after | 3.02 | 25.5% | **0.64** |
+| `-t 4` before | 8.26 | 28.9% | 1.00 |
+| `-t 4` after | 5.41 | 20.6% | **0.64** |
+
+Identical at both thread counts, so the table growing 395 KB → 1.45 MB
+(shared read-only across threads) costs nothing at 4. Wall clock resolved this
+one without help: `-t 1` 13.89 → 11.64 s, `-t 4` 7.19 → 6.64 s.
+**~1.14x end to end.** 460/460 tests, crossval unchanged, and the `.cohout` is
+**byte-identical** — the ~5e-16 of resummation moved no reported S/N.
+
+**This reopens `Float32` weights.** The 2026-08-16 verdict (1.64x *slower*) rested
+entirely on the per-trial cross-lane reduce, which no longer exists; and `Float32`
+would now halve a table that has grown 3.7x. Untested — see §3.1's next-steps.
 
 #### Retirements (2026-08-16)
 

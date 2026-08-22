@@ -224,20 +224,34 @@ if isfile(EXAMPLE_FFT)
         nbig = 384
         wb = CoherentSearch.Workspace(params, nbig)
         CoherentSearch.fill_chunk_profiles!(wb, dplans, ft, params, r_lo, lodr, nbig; t0=0)
-        nsm = 128
-        ws2 = CoherentSearch.Workspace(params, nsm)
+        # Chunk sizes deliberately spanning both cases: multiples of
+        # `DIRECT_GROUP_V` (so the trials-axis groups tile each chunk exactly) and
+        # NON-multiples (so both end groups hang off the chunk and are computed in
+        # full, then masked on store).  The second case is the one the group
+        # kernel is built to survive: if groups were anchored to the chunk rather
+        # than to the global trial index, or if partial groups fell back to a
+        # different kernel, these would differ in the last bits and the pin below
+        # would have to be loosened to ~1e-16.
+        V = CoherentSearch.DIRECT_GROUP_V
         worst = 0.0
-        for c in 0:2
-            t0 = c * nsm
-            CoherentSearch.fill_chunk_profiles!(ws2, dplans, ft, params, r_lo + t0 * lodr,
-                                                lodr, nsm; t0=t0)
-            for h in (1, 5, 32), j in 1:nsm
-                a = ws2.ftprofs[h + 1, j]
-                b = wb.ftprofs[h + 1, t0 + j]
-                worst = max(worst, abs(a - b) / abs(b))
+        misaligned = 0
+        for nsm in (128, 100, 37, 51)
+            nsm % V == 0 || (misaligned += 1)
+            ws2 = CoherentSearch.Workspace(params, nsm)
+            t0 = 0
+            while t0 + nsm <= nbig
+                CoherentSearch.fill_chunk_profiles!(ws2, dplans, ft, params,
+                                                    r_lo + t0 * lodr, lodr, nsm; t0=t0)
+                for h in (1, 5, 32), j in 1:nsm
+                    a = ws2.ftprofs[h + 1, j]
+                    b = wb.ftprofs[h + 1, t0 + j]
+                    worst = max(worst, abs(a - b) / abs(b))
+                end
+                t0 += nsm
             end
         end
-        @info "direct interpolation chunk invariance" worst
+        @info "direct interpolation chunk invariance" worst V misaligned
+        @test misaligned == 3     # the sizes above really do straddle groups
         @test worst == 0.0        # identical arithmetic, not merely close
     end
 
