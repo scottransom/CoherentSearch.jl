@@ -81,7 +81,15 @@ function main()
     # suggests.
     fsp = Float64(meta["boxcar_fsp"]); maxfrac = Float64(meta["boxcar_maxfrac"])
     metric_ref = read_f64(joinpath(outdir, "metric_boxcar_ref.bin"))
-    metric_jl = snr_metrics(profs_ref; boxcar_fsp=fsp, boxcar_maxfrac=maxfrac)
+    # `sigma_center=:median` asks for the Python-identical σ̂ (MAD about the sample
+    # median).  The Julia default is `:zero` — folding about the exact zero the
+    # DC-held-at-zero construction guarantees, which is faster and has one fewer
+    # estimated parameter, but is a deliberate divergence from upstream.  Pinning
+    # here with `:median` keeps this check at 1e-9 on everything else the metric
+    # does (the width bank, the per-profile median baseline, the scan arithmetic)
+    # instead of loosening the tolerance to ~1e-2 to swallow that one difference.
+    metric_jl = snr_metrics(profs_ref; boxcar_fsp=fsp, boxcar_maxfrac=maxfrac,
+                            sigma_center=:median)
     merr = maximum(abs.(metric_jl .- metric_ref))
     mrel = merr / maximum(abs.(metric_ref))
     @printf("[metric]  snr(:boxcar) max|Δ| = %.3e   rel = %.3e   (n=%d)\n",

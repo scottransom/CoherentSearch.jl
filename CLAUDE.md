@@ -103,8 +103,9 @@ julia --project=. bin/coherent_search.jl --verbose ... FILE.fft
 julia --project=. bin/coherent_search.jl --precision f32 ... FILE.fft
 
 # Cross-validation against the Python oracle.  Needs an interpreter that can
-# `import coherent_search`: /home/sransom/python_venvs/pixiPSR/.pixi/envs/default/bin/python
-# (override with $COHERENT_PYTHON).  Default test data is the sibling repo's
+# `import coherent_search`.  `DEFAULT_PY` in the script is the WORKSTATION's
+# (/data1/environments/pixiPSR/...); on the laptop set
+#   COHERENT_PYTHON=/home/sransom/python_venvs/pixiPSR/.pixi/envs/default/bin/python  Default test data is the sibling repo's
 # examples/harmonics_hi.fft — a 10.0123456789123 Hz fake pulsar, T=1000 s
 # (override with $COHERENT_FFT).  Both paths are machine-specific; re-point them
 # on a new host.
@@ -517,12 +518,28 @@ re-deriving them.
     (0.56–1.03x — it is a ~15.8 GB/s L3 wall, not a code defect); and a cheap
     upper bound to skip profiles outright (after ladder pruning the bank is all
     narrow, and the tightest cheap bound sits at 5.9 against `medcut = 4.0`).
-  - **Open, needs a call:** fixing the MAD's location at the structural zero
-    (`1.4826 × median(|x|)`, one quickselect instead of two) is ~1% end-to-end
-    *and* statistically better — DC is held at 0, so the centre is known, and the
-    sample median measures within ±0.03σ of it. It was not landed because it
-    changes the un-subsampled branch, which is what `snr_metrics` — and hence the
-    Python oracle pin at 7.0e-17 — uses. See `Summary_and_Future_Work.md` §3.1.
+- **Done (2026-08-22, follow-up): σ̂ folds about the structural zero — another
+  12.2% off the metric, 1.04x end-to-end.** DC is held at zero, so every profile's
+  bin mean is *exactly* 0 and the pooled distribution is symmetric about it;
+  `1.4826 × median(|x|)` is then the same scale estimator with the location known
+  rather than estimated. **One `_median!` instead of two** (σ̂ 245 → 149 µs per
+  chunk isolated), and statistically the better of the pair. Measured
+  interleaved over three rounds, metric share 32.83% → 30.04% of accounted time.
+  Candidates barely move (13.27 → 13.27, 7.76 → 7.76, 7.22 → 7.21).
+  - **This is a deliberate divergence from the Python oracle, and it is named,
+    not hidden.** `_block_sigma(...; center = :median)` still computes the classic
+    MAD-about-the-sample-median that upstream `snr_metric` does, `snr_metrics`
+    forwards it as `sigma_center`, and `crossval/crossval_accuracy.jl` passes
+    `:median` — so the metric pin stays at **1.365e-16** and still covers the
+    width bank, the per-profile median baseline and the scan arithmetic. Loosening
+    that tolerance to ~1e-2 to swallow the difference would have been the wrong
+    trade: it would hide a real bug in any of those three.
+  - `test/test_search.jl` pins `:zero` against `:median` (≤2% at every fold depth,
+    against σ̂'s own ~1% sampling error) *and* pins the premise — that the pooled
+    median really sits at zero — because if that ever stopped holding, `:zero`
+    would be silently biased and every reported S/N with it.
+  - **Cumulative for the day: metric share 36.0% → 30.0%, i.e. 23.7% off the
+    metric and ~1.09x end-to-end at `-t 1`.**
 - **In-situ phase timers are now permanent** (`phase_reset!` / `phase_times`,
   `PHASE_NAMES`; ~0.03% of runtime, one `time_ns` pair per phase per chunk).
   `bench/precision_ab.jl` prints them alongside a wall-clock A/B. Use them
@@ -569,9 +586,10 @@ re-deriving them.
   the interp penalty. `bench/profile_search.jl` still defaults to 5–30 Hz; pass
   `FILE.fft 33.3333 0.1` to match the riptide bench config.
 - **Where the single-thread time is now** (`:f64`, PM0063, 0.1–33.3 Hz, `-t 1`,
-  after the 2026-08-22 metric work): interp 33%, boxcar metric 33% (decim-metric
-  + gate+metric + block-sigma), decim-brfft 20%, base brfft 12%. **The metric and
-  the interpolation are now level**, where the metric used to be 47%.
+  after the 2026-08-22 metric work): interp ~34%, boxcar metric **30%**
+  (decim-metric + gate+metric + block-sigma), decim-brfft ~21%, base brfft ~12%.
+  **Interpolation is now the largest single phase**, where the metric was 47%
+  that morning.
   For `interp`, the identified structural cost is the per-trial horizontal
   reduce, and the way out is vectorising across *trials* (as the boxcar gate did
   for 2.77–4.05x), not a wider `m`-axis; see §3.1 for the periodicity that makes

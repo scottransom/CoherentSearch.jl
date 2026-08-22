@@ -487,7 +487,8 @@ The subsample indices depend only on `(nbins, n)`, and `M` enters only through t
 ratio the caller forms (`excess/σ`), so the unnormalised `brfft` and normalised
 `irfft` paths yield the identical scale-free S/N.
 """
-function _block_sigma(M::AbstractMatrix{T}, nbins::Int, n::Int, buf::Vector{T}) where {T<:AbstractFloat}
+function _block_sigma(M::AbstractMatrix{T}, nbins::Int, n::Int, buf::Vector{T};
+                      center::Symbol=:zero) where {T<:AbstractFloat}
     # The linear indexing below is only the intended (i, j) if the profile axis is
     # exactly `M`'s first dimension — cheap to check once per block, and a silent
     # wrong σ̂ (hence a silently wrong metric everywhere) if it ever stops holding.
@@ -535,9 +536,31 @@ function _block_sigma(M::AbstractMatrix{T}, nbins::Int, n::Int, buf::Vector{T}) 
             end
         end
     end
-    med = _median!(buf, ns)                       # destroys buf order (values preserved)
-    @inbounds for t in 1:ns
-        buf[t] = abs(buf[t] - med)                # MAD over the same multiset (order irrelevant)
+    # `center = :zero` (production) folds about the location the construction
+    # already guarantees: the profile spectrum's DC bin is held at zero, so every
+    # profile's bin mean is *exactly* 0 and the pooled distribution is symmetric
+    # about it.  `1.4826 × median(|x|)` is then the same scale estimator with the
+    # location known rather than estimated — one `_median!` instead of two, and
+    # statistically the better of the pair (it spends no degree of freedom on a
+    # location it has).  Measured on real chunks, the sample median sits within
+    # ±0.03σ of zero at every fold depth and σ̂ moves by ≤0.6%, against its own
+    # ~1% sampling error.
+    #
+    # `center = :median` is the classic MAD-about-the-sample-median, which is what
+    # the Python oracle computes.  It exists for `crossval/crossval_accuracy.jl`,
+    # so that the metric pin stays at 1e-9 on everything it can still check (the
+    # width bank, the per-profile median baseline, the scan arithmetic) instead of
+    # being loosened to hide this one deliberate difference.  Nothing else calls
+    # it; `test/test_search.jl` pins the two against each other.
+    if center === :median
+        med = _median!(buf, ns)                   # destroys buf order (values preserved)
+        @inbounds for t in 1:ns
+            buf[t] = abs(buf[t] - med)            # MAD over the same multiset
+        end
+    else
+        @inbounds for t in 1:ns
+            buf[t] = abs(buf[t])
+        end
     end
     return T(1.4826) * _median!(buf, ns)
 end
@@ -868,7 +891,7 @@ end
 end
 
 """
-    snr_metrics(profs; boxcar_fsp=1.5, boxcar_maxfrac=0.3) -> Vector{Float64}
+    snr_metrics(profs; boxcar_fsp=1.5, boxcar_maxfrac=0.3, sigma_center=:zero) -> Vector{Float64}
 
 Peak boxcar matched-filter detection metric for every profile (column) of the
 `(nbins × L)` real profile matrix `profs`.  Public port of `snr_metric` from the
@@ -876,12 +899,19 @@ Python `coherent_search` (note the profiles are columns here, rows in Python),
 and the function `crossval/crossval_accuracy.jl` pins to that oracle.
 
 This is the *reference* implementation: readable, allocating, and — by default —
-exact, in that the pooled block `σ̂` is a full MAD over every bin of every
-profile, which is what Python does.  The production search instead subsamples it
-to `_BOXCAR_SIGMA_SAMPLES` bins (see [`_block_sigma`](@ref)), a deliberate
-approximation the hot loop can afford and the oracle comparison cannot;
-`sigma_samples` exists so [`block_metrics`](@ref) can ask for that same estimator
-when it is standing in as the optimised path's equivalence partner.
+pooling `σ̂` over every bin of every profile.  The production search instead
+subsamples to `_BOXCAR_SIGMA_SAMPLES` bins (see [`_block_sigma`](@ref)), a
+deliberate approximation the hot loop can afford and the oracle comparison
+cannot; `sigma_samples` exists so [`block_metrics`](@ref) can ask for that same
+estimator when it is standing in as the optimised path's equivalence partner.
+
+`sigma_center` is the one place this port *deliberately* differs from Python.
+Both default to `:zero` here and in the search — folding `σ̂` about the exact
+zero the DC-held-at-zero construction guarantees, rather than about a sample
+median estimating it — which is faster and statistically better, but is not what
+`snr_metric` does upstream.  Pass `:median` for the Python-identical estimator;
+`crossval/crossval_accuracy.jl` does exactly that, so its 1e-9 pin still covers
+everything else in the metric.
 
 The metric is scale-free — a ratio of two linear-in-amplitude quantities — so it
 does not care whether `profs` came from a normalised `irfft` or the unnormalised
@@ -890,6 +920,7 @@ does not care whether `profs` came from a normalised `irfft` or the unnormalised
 function snr_metrics(profs::AbstractMatrix{<:Real};
                      boxcar_fsp::Real=1.5, boxcar_maxfrac::Real=0.3,
                      sigma_samples::Integer=typemax(Int),
+                     sigma_center::Symbol=:zero,
                      widths::Union{Nothing,AbstractVector{<:Integer}}=nothing)
     nbins, L = size(profs)
     medbuf = Vector{Float64}(undef, nbins)
@@ -901,7 +932,7 @@ function snr_metrics(profs::AbstractMatrix{<:Real};
         boxcar_widths(nbins; fsp=boxcar_fsp, maxfrac=boxcar_maxfrac) : collect(Int, widths)
     psum = Vector{Float64}(undef, nbins + widths[end] + 1)
     sigbuf = Vector{Float64}(undef, min(nbins * L, sigma_samples))
-    sigma = _block_sigma(P, nbins, L, sigbuf)             # one robust σ for the whole set
+    sigma = _block_sigma(P, nbins, L, sigbuf; center=sigma_center)   # one robust σ for the set
     invsigma = sigma > 0 ? 1.0 / sigma : 0.0
     return [_profile_boxcar(P, j, medbuf, psum, widths, nbins, invsigma) for j in 1:L]
 end

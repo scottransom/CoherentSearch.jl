@@ -1079,18 +1079,48 @@ percent level needs to either use the exact σ̂ or model this term. Raising
 gather makes the *traffic* affordable now, but the two quickselects are `O(cap)`:
 16384 samples would take rms to ~0.8% and give back most of this section's win.
 
-**Not done, and it needs a decision: fix the MAD's location at the structural
-zero.** `_block_sigma` spends two quickselects — one to find the median, one for
-the MAD around it. But the location is *known*: DC is held at zero, so every
-profile's bin mean is exactly 0 and the pooled distribution is symmetric about
-it. `1.4826 × median(|x|)` is then the same estimator with one quickselect
-instead of two, and is *statistically better* (it does not spend a degree of
-freedom on a location it already knows). Measured: the sample median sits within
-**±0.03σ** of zero at every depth, and σ̂ moves by ≤0.6%. It would take roughly
-half of what is left of σ̂, ~1% end to end. **It was not landed because it changes
-the un-subsampled branch too, and that is the branch `snr_metrics` uses — it
-would break the Python oracle pin at 7.0e-17.** Landing it means either
-re-pinning the oracle or teaching the Python side the same estimator.
+#### Follow-up, same day: σ̂ folds about the structural zero — another 12.2%
+
+`_block_sigma` was spending two quickselects: one to find the median, one for the
+MAD about it. But the location is *known*. DC is held at zero, so every profile's
+bin mean is exactly 0 and the pooled distribution is symmetric about it, and
+`1.4826 × median(|x|)` is the same scale estimator with the location supplied
+rather than estimated — **one `_median!` instead of two**, and statistically the
+better of the pair, since it spends no degree of freedom on a location it has.
+Measured, the sample median sits within **±0.03σ** of zero at every fold depth
+and σ̂ moves by ≤0.6%, against its own ~1% sampling error.
+
+Isolated, σ̂ goes 245 → 149 µs per chunk. In situ, over three interleaved rounds,
+the metric share of accounted time goes **32.83% → 30.04%** — i.e. **12.2% off
+the metric, ~1.04x end to end**. Candidates barely move: 13.27 → 13.27,
+7.76 → 7.76, 7.22 → 7.21.
+
+**Cumulative for the day: metric share 36.0% → 30.0%, 23.7% off the metric,
+~1.09x end to end at `-t 1`.** Interpolation (~34%) is now the largest single
+phase.
+
+**The divergence from the oracle is named, not swallowed.** This *does* change the
+un-subsampled branch, which is the one `snr_metrics` uses and the one
+`crossval/crossval_accuracy.jl` pins Python against — the reason it was held back
+until Scott took the call on 2026-08-22 ("push speed, accept a bit of divergence,
+we already know the algorithm is right from the earlier detailed tests"). Rather
+than loosen the crossval tolerance from 1e-9 to ~1e-2 to hide it, the estimator
+is selectable:
+
+- `_block_sigma(...; center = :median)` computes the classic MAD about the sample
+  median — exactly what upstream `snr_metric` does;
+- `snr_metrics` forwards it as `sigma_center`, defaulting to `:zero` like the
+  search;
+- `crossval_accuracy.jl` passes `:median`, so the metric pin **stays at
+  1.365e-16** and still covers the three separately fallible pieces it was written
+  for: the width bank, the per-profile median baseline, and the scan arithmetic.
+
+Loosening the tolerance instead would have let a real bug in any of those three
+hide under the 1e-2 that this one deliberate difference costs.
+`test/test_search.jl` pins `:zero` against `:median` at every fold depth, and
+pins the *premise* separately — that the pooled median really sits at zero —
+because if that ever stopped holding, `:zero` would be silently biased and every
+reported S/N with it.
 
 #### Retirements (2026-08-16)
 

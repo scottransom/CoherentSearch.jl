@@ -274,6 +274,40 @@ if isfile(EXAMPLE_FFT)
         @test all(a.metric == b.metric for (a, b) in zip(cg, ce))
     end
 
+    @testset "block sigma: :zero centring matches the classic MAD" begin
+        # `_block_sigma` folds about the exact zero the DC-held-at-zero
+        # construction guarantees (`center=:zero`, production) rather than about a
+        # sample median (`:median`, what Python computes and what
+        # `crossval/crossval_accuracy.jl` pins to).  The two must agree to well
+        # inside σ̂'s own ~1% sampling error.  The premise is checked directly too
+        # — if the pooled median ever stopped sitting at zero, `:zero` would be
+        # silently biased and every reported S/N with it.
+        CS = CoherentSearch
+        params = SearchParams(nharms=60, m=32)
+        Nprof = 512
+        lodr = params.hidr / params.nharms
+        ws = CS.Workspace(params, Nprof)
+        for rstart in (10010.0, 20010.0, 40010.0)
+            dplans = CS.build_direct_plans(params, rstart)
+            CS.fill_chunk_profiles!(ws, dplans, ft, params, rstart, lodr, Nprof; t0=0)
+            # `fill_chunk_profiles!` does the base fold only; the decimated
+            # stacks are transformed in `decim_pass!`, so do that here.
+            for db in ws.decims
+                db.dprofs .= db.brfftplan * db.src   # `*` avoids a LinearAlgebra test dep
+            end
+            folds = vcat([(2params.nharms, ws.profs, ws.bcsig)],
+                         [(2db.Hk, db.dprofs, db.bcsig) for db in ws.decims])
+            for (nb, P, buf) in folds
+                s0 = CS._block_sigma(P, nb, Nprof, buf)                    # :zero
+                sm = CS._block_sigma(P, nb, Nprof, buf; center=:median)    # classic MAD
+                @test s0 > 0 && isapprox(s0, sm; rtol=0.02)
+                # The location `:zero` assumes, measured on the same profiles.
+                allbins = vec(copy(P))
+                @test abs(CS._median!(allbins, length(allbins))) < 0.1 * sm
+            end
+        end
+    end
+
     @testset "batched boxcar gate matches the scalar gate" begin
         # Directly: the cross-profile SIMD gate against the per-column scalar
         # one it replaces, on real profiles.  Float32 tiles make this close, not
