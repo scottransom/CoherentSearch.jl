@@ -550,9 +550,11 @@ re-deriving them.
   - **Four measured dead ends — do not re-guess them:** fusing the transpose away
     (a wash at `B=32`, worse at 64); full fusion of prefix + widths (1.33x
     *slower*, AVX2 register pressure); blocking or reordering the transpose
-    (0.56–1.03x — it is a ~15.8 GB/s L3 wall, not a code defect); and a cheap
-    upper bound to skip profiles outright (after ladder pruning the bank is all
-    narrow, and the tightest cheap bound sits at 5.9 against `medcut = 4.0`).
+    (0.56–1.03x — **but the "~15.8 GB/s L3 wall" that justified this verdict does
+    NOT hold on the workstation; see the transpose entry below, where it is the
+    largest single item in the whole search**); and a cheap upper bound to skip
+    profiles outright (after ladder pruning the bank is all narrow, and the
+    tightest cheap bound sits at 5.9 against `medcut = 4.0`).
 - **Done (2026-08-22, follow-up): σ̂ folds about the structural zero — another
   12.2% off the metric, 1.04x end-to-end.** DC is held at zero, so every profile's
   bin mean is *exactly* 0 and the pooled distribution is symmetric about it;
@@ -613,6 +615,42 @@ re-deriving them.
     395 KB → 1.45 MB (shared read-only) costs nothing threaded at 4.
   - 460/460 tests, crossval unchanged (3.8e-16 / 2.1e-16 / 1.4e-16), `.cohout`
     byte-identical — the ~5e-16 of resummation moved no reported S/N.
+- **The metric's own split, measured on the workstation 2026-08-22 — and the
+  transpose is 69% of it.** `bench/metric_bench.jl`, PM0063, nharms=60,
+  Nprof=2048, `-t 1`, µs per chunk summed over `k = 1…6`: σ̂ **181**, transpose
+  **1516**, width scan **337**, gate 1908, metric 2017, of a **2198 µs** total;
+  the exact rescan fires on 0.05–1.76% of trials. As shares: transpose **69.0%**,
+  width scan 15.3%, σ̂ 8.2%. Since the metric is ~45% of runtime here, **the
+  transpose alone is ~31% of the whole search** — the largest single item, larger
+  than any FFT phase.
+  - **It is NOT at a bandwidth wall, and the recorded claim that it is was wrong
+    (or laptop-specific).** At `k = 1` it moves 1.97 MB in + 0.98 MB out in
+    626.6 µs = **4.7 GB/s**, and the same 4.7–4.8 GB/s at *every* `k`. Measured
+    achievable single-core copy on this host: **21.1 GB/s at a 2 MB footprint**,
+    10.1 GB/s at 32 MB. So it runs at ~22% of what the machine gives at its own
+    footprint, and the size-independence of that figure is the signature of an
+    *access-pattern* limit, not a bandwidth one.
+  - **The mechanism is write-scatter.** Reading `profs[:, j]` is contiguous
+    (960 B per profile), but writing `tile[(i-1)*B + b]` for a fixed profile `b`
+    walks stride `B*4 = 512 B`, so each of the 120 writes lands in a different
+    cache line and dirties it for one 4-byte word.
+  - **The unmeasured idea worth trying first: have the `brfft` write the tile
+    layout directly.** Dead end (2) in the list above transposed the *whole* array
+    including the transform axis (`(Nprof, Hₖ+1)` along dim 2) and was 2–3x
+    slower — that is a different experiment. Handing `mul!` a strided *output
+    view* keeps the transform along dim 1 and changes only where results land,
+    which would delete the transpose outright if FFTW can scatter in its final
+    pass.
+  - **`--precision f32` halves the read side** and is already measured to help
+    exactly these phases (`gate+metric` −8.1%, `decim-metric` −5.4% at `-t 1`).
+  - **Kadane's algorithm is NOT the next move**, despite being the obvious idea.
+    It would replace the width×phase scan, which is **15.3%** of the metric, and
+    after `ladder_boxcar_widths` the bank is only `W = 4–5` — so its ceiling is
+    ~4x on 15.3%, i.e. ~5% of runtime, before any of the tail-calibration cost.
+    Worse, **plain Kadane maximises the SUM, and our statistic is `sum/(σ√w)`** —
+    a different objective, needing a max-density/normalised-segment algorithm
+    whose serial dependency chain vectorises *worse* than the present scan, which
+    is already SIMD across `_BC_BATCH = 128` profiles.
 - **In-situ phase timers are now permanent** (`phase_reset!` / `phase_times`,
   `PHASE_NAMES`; ~0.03% of runtime, one `time_ns` pair per phase per chunk).
   `bench/precision_ab.jl` prints them alongside a wall-clock A/B. Use them
