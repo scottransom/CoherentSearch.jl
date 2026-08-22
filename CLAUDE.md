@@ -137,10 +137,13 @@ pulsar at S/N 12.97 vs riptide's 11.80, plus two candidates it does not report.
 riptide's two extra entries are the `f/2` and `2f` of the pulsar, which it does
 not filter and we collapse.
 
-That table is the **laptop**. The same command on the 20-core workstation
-(`fitzroy`) gives rseek 20.4 s, ours `-t 1` 32.3 s, `-t 20` 4.6 s — i.e. **1.59x
-slower**, not 1.24x. Quote the machine with the ratio; the two hosts disagree by
-more than any optimisation discussed below.
+That table is the **laptop**, and it is out of date on our side. The same
+command on the 20-core workstation (`fitzroy`) gave rseek 20.4 s, ours `-t 1`
+32.3 s, `-t 20` 4.6 s — **1.59x slower** — and after the 2026-08-22 work it gives
+**rseek 19.43 s, ours `-t 1` 20.89 s, i.e. 1.07x slower**, our side having come
+down 32.3 → 20.9 s (1.55x). Quote the machine *and* the date with the ratio; the
+two hosts disagree by more than any single optimisation below, and the code has
+moved 1.55x under a table that still reads 1.24x.
 
 - **Start-up is NOT what the comparison measures**, and the harness proves it
   per run: rseek 1.41 s start-up + 22.93 s searching, ours 1.48 s + 28.78 s, so
@@ -207,11 +210,14 @@ more than any optimisation discussed below.
   and at `bins_min = 120` riptide's boxcar bank finally matches ours (9 widths,
   30% duty). Work agrees to 4–8%. Measured 2026-08-16, workstation, `-t 1`,
   interleaved: **rseek 18.35/18.33 s, ours 17.86/16.45 s — we are ~1.05–1.11x
-  FASTER at equal work.** The `bench` deficit is the ladder, not the code.
-  **But rseek wins the pulsar in that config: S/N 12.6 (`w=13`, ducy 10.3%) vs
-  our 11.89 at the same depth.** Our 12.97 comes from the `k=6` fold, so
-  "we detect more strongly" is a statement about the *ladder*, not about the
-  per-fold detector.
+  FASTER at equal work.** Re-measured 2026-08-22 after that day's work:
+  **rseek 17.51 s, ours 15.95 s — 1.10x faster on wall clock, and 1.13x on pure
+  compute (14.50 s against its 16.32 s) once each side's start-up is out.**
+  The `bench` deficit is the ladder, not the code.
+  **But rseek still wins the pulsar in that config: S/N 12.6 (`w=13`, ducy 10.3%)
+  vs our 11.89 — 12.10 as of 2026-08-22 — at the same depth.** Our 13.27 comes
+  from the decimated fold, so "we detect more strongly" is a statement about the
+  *ladder*, not about the per-fold detector.
 - **Our S/N and riptide's are the SAME statistic, up to `√(1−duty)` — and that
   factor is our bug, not a difference of definition (2026-08-16).** Both are a
   boxcar matched filter maximised over phase on a folded profile. riptide
@@ -280,10 +286,27 @@ re-deriving them.
   fixes `nthreads` at process start — and each worker times only the *warm
   in-process* `search`. **Excluding start-up is the point:** on the whole-process
   wall clock the same run scales 6.7x at `-t 20`, and 9.9x once the ~1.4 s fixed
-  cost is out. Measured on master, 20-core workstation, PM0063 at the riptide
-  bench config: 1/2/4/8/16/20 threads → 31.9/18.3/9.4/5.4/3.3/3.2 s, i.e. **9.9x
-  at `-t 20` (49% efficiency), Amdahl `s = 0.059`.** CPU-seconds inflate 63%
-  over the same span, which is the memory-stall term, not a code defect.
+  cost is out. Measured on the 20-core workstation, PM0063 at the riptide bench
+  config, 1/2/4/8/16/20 threads:
+
+  | | 1 | 2 | 4 | 8 | 16 | 20 | best | Amdahl `s` |
+  |---|---|---|---|---|---|---|---|---|
+  | before 2026-08-22 | 31.9 | 18.3 | 9.4 | 5.4 | 3.3 | 3.2 | 9.9x @20 | 0.059 |
+  | after the laptop pass | 22.7 | 12.8 | 6.6 | 4.0 | 2.5 | 2.5 | **9.0x @16** | 0.063 |
+
+  **The laptop pass is worth 1.40x at `-t 1` here** (better than the ~1.24x it
+  measured on the laptop) **and 1.26x at `-t 20`** — the win shrinks with thread
+  count because it removed work that was parallel. Scaling itself barely moved
+  (`s` 0.059 → 0.063 against a faster serial baseline), so **the two scratch
+  growths did NOT cost anything at 20 threads**: the boxcar gate's tile doubling
+  (`_BC_BATCH` 32 → 64, since 64 → 128) and the interpolator's weight table
+  (395 KB → 1.45 MB, shared read-only). CPU-seconds inflate 62% over the span,
+  the same memory-stall term as before, not a code defect.
+  - **`-t 20` is no longer faster than `-t 16`** (2.54 vs 2.52 s). This is a
+    dual-socket box (2×10 cores, 14 MB L3 *per socket*); past 16 threads the
+    marginal core is buying less than the cross-socket traffic costs.
+  - The desktop carries ~2 cores of its own load (Chrome, Zoom), which is worth
+    remembering before reading too much into the top of the curve.
 - **Done (2026-07):** quickselect median in `_profile_snr` (was 41% of runtime →
   7.5%) and a type-stable `Workspace{S,B,D}` (killed hot-loop dynamic `mul!`
   dispatch) — together ~1.6× warm single-thread, results unchanged. See §2 of
@@ -478,11 +501,23 @@ re-deriving them.
   (the section comment said ~20%), and `_block_sigma` is **26% of all metric
   work** — invisible because it is billed to `block-sigma` at `k=1` but hidden
   inside `decim-metric` for `k=2…6`. Two changes landed:
-  - **`_BC_BATCH` 32 → 64**, worth 10.8% of the metric and **byte-identical**
-    (the per-profile arithmetic does not depend on `B`). Interleaved over all six
-    depths, `B = 32/48/64/96/128` → 692/628/575/572/577 µs per chunk; 64 is the
-    knee. **It disproves the L1 intuition**: at `B=64` the tile+prefix pair is
-    63 KB, overflowing the 32 KB L1 that `B=32` nearly fits, and wins anyway.
+  - **`_BC_BATCH` 32 → 64 → 128** (64 on the laptop, raised to 128 on
+    2026-08-22 after the workstation sweep), worth 10.8% of the metric there and
+    another 6.9% here, **byte-identical** either way (the per-profile arithmetic
+    does not depend on `B`). Laptop, interleaved over all six depths:
+    `B = 32/48/64/96/128` → 692/628/575/572/577 µs per chunk, so 64 is its knee
+    and 128 is 0.3% behind. Workstation, in situ metric share:
+    48.96/48.55/48.68/48.03/**45.52**% for the same five, plus 47.67/45.42% at
+    192/256 — everything from 32 to 96 is one flat plateau and only 128 moves it.
+    So 128 costs the laptop ~0.3% and buys the workstation ~4% end to end.
+    **It disproves the L1 intuition twice over**: at `B=64` the tile+prefix pair is
+    63 KB, overflowing the 32 KB L1 that `B=32` nearly fits, and wins anyway — and
+    at `B=128` it is 126 KB and wins again.
+    - **This sweep is the cleanest example of why to read shares, not seconds.**
+      The absolute times across `B = 32…96` differ by 6% while the *share* is
+      flat to 0.5%: that 6% is whole-machine drift between invocations, on a host
+      whose within-run rep-to-rep scatter is only ±1%. Reading the absolute
+      column would have produced a confident ranking of pure noise.
   - **`_block_sigma` subsamples whole profiles**, evenly spaced, instead of a flat
     stride through the linear index — 2.7 MB → 0.4 MB of gather per chunk, worth
     3.2%. It is also a *better* sample: the flat stride hit only `nbins/s`
@@ -591,24 +626,67 @@ re-deriving them.
   one process — which removes the precompile confound that once produced a
   confidently wrong answer, and makes `--precision f32` a flag rather than a
   checkout.
-- **`Float32` profiles: do not merge, at any thread count (2026-08-16).** The
-  2026-08-15 verdict below ("a thread-count-dependent win, crossover ~4 threads")
-  was measured *over the gather* and no longer holds. With the gather removed,
-  `:f32` vs `:f64` is **0.82x at `-t 1`, 0.92x at `-t 4`, 0.98x at `-t 8`, 1.01x
-  at `-t 16`.** `Float32` never made the search faster — it relieved a bandwidth
-  problem, and that problem has been fixed at its source, so the threaded win
-  went with it. The deployment-model question (§3.1) therefore no longer decides
-  anything.
-- **Historical: fully-`Float32` interpolation was 1.64x SLOWER (2026-08-16) —
-  and that verdict is now VOID, because its mechanism was removed on 2026-08-22.**
-  Narrowing `DirectPlan`'s `W`/`A` and the accumulators cost 1533 → 2482 µs per
-  chunk, and the diagnosis was the *per-trial horizontal reduce*: at `m = 16` a
-  `Float32` sum is exactly one 16-lane vector — one FMA, no ILP, then a
-  **four**-stage cross-lane reduce — where `Float64` got two independent 8-lane
-  accumulators and a three-stage reduce. The trials-axis kernel has **no
-  cross-lane reduce at all**, so that mechanism cannot apply; and `Float32` would
-  now also halve a weight table that grew 395 KB → 1.45 MB. **Re-measure before
-  quoting the 1.64x.** `build_direct_plans(WT, …)` still takes the type.
+- **`Float32` profiles (`--precision f32`): the "do not merge at any thread count"
+  verdict is DEAD, and the crossover is back (2026-08-22, workstation).** Measured
+  `:f32` vs `:f64` in one process at the riptide bench config: **0.965x at `-t 1`,
+  1.030x at `-t 4`, 1.173x at `-t 8`, 1.167x at `-t 16`, 1.337x at `-t 20`** —
+  against the 2026-08-16 figures of 0.82/0.92/0.98/1.01 for the same four points.
+  Every point improved and the crossover sits between 1 and 4 threads.
+  - The mechanism is visible in the phase table and is exactly what was predicted:
+    the metric's bandwidth-bound half gets cheaper (`decim-metric` −5.4%,
+    `gate+metric` −8.1%, `zero-ftprofs` −62%, base `brfft` −18%) while
+    `decim-brfft` (+23%) and `interp` (+27%) get worse. At one thread the second
+    group wins; with 20 threads competing for L3 the first does.
+  - **`Float32` interpolation *weights* do not fix the `interp` penalty** — tried,
+    on the theory that it was a `ComplexF64`→`ComplexF32` store conversion. It is
+    still +31% with `Float32` weights, so that hypothesis is wrong and the cause
+    is unidentified. Combining the two is also *worse* than either alone at
+    `-t 1` (0.915x), because `B = 128` and the `Float32` weights had already taken
+    some of what `:f32` profiles was buying.
+  - **Still not the default**, because it loses at `-t 1` and the deployment model
+    that matters for real searches is one single-threaded process per DM (§3.1).
+    But `--precision f32` is now the right flag for a `-t 16`-and-up run, which it
+    was not on 2026-08-16.
+- **Done (2026-08-22, workstation): `Float32` interpolation weights are now the
+  DEFAULT, and the old "1.64x SLOWER" verdict was not merely void but backwards.**
+  That verdict blamed the per-trial cross-lane reduce; the trials-axis kernel
+  deleted it, so the mechanism went with it. Re-measured in situ on the machine
+  that produced it, each type at its own best `DIRECT_GROUP_V` — and the knee
+  *moves*, because `Float32` doubles the lanes per register and so halves the
+  accumulator count at fixed `V`:
+
+  | WT | V=8 | V=16 | V=32 | V=64 |
+  |---|---|---|---|---|
+  | `Float64` | 21.2% | **17.5%** | 18.1% | 29.8% |
+  | `Float32` | — | 15.5% | **13.3%** | 16.8% |
+
+  (interp share of accounted time, PM0063 0.1–33.3 Hz `-t 1`.) **24% off the
+  interp phase**, ~4% end to end, and it halves the 1.45 MB table. `V` is left a
+  single const at 32: the `Float64` path is now only the reference/pin path and
+  pays 3% of interp for it, which is not worth plumbing a per-type `Val`.
+  - **The accuracy cost is real, tiny, and end-to-end invisible.** Worst relative
+    error vs the exact `fourier_interp` goes 6.8e-11 → **2.0e-7** — five orders of
+    magnitude under the ~1.27% of signal power the `m=16` truncation already
+    discards and the ~6.5% the `hidr` grid costs at the top harmonic. The PM0063
+    `.cohout` down to threshold 6 (21 candidates) is **byte-identical** between
+    weight types, frequencies to 12 decimals included, at `m = 16, 20, 24, 32`.
+  - **`m` does NOT trade against this — they are different errors.** `m` sets the
+    *truncation* of the Eqn.-30 sum; the 2e-7 is *rounding* in the weights, and
+    raising `m` nudges it up, not down. What `Float32` does buy is a cheaper
+    kernel bin: **`m = 32` in `Float32` costs 3.44 s of interp against
+    `Float64`/`m = 16`'s 3.71 s**, so halving the truncation loss (1.27% → 0.63%,
+    a real ~0.3% of recovered S/N) is now available for *less* than today's
+    default cost. `m` stays 16 — 0.3% of S/N is not worth 3% of wall clock in a
+    blind search — but `--m 32` is the cheap option it was not before.
+  - **The pins do not move, and that is the `sigma_center` pattern again.**
+    2.0e-7 does not fit under the `worst < 1e-7` interpolator pin or
+    `PIN_TOL = 1e-8`; those are machine-precision statements about the *exact*
+    kernel, and loosening them to swallow a deliberate constant would let a real
+    tabulation bug hide with it. `chunk_metrics` gained a `weights` kwarg, the
+    three affected pins ask for `Float64` explicitly, and **two new pins cover the
+    shipped `Float32` path** at the ~1e-6 it achieves. 462 tests, up from 460.
+  - The trade is disclosed at runtime under `--verbose`, quoted against the two
+    errors that dominate it so it is read in proportion.
 - **Four plausible mechanisms for the decimated-transform regression, all
   measured, all wrong** — record them so they are not re-guessed: (1) *leading-dimension
   alignment* — `k=4` gives `Hₖ+1 = 16`, perfectly 64-byte aligned in `Float32`,
@@ -623,20 +701,27 @@ re-deriving them.
   0.1–8 Hz. Band choice changes the *mix* (how much exact-median rescan runs), not
   the interp penalty. `bench/profile_search.jl` still defaults to 5–30 Hz; pass
   `FILE.fft 33.3333 0.1` to match the riptide bench config.
-- **Where the single-thread time is now** (`:f64`, PM0063, 0.1–33.3 Hz, `-t 1`,
-  after the whole 2026-08-22 pass): boxcar metric ~33%, interp **~25%**,
-  decim-brfft ~24%, base brfft ~14%. Over that one day the metric went 47% → 33%
-  and the interpolation 34% → 25%; **`decim-brfft` is now the phase that has
-  never been looked at**, and it is close to the top. It reads `ftprofs` with
-  stride `k`, so each of the five decimated passes touches essentially the whole
-  2 MB array to use `1/k` of it — ~10 MB per chunk.
-  For `interp`, the identified structural cost is the per-trial horizontal
-  reduce, and the way out is vectorising across *trials* (as the boxcar gate did
-  for 2.77–4.05x), not a wider `m`-axis; see §3.1 for the periodicity that makes
-  a trial-ordered weight table possible and for the part that has not been
-  prototyped. `decim-brfft` reads `ftprofs` with stride `k`, so each of the five
-  decimated passes touches essentially the whole 2 MB array to use `1/k` of it —
-  ~10 MB per chunk, unexamined.
+- **Where the single-thread time is now — and the two machines DISAGREE about it,
+  so quote the host.** `:f64`, PM0063, 0.1–33.3 Hz, `-t 1`, phase share of
+  accounted time:
+
+  | | metric | interp | decim-brfft | base brfft |
+  |---|---|---|---|---|
+  | i7-10510U (laptop), after 2026-08-22 | ~33% | ~25% | ~24% | ~14% |
+  | Xeon Silver 4114 (fitzroy), same code | **48.8%** | 17.6% | 21.2% | 10.3% |
+  | fitzroy, after the workstation pass | **45.5%** | **13.8%** | 22.8% | 10.9% |
+
+  **The metric is half the runtime on the workstation and a third on the laptop**,
+  and the interpolation is the reverse. A knob tuned on one host is not
+  automatically right on the other — which is exactly how `_BC_BATCH` came out at
+  64 there and 128 here. Re-baseline before optimising, and say which machine.
+  - `decim-brfft` remains **the phase that has never been looked at**, and on
+    both hosts it is now second or third. It reads `ftprofs` with stride `k`, so
+    each of the five decimated passes touches essentially the whole 2 MB array to
+    use `1/k` of it — ~10 MB per chunk, unexamined.
+  - For `interp` the structural cost *was* the per-trial horizontal reduce; that
+    was fixed by vectorising across trials (a159706) and then again by
+    `Float32` weights, and at 13.8% it is no longer the place to look.
 - **Historical (2026-08-15), superseded by the two entries above but kept because
   the *shape* of the curve was real:** with the gather still present, `Float32`
   was 0.88x at `-t 1`, 1.00x at `-t 4`, 1.14x at `-t 16`, doing 13% more CPU work
