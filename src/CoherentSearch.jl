@@ -42,7 +42,8 @@ export DirectPlan, build_direct_plans, trial_grid_rational,
 include("directinterp.jl")
 
 # --- FFTW plan-wisdom persistence (faster planning / start-up) ---
-export wisdom_path, import_wisdom!, export_wisdom!, prime_wisdom
+export wisdom_path, import_wisdom!, export_wisdom!, prime_wisdom,
+       production_params
 include("wisdom.jl")
 
 # --- Per-candidate profile reconstruction (for plotting) ---

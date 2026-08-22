@@ -1,7 +1,7 @@
 using Test
 using FFTW: FFTW
 using CoherentSearch
-using CoherentSearch: output_path, plot_stem, main, _plans!, Workspace
+using CoherentSearch: output_path, plot_stem, main, _plans!, Workspace, parse_cmdline
 using Logging: with_logger, NullLogger
 
 # ---------------------------------------------------------------------------
@@ -147,6 +147,33 @@ end
     # And the wisdom it wrote is loadable, which is the whole point of writing it.
     @test import_wisdom!(path)
     rm(path; force = true)
+end
+
+@testset "prime_wisdom's default primes the plans a DEFAULT run actually builds" begin
+    # The bug this pins (found 2026-08-22): `prime_wisdom`'s default was
+    # `SearchParams()` — nharms=32, decimations=[1], i.e. ONE 64-bin transform —
+    # while the CLI defaults to nharms=60, --maxdecim 6, i.e. six transforms of
+    # 120/60/40/30/24/20 bins, five of them on strided views.  So the function
+    # documented as "run once per host" primed a transform the search never
+    # executes and none of the six it does.  The test above could not catch it
+    # because it passes `params` explicitly, which is exactly the case that worked.
+    a = parse_cmdline(["dummy.fft"])
+    cli = SearchParams(nharms = a["nharms"], m = a["m"], hidr = a["hidr"],
+                       threshold = a["threshold"],
+                       decimations = decimation_set(a["nharms"], a["maxdecim"]),
+                       precision = Symbol(a["precision"]))
+    prod = production_params()
+    @test prod.nharms == cli.nharms
+    @test prod.decimations == cli.decimations
+
+    # And the transform lengths really are the ones a Workspace builds: the base
+    # brfft is 2*nharms bins, plus one per decimation factor at 2*fld(nharms,k).
+    want = sort(unique(vcat(2 * cli.nharms,
+                            [2 * fld(cli.nharms, k) for k in cli.decimations if k > 1])))
+    ws = CoherentSearch.Workspace(prod, 64)
+    got = sort(unique(vcat(size(ws.profs, 1), [size(d.dprofs, 1) for d in ws.decims])))
+    @test got == want
+    @test length(got) == 6            # 120/60/40/30/24/20 — not 1
 end
 
 @testset "main: multi-file run writes one .cohout per input" begin

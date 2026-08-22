@@ -62,31 +62,60 @@ function export_wisdom!(path::AbstractString = wisdom_path())
 end
 
 """
-    prime_wisdom(params=SearchParams(); blocksize=2048, rigor=FFTW.PATIENT,
-                 path=wisdom_path()) -> String
+    prime_wisdom(params=production_params(); blocksize=2048, rigor=FFTW.PATIENT,
+                 precisions=(:f64, :f32), path=wisdom_path()) -> String
 
 One-time, more-thorough planning pass: build every FFTW plan the search uses for
 `params`/`blocksize` at `rigor` (default `FFTW.PATIENT`) and save the wisdom to
-`path`, augmenting whatever is already there.  A later ordinary `search` (which
-plans at `FFTW.MEASURE`) reuses these plans directly — instant planning *and* the
-better `PATIENT` transforms.  Returns the wisdom path.
+`path`, augmenting whatever is already there.  Returns the wisdom path.
 
-Wisdom is keyed by transform length, so priming covers a given `nharms`/
-`decimations`/`blocksize`; other configurations are still learned incrementally by
-`search`'s own import/export.  Run once per host after an environment change.
+Since 2026-08-22 `search` already plans at `PATIENT` whenever `wisdom=true`, so
+this is no longer needed to *get* patient plans — it exists to pay their ~1 s
+planning cost ahead of time, and to cover configurations (notably the other
+`precision`) that the run you are about to do will not itself build.
+
+**`params` defaults to the CLI's production configuration, not `SearchParams()`.**
+That distinction was a live bug until 2026-08-22: `SearchParams()` is
+`nharms = 32, decimations = [1]`, a *single* 64-bin transform, while the CLI
+defaults to `nharms = 60, --maxdecim 6`, i.e. six transforms of
+120/60/40/30/24/20 bins — five of them on strided views, which are exactly the
+ones `PATIENT` helps.  So `prime_wisdom()` as previously documented ("run once per
+host") primed one transform the search never executes and none of the six it does.
+
+Wisdom is keyed by transform length, stride and precision, so priming covers a
+given `nharms`/`decimations`/`blocksize`/`precision`; other configurations are
+still learned incrementally by `search`'s own import/export.  Run once per host
+after an environment change.
 """
-function prime_wisdom(params::SearchParams = SearchParams();
+function prime_wisdom(params::SearchParams = production_params();
                       blocksize::Integer = 2048, rigor::Integer = FFTW.PATIENT,
+                      precisions = (:f64, :f32),
                       path::AbstractString = wisdom_path())
     import_wisdom!(path)                         # augment, don't discard, existing wisdom
-    old = _PLAN_RIGOR[]
-    _PLAN_RIGOR[] = UInt32(rigor)
-    try
-        Nprof = max(1, Int(blocksize))
-        Workspace(params, Nprof)                 # constructs every FFTW plan at `rigor`
-    finally
-        _PLAN_RIGOR[] = old
+    Nprof = max(1, Int(blocksize))
+    with_plan_rigor(rigor) do
+        for prec in precisions
+            # `Workspace` constructs every FFTW plan the search uses: the base
+            # `brfft` and one strided `brfft` per decimation factor.
+            Workspace(_with_precision(params, prec), Nprof)
+        end
     end
     export_wisdom!(path)
     return path
 end
+
+"""
+    production_params(; nharms=60, maxdecim=6) -> SearchParams
+
+The configuration `bin/coherent_search.jl` searches with by default, which is
+*not* `SearchParams()`.  Used as `prime_wisdom`'s default so that priming covers
+the plans a default run actually builds.
+"""
+production_params(; nharms::Integer = 60, maxdecim::Integer = 6) =
+    SearchParams(nharms = nharms, decimations = decimation_set(nharms, maxdecim))
+
+# `Base.@kwdef` gives no copy-with-override constructor.  Rebuild by reflection so
+# this keeps working when `SearchParams` gains a field.
+_with_precision(p::SearchParams, prec::Symbol) =
+    SearchParams(; (f => (f === :precision ? prec : getfield(p, f))
+                    for f in fieldnames(SearchParams))...)

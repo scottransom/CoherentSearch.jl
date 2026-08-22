@@ -1101,11 +1101,48 @@ end
 # ---------------------------------------------------------------------------
 
 # FFTW planning rigor used by every plan constructor below.  A mutable ref (not a
-# hardcoded flag) so `prime_wisdom` can temporarily raise it to `FFTW.PATIENT` for
-# a one-time, more-thorough planning pass whose result is cached as wisdom; normal
-# runs stay at `FFTW.MEASURE`.  See `wisdom.jl`.
-const _PLAN_RIGOR = Ref{UInt32}(FFTW.MEASURE)
+# hardcoded flag) so callers can raise or lower it around a planning pass; see
+# `prime_wisdom` in `wisdom.jl`.
+#
+# **`PATIENT` by default, because it is measurably better and self-amortising.**
+# Measured 2026-08-22 (Xeon Silver 4114, nharms=60, decimations 1…6, Nprof=2048),
+# interleaved over two rounds against the same wisdom file primed each way:
+# `decim-brfft` 4.69 → 4.24 s and 4.83 → 4.40 s, i.e. **~9% off the decimated
+# transforms**, ~2–3% end to end.  The base `brfft` does not move (2.30 → 2.28):
+# the win is entirely in the *strided* decimated plans, which is where FFTW has a
+# real choice to make.
+#
+# The cost is paid once.  Cold planning of all six transforms is 0.006 s at
+# `ESTIMATE`, 0.30 s at `MEASURE`, **1.30 s at `PATIENT`** — and 0.0155 s once the
+# result is in the wisdom file, which `search` imports and exports by default.  So
+# `PATIENT` costs ~1 s on the first run of a given (host, nharms, decimations,
+# blocksize, precision) and nothing after, against ~0.5 s saved on every 20 s run.
+#
+# **`EXHAUSTIVE` is not worth it and was measured, not assumed**: 14.96 s of
+# planning for an FFT share of 34.4% against `PATIENT`'s 33.9%, i.e. no better
+# than drift.  `PATIENT` is the knee.
+#
+# `search` drops back to `MEASURE` when `wisdom=false`, since without a wisdom
+# file to cache into, `PATIENT` would re-pay its 1.3 s on *every* run.
+const _PLAN_RIGOR = Ref{UInt32}(FFTW.PATIENT)
 plan_rigor() = _PLAN_RIGOR[]
+
+"""
+    with_plan_rigor(f, rigor)
+
+Run `f()` with the FFTW planning rigor temporarily set to `rigor`, restoring it
+afterwards.  Planning is single-threaded and happens before the parallel region,
+so a process-wide ref is safe here; do not call this from inside a search.
+"""
+function with_plan_rigor(f, rigor::Integer)
+    old = _PLAN_RIGOR[]
+    _PLAN_RIGOR[] = UInt32(rigor)
+    try
+        return f()
+    finally
+        _PLAN_RIGOR[] = old
+    end
+end
 
 """
     DecimBuf
@@ -1989,9 +2026,9 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
     Nprof = max(1, Int(blocksize))
     nchunks = cld(total, Nprof)
 
-    # Load saved FFTW wisdom so the (single-threaded, up-front) MEASURE planning
-    # below collapses to a lookup; persist it afterwards so the first run teaches
-    # every subsequent one.  Off with `wisdom=false`.
+    # Load saved FFTW wisdom so the (single-threaded, up-front) planning below
+    # collapses to a lookup; persist it afterwards so the first run teaches every
+    # subsequent one.  Off with `wisdom=false`.
     wpath = wisdom ? (wisdom_file === nothing ? wisdom_path() : String(wisdom_file)) : ""
     wisdom && import_wisdom!(wpath)
 
@@ -1999,7 +2036,14 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
     # they are built once here against `r_lo` and shared read-only by every task.
     dplans = build_direct_plans(params, r_lo)
     nt = max(1, min(nthreads(), nchunks))
-    workspaces = _plans!(cache, params, Nprof, nt)
+    # `PATIENT` is worth ~9% of the decimated transforms and costs ~1 s of
+    # planning, which the wisdom file amortises to nothing.  With no wisdom file
+    # there is nothing to amortise into, so fall back to `MEASURE` (see
+    # `_PLAN_RIGOR`).  Only the *first* workspace pays: FFTW's wisdom is
+    # process-global, so the other `nt-1` are lookups.
+    workspaces = with_plan_rigor(wisdom ? FFTW.PATIENT : FFTW.MEASURE) do
+        _plans!(cache, params, Nprof, nt)
+    end
 
     wisdom && export_wisdom!(wpath)
 
