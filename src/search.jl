@@ -718,20 +718,56 @@ function BoxcarBatch(nbins::Integer, wmax::Integer, Nprof::Integer,
                           Vector{Float64}(undef, Nprof))
 end
 
+# Profiles per inner block of `_bc_transpose!`.  See the comment there: this is
+# the single most host-sensitive constant in the file, and 8 is the value that is
+# a large win on one machine and nearly free on the other.
+const _BC_TR_BJ = 8
+
 # Transpose profile columns `j0+1 .. j0+B` into `tile` as (B, nbins), converting
-# to the tile's eltype.  The inner loop walks *columns*, so it is a stride-`nbins`
-# gather — but a fully-used one (every byte of every line is read by some `i`),
-# and LLVM vectorises it: 4/8/16-bin row blocking and a column-major walk all
-# measured 0.56x/0.71x/0.85x/1.03x against it (`Summary_and_Future_Work.md` §3.1).
-# It is **48% of the batched gate** — 303 µs per chunk at B=64, moving 4.8 MB,
-# i.e. ~15.8 GB/s.  That is an L3 bandwidth wall, so the price of admission for
-# the rest is not going down without narrowing `profs` itself.
+# to the tile's eltype.  Writes are contiguous (a `BJ`-wide run of one tile row);
+# the READ `profs[i, j0+b]` walks profiles, so it is a stride-`nbins` gather — a
+# fully-used one (every byte of every line is read by some `i`), which LLVM
+# vectorises.  Note the direction: an earlier note had this as write-scatter and
+# proposed cache-line-filling write blocks, which is the wrong end — the writes
+# already fill lines, and blocking them is measurably worse on both hosts.
+#
+# **What matters is `BJ`: how many profiles are in flight at once**, i.e. how many
+# concurrent strided read streams the loop asks the machine to sustain.  The
+# unblocked nest asks for `B = 128` of them, and the two hosts disagree about that
+# by a factor of 3.5 (µs per chunk summed over the default `k = 1…6` ladder,
+# `Nprof = 2048`, `Float64` profiles; `bench/tile_shape_bench.jl`):
+#
+#   BJ:            4      8     16     32     64    128 (unblocked)
+#   i7-10510U:   354    325    377    372    354    295
+#   Xeon 4114:   464    431   1840   1764   1765   1514
+#
+# On the Xeon everything from 16 up is one flat plateau at the unblocked cost and
+# 8 is **3.51x** faster than it (2.40x in `Float32`); on the laptop the ordering is
+# inverted and 8 measures 0.91x here (1.01x in `Float32`).  Blocking the *phase*
+# axis as well (the 4x8, 8x8 shapes) is slower than blocking `b` alone on both.
+#
+# **In situ the laptop's 0.91x does not appear — it is a small win there too.**
+# Interleaved, `-t 1`, metric share of accounted time: laptop 35.66% → 34.81%
+# (10.79 → 10.50 s), Xeon 48.93% → **31.60%** (19.41 → 14.32 s, i.e. **1.36x
+# end-to-end**).  The microbench above re-reads `profs` hot; the search reads it
+# once, right after the `brfft` that wrote it, so cutting 128 concurrent read
+# streams to 8 pays off on both machines.
+#
+# This supersedes the recorded verdict that the transpose sat at "an L3 bandwidth
+# wall": it does not.  At `B = 128` the Xeon ran it at 4.7 GB/s against the 21 GB/s
+# that host actually delivers at this footprint, and the rate's independence of
+# size was the signature of an access-pattern limit, which is what `BJ` fixes.
+# The output is bit-identical for every `BJ` — this is a loop nest, not a method.
 @inline function _bc_transpose!(tile::Vector{T}, profs::AbstractMatrix{<:AbstractFloat},
-                                j0::Int, nbins::Int, ::Val{B}) where {T,B}
-    @inbounds for i in 1:nbins
-        o = (i - 1) * B
-        for b in 1:B
-            tile[o + b] = T(profs[i, j0 + b])
+                                j0::Int, nbins::Int, ::Val{B},
+                                ::Val{BJ}=Val(_BC_TR_BJ)) where {T,B,BJ}
+    B % BJ == 0 || throw(ArgumentError("_BC_BATCH=$B must be a multiple of BJ=$BJ"))
+    @inbounds for b0 in 0:BJ:(B - 1)
+        for i in 1:nbins
+            o = (i - 1) * B + b0
+            @simd for b in 1:BJ
+                tile[o + b] = T(profs[i, j0 + b0 + b])
+            end
         end
     end
 end

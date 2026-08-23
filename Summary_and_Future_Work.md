@@ -1032,11 +1032,14 @@ largely evaporate; the part that was vector width (`B`) survives.
    with per-width running accumulators. **1.33x slower**: `nwidths × B/8` live
    accumulator vectors plus the rolling prefix rows exceed the 16 AVX2 registers.
 3. **Blocking or reordering the transpose** — 4/8/16-bin row blocks, or a
-   column-major walk: **0.56x/0.71x/0.85x/1.03x** vs the current loop. The
-   stride-`nbins` gather already vectorises; at `B=64` the transpose moves
-   4.8 MB per chunk in 303 µs, which is **~15.8 GB/s** — an L3 bandwidth wall,
-   not a code defect. Nothing short of narrowing `profs` to `Float32` changes it,
-   and that is `--precision f32`, measured at 0.82x at `-t 1`.
+   column-major walk: **0.56x/0.71x/0.85x/1.03x** vs the current loop, on the
+   laptop, at `B=64`. **This entry was right about its own configuration and
+   wrong as a generalisation — see §3.3.** All three of those block the *phase*
+   axis, which is not the axis that matters; blocking the *profile* axis by 8 is
+   **3.51x** on the workstation (and a small in-situ win on the laptop). The
+   "~15.8 GB/s L3 bandwidth wall" this entry inferred was not a wall: at `B=128`
+   the workstation ran the same loop at 4.7 GB/s against the 21 GB/s that host
+   delivers at this footprint.
 4. **A cheap upper bound to skip whole profiles.** Tempting because the gate only
    has to *not underestimate* by more than `boxcar_medmargin`, so a profile that
    provably cannot reach `medcut` needs no scan at all. But after the ladder
@@ -1046,8 +1049,9 @@ largely evaporate; the part that was vector width (`B`) survives.
    to reject anything.
 
 **Where the metric time is now** (isolated, per chunk, `B=64`): transpose 303 µs,
-width scan 228, σ̂ 210, rescan + writeback 87. The transpose is a bandwidth wall,
-the scan runs at >1 vector op/cycle, and what is left of σ̂ is two quickselects.
+width scan 228, σ̂ 210, rescan + writeback 87. The scan runs at >1 vector op/cycle
+and what is left of σ̂ is two quickselects. (The transpose is called a bandwidth
+wall here; it was not — see §3.3.)
 
 **Candidates are not byte-identical, by design** — σ̂ moved. At the riptide bench
 config the same three candidates come out at the same frequencies, with S/N
@@ -1776,6 +1780,86 @@ and should not be re-derived:
 - **`Distributed.jl` backend** reusing the same chunk abstraction, for
   cluster-scale searches across nodes.
 - **Broader real-data validation** beyond the single artificial test pulsar.
+
+### 3.3 The tile transpose (2026-08-22) — 1.36x on the workstation, from a loop nest
+
+`bench/metric_bench.jl` on the workstation put the boxcar gate's tile transpose at
+**1516 µs per chunk, 69% of the metric and ~31% of the whole search** — the
+largest single item, larger than any FFT phase. It is now **421 µs (3.60x)**, and
+the fix is one loop nest: **block the profile axis by 8**.
+
+**The diagnosis that had blocked this was wrong twice over.** The recorded verdict
+(§3.1, dead end 3) was "an L3 bandwidth wall, not a code defect", and the brief
+that reopened it blamed **write-scatter**. Neither holds:
+
+* It is not a bandwidth wall. At `B = 128` the workstation ran the transpose at
+  **4.7 GB/s** while that host delivers **21 GB/s** of copy at the same 2 MB
+  footprint (`bench/transpose_bench.jl`), and the rate is flat in size, which is
+  the signature of an access-pattern limit rather than a bandwidth one.
+* It is not write-scatter. In `_bc_transpose!` the inner loop is over `b` with `i`
+  fixed, so the **write** `tile[(i-1)*B + b]` is a contiguous 512 B run and the
+  **read** `profs[i, j0+b]` is the stride-`nbins` gather. The kernel's own comment
+  had this right; the brief inverted it, and the "16 Float32 = one cache line"
+  write blocking it proposed is measurably *worse* on both hosts.
+
+What the loop actually asks for is `B = 128` **concurrent strided read streams**,
+and that is what the two hosts disagree about. `bench/tile_shape_bench.jl` sweeps
+the block width `BJ` (µs per chunk summed over the default `k = 1…6` ladder,
+`Nprof = 2048`, `Float64` profiles):
+
+| `BJ` | 4 | 8 | 16 | 32 | 64 | 128 (shipped) |
+|---|---|---|---|---|---|---|
+| i7-10510U | 354 | 325 | 377 | 372 | 354 | **295** |
+| Xeon Silver 4114 | 464 | **431** | 1840 | 1764 | 1765 | 1514 |
+
+On the Xeon everything from 16 up is one flat plateau at the unblocked cost and 8
+is **3.51x** below it (2.40x in `Float32`); on the laptop the ordering is inverted
+and 8 is 0.91x (1.01x in `Float32`). Blocking the *phase* axis as well (4x8, 8x8)
+is worse than blocking `b` alone on both hosts, which is why the earlier
+phase-blocked attempts all read as losses.
+
+**In situ the laptop's predicted 0.91x loss does not appear — it is a small win.**
+Three interleaved rounds per host, `-t 1`, PM0063 at 0.1–33.3 Hz, comparing each
+run's metric share of accounted time:
+
+| | metric share, before | after | accounted time |
+|---|---|---|---|
+| i7-10510U | 35.66% | 34.81% | 10.79 → 10.50 s (1.03x) |
+| Xeon Silver 4114 | 48.93% | 31.60% | 19.41 → 14.32 s (**1.36x**) |
+
+The direction flip on the laptop is the isolated-vs-in-situ gap running the other
+way for once: the microbench re-reads `profs` hot, while the search reads it right
+after the `brfft` that wrote it, so cutting 128 read streams to 8 helps there too.
+**On the workstation the metric itself is 2.10x** (9.49 → 4.53 s) and is no longer
+the largest phase — `decim-brfft`, which has still never been looked at, is.
+
+**Candidates are byte-identical on both hosts** (21 of them down to threshold 6),
+which is the right gate here: `BJ` is a loop nest, not a method, so anything else
+would be a bug. `test/test_search.jl` pins the tile bit-for-bit across
+`BJ ∈ {1,2,4,8,16,32,64,128}` at two tile offsets, and asserts `_BC_BATCH` stays
+divisible by `_BC_TR_BJ`.
+
+**Two ideas that this beat, both measured, so they need not be re-tried:**
+
+* **FFTW's guru rank-0 r2r transpose** (the PRESTO trick,
+  `~/src/presto/tests/test_transpose.c`: `howmany_rank = 2`, `rank = 0`, a pure
+  strided copy that FFTW cache-blocks). It is genuinely good — 561 µs on the
+  workstation against the shipped loop's 1510 — but `BJ = 8` gets 431 µs with no
+  plan, no buffer and no ccall. On the laptop it is 0.86x. `bench/transpose_bench.jl`
+  and `bench/gate_layout_bench.jl` keep it, together with the whole-chunk
+  `profsT` layout it enables (1.79x on the workstation gate, **0.73x on the
+  laptop**, and it costs 4.8 MB per workspace).
+* **The guru profile-major `brfft`** (`bench/guru_transpose_probe.jl`, prototyped
+  the day before): plan the `c2r` with output stride `Nprof` so the transform
+  writes the gate's tile layout and the transpose disappears. Swept across the
+  whole ladder in both precisions (`bench/guru_brfft_ladder.jl`) it is **0.78x
+  (`:f64`) / 0.99x (`:f32`) on the laptop**. The probe's 1.25–1.50x came from
+  comparing against `copyto!(tile, transpose(Yd))`, a naive whole-array transpose
+  that is ~2.7x slower than the `_bc_transpose!` that actually ships — **the
+  baseline was wrong, not the measurement.** Always benchmark against the shipped
+  kernel, not against the obvious way to write it.
+* **Fusing the transpose into the prefix sum** was re-tested at `B = 128` (it was
+  a wash at 32 and worse at 64): **0.98x**. Still not it.
 
 ---
 

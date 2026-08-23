@@ -123,35 +123,35 @@ at `../riptide`), not the Python original. Run
 `python3 compare/compare_riptide.py FILE.fft` — it is an *occasional* benchmark
 (~5 min at `--preset bench --repeat 3`), not a dev-loop tool.
 
-Measured 2026-08-11 on `PM0063_034C1_DM445.0_red.fft`, `--preset bench`, both
-covering **0.1–200 Hz in 120…20 bins**, 4-core i7-10510U:
+**We now beat `rseek` single-threaded on both hosts.** Measured 2026-08-22 on
+`PM0063_034C1_DM445.0_red.fft`, `--preset bench`, both covering **0.1–200 Hz in
+120…20 bins**, median of 3:
 
-| | wall (s) | cores |
-|---|---|---|
-| `rseek` | 24.4 | 1.02 |
-| ours `-t 1` | 29.3 | 1.01 |
-| ours `-t 4` | 22.3 | 3.23 |
+| | rseek | ours `-t 1` | ratio | ours, all cores |
+|---|---|---|---|---|
+| i7-10510U (laptop, 4 cores) | 22.25 s | **11.99 s** | **1.84x faster** | 7.77 s `-t 4` |
+| Xeon Silver 4114 (fitzroy, 20 cores) | 19.83 s | **15.79 s** | **1.26x faster** | 3.51 s `-t 20` |
 
-**~1.2–1.4x slower single-threaded, but we detect more strongly**: the 7.1185 Hz
-pulsar at S/N 12.97 vs riptide's 11.80, plus two candidates it does not report.
-riptide's two extra entries are the `f/2` and `2f` of the pulsar, which it does
-not filter and we collapse.
+**And we detect more strongly**: the 7.1185 Hz pulsar at S/N 13.27 vs riptide's
+11.80, plus two candidates it does not report. riptide's two extra entries are
+the `f/2` and `2f` of the pulsar, which it does not filter and we collapse.
 
-That table is the **laptop**, and it is out of date on our side. The same
-command on the 20-core workstation (`fitzroy`) gave rseek 20.4 s, ours `-t 1`
-32.3 s, `-t 20` 4.6 s — **1.59x slower** — and after the 2026-08-22 work it gives
-**rseek 19.43 s, ours `-t 1` 20.89 s, i.e. 1.07x slower**, our side having come
-down 32.3 → 20.9 s (1.55x). Quote the machine *and* the date with the ratio; the
-two hosts disagree by more than any single optimisation below, and the code has
-moved 1.55x under a table that still reads 1.24x.
+**This section has read "we are slower" for its whole life and no longer does —
+check the date before quoting it.** The history on the laptop is 29.3 s
+(2026-08-11, 1.24x slower) → 11.99 s, and on the workstation 32.3 s (1.59x
+slower) → 20.89 s (1.07x slower, after the 2026-08-22 metric/interp work) →
+15.79 s (1.26x faster, after the transpose fix). Quote the machine *and* the
+date with the ratio; the two hosts still disagree by more than any single
+optimisation below (1.84x vs 1.26x on the same code and the same data).
 
 - **Start-up is NOT what the comparison measures**, and the harness proves it
-  per run: rseek 1.41 s start-up + 22.93 s searching, ours 1.48 s + 28.78 s, so
-  the pure-compute ratio (1.26x) matches the wall ratio (1.24x). Our fixed cost
-  is measured by re-running the same command over a near-empty band.
-  riptide's `find_peaks` is 7.0 s (31% of its compute) and is a separate pass
-  doing the candidate work we do inline — do **not** compare us against its
-  `ffa_search` (15.6 s) alone.
+  per run — and it now works *against* us, since ours is the larger of the two
+  and we win anyway. Laptop, `bench`, 2026-08-22: rseek 0.46 s start-up +
+  21.54 s searching, ours 0.95 s + 11.03 s, so the pure-compute ratio (0.51x) is
+  a shade better than the wall ratio (0.54x). Our fixed cost is measured by
+  re-running the same command over a near-empty band. riptide's `find_peaks` is
+  9.9 s (46% of its compute) and is a separate pass doing the candidate work we
+  do inline — do **not** compare us against its `ffa_search` (11.1 s) alone.
 - **Match total frequency COVERAGE, not the trial range.** Both codes hit the
   same sampling wall — riptide needs `P >= tsamp*bins` and downsamples to stay
   in `[bmin, bmax]`; our `k`-fold of `nharms/k` harmonics needs its top harmonic
@@ -209,15 +209,15 @@ moved 1.55x under a table that still reads 1.24x.
   fold depth per side over 0.1–33.3 Hz**: same band, same `dr = 1/nbins` grid,
   and at `bins_min = 120` riptide's boxcar bank finally matches ours (9 widths,
   30% duty). Work agrees to 4–8%. Measured 2026-08-16, workstation, `-t 1`,
-  interleaved: **rseek 18.35/18.33 s, ours 17.86/16.45 s — we are ~1.05–1.11x
-  FASTER at equal work.** Re-measured 2026-08-22 after that day's work:
-  **rseek 17.51 s, ours 15.95 s — 1.10x faster on wall clock, and 1.13x on pure
-  compute (14.50 s against its 16.32 s) once each side's start-up is out.**
-  The `bench` deficit is the ladder, not the code.
-  **But rseek still wins the pulsar in that config: S/N 12.6 (`w=13`, ducy 10.3%)
-  vs our 11.89 — 12.10 as of 2026-08-22 — at the same depth.** Our 13.27 comes
-  from the decimated fold, so "we detect more strongly" is a statement about the
-  *ladder*, not about the per-fold detector.
+  interleaved: rseek 18.35/18.33 s, ours 17.86/16.45 s — ~1.05–1.11x faster at
+  equal work; 1.10x after that day's work. Re-measured 2026-08-22 on the **laptop**
+  after the transpose fix: **rseek 18.07 s, ours 10.07 s — 1.80x faster on wall
+  clock, 1.91x on pure compute** (9.03 s against its 17.27 s). The `bench` deficit
+  was never the code, and there is no longer a deficit in either preset.
+  **But rseek still wins the pulsar in that config: S/N 12.60 (`w=13`, ducy 10.3%)
+  vs our 12.10 (H=65, ducy 14.6%) at the same depth.** Our 13.27 comes from the
+  decimated fold, so "we detect more strongly" is a statement about the *ladder*,
+  not about the per-fold detector.
 - **Our S/N and riptide's are the SAME statistic, up to `√(1−duty)` — and that
   factor is our bug, not a difference of definition (2026-08-16).** Both are a
   boxcar matched filter maximised over phase on a folded profile. riptide
@@ -548,12 +548,13 @@ re-deriving them.
     always were.** The 10% gap is safe; a percent-level S/N comparison (the §3.2
     Monte Carlo) is not, and must use the exact σ̂ or model this term.
   - **Four measured dead ends — do not re-guess them:** fusing the transpose away
-    (a wash at `B=32`, worse at 64); full fusion of prefix + widths (1.33x
-    *slower*, AVX2 register pressure); blocking or reordering the transpose
-    (0.56–1.03x — **but the "~15.8 GB/s L3 wall" that justified this verdict does
-    NOT hold on the workstation; see the transpose entry below, where it is the
-    largest single item in the whole search**); and a cheap upper bound to skip
-    profiles outright (after ladder pruning the bank is all narrow, and the
+    (a wash at `B=32`, worse at 64; re-tested at `B=128` and 0.98x); full fusion of
+    prefix + widths (1.33x *slower*, AVX2 register pressure); blocking or
+    reordering the transpose (0.56–1.03x — **overturned on 2026-08-22: all three
+    of those blocked the PHASE axis, and blocking the PROFILE axis by 8 is 3.51x
+    on the workstation.** The "~15.8 GB/s L3 wall" that justified the verdict was
+    not a wall at all; see the transpose entry below); and a cheap upper bound to
+    skip profiles outright (after ladder pruning the bank is all narrow, and the
     tightest cheap bound sits at 5.9 against `medcut = 4.0`).
 - **Done (2026-08-22, follow-up): σ̂ folds about the structural zero — another
   12.2% off the metric, 1.04x end-to-end.** DC is held at zero, so every profile's
@@ -615,38 +616,56 @@ re-deriving them.
     395 KB → 1.45 MB (shared read-only) costs nothing threaded at 4.
   - 460/460 tests, crossval unchanged (3.8e-16 / 2.1e-16 / 1.4e-16), `.cohout`
     byte-identical — the ~5e-16 of resummation moved no reported S/N.
-- **The metric's own split, measured on the workstation 2026-08-22 — and the
-  transpose is 69% of it.** `bench/metric_bench.jl`, PM0063, nharms=60,
-  Nprof=2048, `-t 1`, µs per chunk summed over `k = 1…6`: σ̂ **181**, transpose
-  **1516**, width scan **337**, gate 1908, metric 2017, of a **2198 µs** total;
-  the exact rescan fires on 0.05–1.76% of trials. As shares: transpose **69.0%**,
-  width scan 15.3%, σ̂ 8.2%. Since the metric is ~45% of runtime here, **the
-  transpose alone is ~31% of the whole search** — the largest single item, larger
-  than any FFT phase.
-  - **It is NOT at a bandwidth wall, and the recorded claim that it is was wrong
-    (or laptop-specific).** At `k = 1` it moves 1.97 MB in + 0.98 MB out in
-    626.6 µs = **4.7 GB/s**, and the same 4.7–4.8 GB/s at *every* `k`. Measured
-    achievable single-core copy on this host: **21.1 GB/s at a 2 MB footprint**,
-    10.1 GB/s at 32 MB. So it runs at ~22% of what the machine gives at its own
-    footprint, and the size-independence of that figure is the signature of an
-    *access-pattern* limit, not a bandwidth one.
-  - **The mechanism is write-scatter.** Reading `profs[:, j]` is contiguous
-    (960 B per profile), but writing `tile[(i-1)*B + b]` for a fixed profile `b`
-    walks stride `B*4 = 512 B`, so each of the 120 writes lands in a different
-    cache line and dirties it for one 4-byte word.
-  - **The unmeasured idea worth trying first: have the `brfft` write the tile
-    layout directly.** Dead end (2) in the list above transposed the *whole* array
-    including the transform axis (`(Nprof, Hₖ+1)` along dim 2) and was 2–3x
-    slower — that is a different experiment. Handing `mul!` a strided *output
-    view* keeps the transform along dim 1 and changes only where results land,
-    which would delete the transpose outright if FFTW can scatter in its final
-    pass.
+- **Done (2026-08-22): the tile transpose was 69% of the metric and ~31% of the
+  whole search on the workstation; it is now 421 µs against 1516 (3.60x), for
+  1.36x end-to-end there and ~1.03x on the laptop, candidates byte-identical.**
+  The fix is one loop nest: `_bc_transpose!` blocks the **profile** axis by
+  `_BC_TR_BJ = 8`. See `Summary_and_Future_Work.md` §3.3.
+  - **Two recorded diagnoses were wrong, and both had blocked the work.** (a) It
+    was not "an L3 bandwidth wall": at `B = 128` the workstation ran it at
+    **4.7 GB/s** against the **21 GB/s** that host delivers at the same 2 MB
+    footprint, flat in size — the signature of an access-pattern limit.
+    (b) It is **read-gather, not write-scatter**: the inner loop is over `b` with
+    `i` fixed, so the write `tile[(i-1)*B+b]` is a contiguous 512 B run and the
+    read `profs[i, j0+b]` is the stride-`nbins` gather. Cache-line-filling *write*
+    blocks are therefore the wrong end, and measure worse on both hosts.
+  - **What matters is how many concurrent strided read streams the loop asks for,
+    and the two hosts disagree about it by 3.5x.** µs per chunk over `k = 1…6`,
+    `Float64` (`bench/tile_shape_bench.jl`): at `BJ = 4/8/16/32/64/128` the laptop
+    gives 354/325/377/372/354/**295** and the Xeon 464/**431**/1840/1764/1765/1514.
+    Everything from 16 up is one flat plateau on the Xeon; only 8 (or 4) escapes it.
+    Blocking the *phase* axis too (4x8, 8x8) is worse than blocking `b` alone on
+    both — which is why every earlier phase-blocked attempt read as a loss.
+  - **The laptop's predicted 0.91x loss does not happen in situ; it is a small
+    win.** Interleaved, 3 rounds, metric share of accounted time: laptop
+    35.66% → 34.81% (10.79 → 10.50 s), workstation 48.93% → **31.60%**
+    (19.41 → 14.32 s). The microbench re-reads `profs` hot; the search reads it
+    straight after the `brfft` that wrote it. **The metric is no longer the
+    largest phase on the workstation** — `decim-brfft` is.
+  - **The guru profile-major `brfft` (`bench/guru_transpose_probe.jl`) is a DEAD
+    END, and its 1.25–1.50x was a baseline error.** It compared against
+    `copyto!(tile, transpose(Yd))`, a naive whole-array transpose ~2.7x slower
+    than the `_bc_transpose!` that ships. Swept over the whole ladder in both
+    precisions (`bench/guru_brfft_ladder.jl`) it is **0.78x (`:f64`) / 0.99x
+    (`:f32`)** on the laptop. Benchmark against the shipped kernel, not against
+    the obvious way to write it.
+  - **FFTW's guru rank-0 r2r transpose is real and still lost.** The PRESTO trick
+    (`~/src/presto/tests/test_transpose.c`: `rank = 0`, `howmany_rank = 2`, a pure
+    strided copy FFTW cache-blocks) does the whole chunk in 561 µs on the
+    workstation against the old loop's 1510 — but `BJ = 8` does it in 431 with no
+    plan, no buffer and no `ccall`. Kept in `bench/transpose_bench.jl` and
+    `bench/gate_layout_bench.jl` along with the whole-chunk `profsT` layout it
+    enables (1.79x on the workstation gate, **0.73x on the laptop**, +4.8 MB per
+    workspace). Fusing the transpose into the prefix sum, re-tested at `B = 128`:
+    **0.98x**.
   - **`--precision f32` halves the read side** and is already measured to help
     exactly these phases (`gate+metric` −8.1%, `decim-metric` −5.4% at `-t 1`).
-  - **Kadane's algorithm is NOT the next move**, despite being the obvious idea.
-    It would replace the width×phase scan, which is **15.3%** of the metric, and
-    after `ladder_boxcar_widths` the bank is only `W = 4–5` — so its ceiling is
-    ~4x on 15.3%, i.e. ~5% of runtime, before any of the tail-calibration cost.
+  - **Kadane's algorithm is still not the next move**, despite being the obvious
+    idea. With the transpose fixed the metric now splits (workstation, µs per
+    chunk over `k = 1…6`) transpose **421**, width scan **346**, σ̂ **185** of
+    1068 — so the scan is 32% of the metric and the metric is 32% of runtime,
+    putting Kadane's ceiling at ~4x on ~10% of runtime, before any of the
+    tail-calibration cost.
     Worse, **plain Kadane maximises the SUM, and our statistic is `sum/(σ√w)`** —
     a different objective, needing a max-density/normalised-segment algorithm
     whose serial dependency chain vectorises *worse* than the present scan, which
@@ -748,15 +767,19 @@ re-deriving them.
   | i7-10510U (laptop), after 2026-08-22 | ~33% | ~25% | ~24% | ~14% |
   | Xeon Silver 4114 (fitzroy), same code | **48.8%** | 17.6% | 21.2% | 10.3% |
   | fitzroy, after the workstation pass | **45.5%** | **13.8%** | 22.8% | 10.9% |
+  | fitzroy, after the transpose fix | 31.6% | 19.3% | **29.5%** | 16.0% |
 
-  **The metric is half the runtime on the workstation and a third on the laptop**,
-  and the interpolation is the reverse. A knob tuned on one host is not
-  automatically right on the other — which is exactly how `_BC_BATCH` came out at
-  64 there and 128 here. Re-baseline before optimising, and say which machine.
-  - `decim-brfft` remains **the phase that has never been looked at**, and on
-    both hosts it is now second or third. It reads `ftprofs` with stride `k`, so
-    each of the five decimated passes touches essentially the whole 2 MB array to
-    use `1/k` of it — ~10 MB per chunk, unexamined.
+  The metric used to be half the runtime on the workstation and a third on the
+  laptop, with the interpolation the reverse; the transpose fix has brought the
+  two hosts into rough agreement. A knob tuned on one host is still not
+  automatically right on the other — that is how `_BC_BATCH` came out at 64 there
+  and 128 here, and how the transpose sat unfixed for a week behind a
+  laptop-derived "bandwidth wall". Re-baseline before optimising, and say which
+  machine.
+  - `decim-brfft` is now **the largest phase on the workstation, and it is the one
+    that has never been looked at.** It reads `ftprofs` with stride `k`, so each of
+    the five decimated passes touches essentially the whole 2 MB array to use
+    `1/k` of it — ~10 MB per chunk, unexamined. **This is the next target.**
   - For `interp` the structural cost *was* the per-trial horizontal reduce; that
     was fixed by vectorising across trials (a159706) and then again by
     `Float32` weights, and at 13.8% it is no longer the place to look.

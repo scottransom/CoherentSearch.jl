@@ -372,6 +372,42 @@ if isfile(EXAMPLE_FFT)
         @test all(got[j] == want[j] for j in (Nprof - ntail + 1):Nprof)
     end
 
+    @testset "the tile transpose is bit-identical at every block width" begin
+        # `_bc_transpose!` blocks the *profile* axis by `_BC_TR_BJ` because the
+        # number of concurrent strided read streams is what the two development
+        # hosts disagree about by 3.5x (see the comment on the kernel).  `BJ` is
+        # a loop nest, not a method: every value must produce the same bytes, or
+        # the gate's bound — and with it the candidate list — moves with a
+        # performance knob.  This is also what would catch `_BC_BATCH` being set
+        # to something `_BC_TR_BJ` does not divide.
+        CS = CoherentSearch
+        params = SearchParams(nharms=60, m=32)
+        nbins = 2params.nharms
+        Nprof = 2CS._BC_BATCH
+        ws = CS.Workspace(params, Nprof)
+        dplans = CS.build_direct_plans(params, 10010.0)
+        CS.fill_chunk_profiles!(ws, dplans, ft, params, 10010.0,
+                                params.hidr / params.nharms, Nprof; t0=0)
+        B = CS._BC_BATCH
+        @test B % CS._BC_TR_BJ == 0
+        ref = Vector{CS._BC_TILE}(undef, B * nbins)
+        CS._bc_transpose!(ref, ws.profs, 0, nbins, Val(B), Val(B))   # unblocked
+        got = similar(ref)
+        for bj in (1, 2, 4, 8, 16, 32, 64, B)
+            for j0 in (0, B)
+                CS._bc_transpose!(ref, ws.profs, j0, nbins, Val(B), Val(B))
+                fill!(got, NaN32)
+                CS._bc_transpose!(got, ws.profs, j0, nbins, Val(B), Val(bj))
+                @test got == ref
+            end
+        end
+        # And the shipped default is one of them.
+        CS._bc_transpose!(ref, ws.profs, 0, nbins, Val(B), Val(B))
+        fill!(got, NaN32)
+        CS._bc_transpose!(got, ws.profs, 0, nbins, Val(B))
+        @test got == ref
+    end
+
     @testset "per-harmonic alignment is more accurate at low harmonics" begin
         # The whole point of per-harmonic numbetween: low harmonics, whose
         # finterp grid is coarse relative to their curvature at a fixed

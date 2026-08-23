@@ -1,3 +1,12 @@
+# SUPERSEDED (2026-08-22) — kept because the guru mechanics in it are correct and
+# reusable, but its CONCLUSION was wrong.  It compares the guru profile-major
+# `brfft` against `copyto!(tile, transpose(Yd))`, a naive whole-array transpose
+# that is ~2.7x slower than the `_bc_transpose!` the search actually runs, so the
+# "1.25-1.50x" below is a baseline error.  Swept across the whole decimation
+# ladder in both precisions against the shipped kernel
+# (`bench/guru_brfft_ladder.jl`), the guru c2r is **0.78x (:f64) / 0.99x (:f32)**
+# on the laptop.  The transpose was instead fixed by blocking its profile axis;
+# see `Summary_and_Future_Work.md` §3.3.
 using FFTW, LinearAlgebra, BenchmarkTools, Printf
 const lib = FFTW.libfftw3
 function guru_c2r(X, yT, flags)

@@ -327,36 +327,45 @@ fmax     = 1 / Pmin        hifreq   = fmax / maxdecim   (our fundamental range;
 0.1–200 Hz in 120…20 bins. `Pmin` defaults to `tsamp * bmin`, riptide's own
 floor, so both run the widest band the data support.
 
-Measured on `PM0063_034C1_DM445.0_red.fft` (T=2097 s, 4-core i7-10510U laptop),
-`--preset bench`, both covering 0.1–200 Hz:
+Measured 2026-08-22 on `PM0063_034C1_DM445.0_red.fft` (T=2097 s, 4-core
+i7-10510U laptop), `--preset bench`, both covering 0.1–200 Hz, median of 3:
 
 | | wall (s) | cores |
 |---|---|---|
-| `rseek` | 24.4 | 1.02 |
-| `coherent_search -t 1` | 29.3 | 1.01 |
-| `coherent_search -t 4` | 22.3 | 3.23 |
+| `rseek` | 22.25 | 1.04 |
+| `coherent_search -t 1` | **11.99** | 1.03 |
+| `coherent_search -t 4` | 7.77 | 3.55 |
 
 The harness also splits start-up from searching, so the obvious objection —
 that this is really measuring Julia's start-up — is answered on every run. It
-is not: the two are within 0.1 s of each other and largely cancel.
+is not; if anything start-up works against us, since ours is the larger of the
+two and we win anyway.
 
 | | start-up | searching | wall |
 |---|---|---|---|
-| `rseek` | 1.41 s (Python import) | 22.93 s | 24.34 s |
-| ours `-t 1` | 1.48 s (boot + JIT + FFTW plans) | 28.78 s | 30.26 s |
+| `rseek` | 0.46 s (Python import) | 21.54 s | 22.00 s |
+| ours `-t 1` | 0.95 s (boot + JIT + FFTW plans) | 11.03 s | 11.98 s |
 
-so the pure-compute ratio (1.26×) matches the wall-clock ratio (1.24×). Note
-that riptide's `find_peaks` is 7.0 s — 31% of its compute — and is a separate
-pass doing candidate work we do inline; comparing our figure against its
-`ffa_search` alone would be wrong.
+so the pure-compute ratio (0.51×) is a shade better than the wall-clock ratio
+(0.54×). Note that riptide's `find_peaks` is 9.9 s — 46% of its compute — and is
+a separate pass doing candidate work we do inline; comparing our figure against
+its `ffa_search` (11.1 s) alone would be wrong.
 
-**Single-threaded we are ~1.2–1.4× slower** (run-to-run scatter on this
-throttling laptop is large; the threaded row is the least reliable, since
-back-to-back heavy runs clock the CPU down). **We detect the 7.1185 Hz pulsar
-more strongly: S/N 12.97 vs 11.80**, and we find two candidates it does not.
-riptide's two extra entries are the `f/2` and `2f` of the pulsar, which it does
-not filter and we collapse by default (`--noharmremove` for a like-for-like
-count).
+**Single-threaded we are ~1.8× faster, while doing ~2.8× the folds** — the
+harness prints that work ratio before it times anything, because the two numbers
+have to be read together. We fold every frequency below `hifreq` once per
+decimation factor, where `rseek` folds it exactly once; that redundancy is our
+harmonic-sum ladder and it is what buys the sensitivity below. Quote the ratio
+with the host and date: this laptop throttles, and the same comparison on a
+20-core Xeon workstation reads differently.
+
+**We also detect the 7.1185 Hz pulsar more strongly: S/N 13.27 vs 11.80**, and we
+find two candidates it does not. riptide's two extra entries are the `f/2` and
+`2f` of the pulsar, which it does not filter and we collapse by default
+(`--noharmremove` for a like-for-like count).
+
+For a pure algorithm-vs-algorithm timing at *equal* work, use `--preset matched`,
+which runs one fold depth on each side and equalises the work to a few percent.
 
 Getting this wrong is easy and expensive: setting our `hifreq` to `1/Pmin` —
 the obvious-looking choice — has us search 6× riptide's band and reports us as
