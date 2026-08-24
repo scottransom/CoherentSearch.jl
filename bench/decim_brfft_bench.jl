@@ -225,3 +225,78 @@ function gather_main()
 end
 
 gather_main()
+
+# ---------------------------------------------------------------------------
+# Fusing the stack writes into `fill_harmonic_row_direct!`
+#
+# The idea: the interpolator already holds harmonic `h`'s value in registers when
+# it stores `ftprofs[h+1, j]`, and `h` belongs to decimated stack `k` whenever
+# `h % k == 0` — so the stacks could be filled with ZERO extra reads, turning the
+# 269 us fused gather into just its write traffic.
+#
+# The catch, and why this needs measuring rather than assuming: `_group_store!`
+# writes a *row* of a column-major matrix, so its stores are already strided by
+# `(nharms+1)*sizeof(Complex{P})` = 976 B (`:f64`).  The stacks are the same
+# shape, so the fused stores are strided too — `(Hk+1)*16` = 496 B at `k=2` — and
+# every one of them touches its own cache line.  87 extra harmonic-rows over the
+# five stacks against the interpolator's own 60 is 1.45x more strided stores.
+#
+# `stackwrite_cost!` is the idea's BEST case: pure scatter stores of a register
+# value, in the interpolator's loop order, no reads at all.  If that alone
+# exceeds the strided-minus-contiguous budget, the fusion cannot win however it
+# is written, and no src change is needed to know it.
+function stackwrite_cost!(dsts, ks, nharms::Int, Nprof::Int, val)
+    @inbounds for h in 1:nharms
+        for t in eachindex(dsts)
+            k = ks[t]
+            h % k == 0 || continue
+            d = dsts[t]
+            i = h ÷ k + 1
+            @simd for j in 1:Nprof
+                d[i, j] = val
+            end
+        end
+    end
+end
+
+# The same stores in the opposite nesting — column-major, all stacks per column —
+# which is the fused *gather*'s order, for reference.
+function stackwrite_colmajor!(dsts, ks, nharms::Int, Nprof::Int, val)
+    @inbounds for j in 1:Nprof
+        for t in eachindex(dsts)
+            d = dsts[t]
+            @simd for i in 1:size(d, 1)
+                d[i, j] = val
+            end
+        end
+    end
+end
+
+function fusion_study(ft, prec::Symbol, budget::Float64)
+    P = prec === :f32 ? Float32 : Float64
+    params = SearchParams(nharms=NHARMS, threshold=6.0, precision=prec,
+                          decimations=decimation_set(NHARMS, MAXDEC))
+    ws = CS.Workspace(params, NPROF)
+    ks   = [db.k for db in ws.decims]
+    dsts = [Matrix{Complex{P}}(undef, db.Hk + 1, NPROF) for db in ws.decims]
+    val  = one(Complex{P})
+    nrows = sum(count(h -> h % k == 0, 1:NHARMS) for k in ks)
+    t_interp_order = us(@benchmark stackwrite_cost!($dsts, $ks, $NHARMS, $NPROF, $val) evals=1 samples=200)
+    t_col_order    = us(@benchmark stackwrite_colmajor!($dsts, $ks, $NHARMS, $NPROF, $val) evals=1 samples=200)
+    @printf("\n  %s  (%d extra strided harmonic-rows against the interpolator's own %d)\n",
+            prec, nrows, NHARMS)
+    @printf("    stack writes, INTERPOLATOR order (harmonic-major) : %8.1f us   %s budget %.1f us\n",
+            t_interp_order, t_interp_order < budget ? "UNDER" : "OVER ", budget)
+    @printf("    stack writes, column-major order (for reference)  : %8.1f us\n", t_col_order)
+end
+
+function fusion_main()
+    ft = FFTFile(FILE)
+    println("\n" * "="^78)
+    println("Fusing the stack writes into the interpolator: pure-write cost (best case)")
+    println("  Budget = strided minus contiguous, i.e. what the whole scheme has to beat.")
+    fusion_study(ft, :f64, 312.2)
+    fusion_study(ft, :f32, 127.5)
+end
+
+fusion_main()

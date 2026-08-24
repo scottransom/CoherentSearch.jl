@@ -814,10 +814,50 @@ re-deriving them.
   and 128 here, and how the transpose sat unfixed for a week behind a
   laptop-derived "bandwidth wall". Re-baseline before optimising, and say which
   machine.
-  - `decim-brfft` is now **the largest phase on the workstation, and it is the one
-    that has never been looked at.** It reads `ftprofs` with stride `k`, so each of
-    the five decimated passes touches essentially the whole 2 MB array to use
-    `1/k` of it — ~10 MB per chunk, unexamined. **This is the next target.**
+  - **`decim-brfft` has now been looked at (2026-08-24) and is close to its floor.
+    Do not re-open it without a new idea — three have been measured and rejected.**
+    `bench/decim_brfft_bench.jl` splits it, in both precisions, on the production
+    `Workspace` holding a genuine chunk. Re-baselined at `-t 1`: `decim-brfft`
+    29.6–30.3%, metric ~31%, interp ~19%, base `brfft` ~16%; at `-t 16`
+    `decim-brfft` rises to 33% and the two transforms together are 51%.
+    - **Small-transform inefficiency is NOT the cause.** Per output bin the
+      *contiguous* decimated transforms cost 1.25–2.08 ns (`:f64`) against the
+      base 120-bin pass's 2.048 — as good or better. FFTW is fine at these sizes.
+    - **The stride is the entire excess:** 972 µs strided vs **660 µs** on a
+      contiguous copy of the identical stack (1.47x; 1.22x in `:f32`). It grows
+      with `k` in `:f64` (1.17x at `k=2` → 2.14x at `k=6`) because a column is
+      61·16 B ≈ 15 lines and at `k ≥ 4` the 64 B stride yields exactly *one*
+      useful element per line; in `:f32` the stride is half as long, 2–4 elements
+      survive per line, and the cost stays flat at ~1.2x.
+    - So **312 µs (`:f64`) / 127 µs (`:f32`) is the budget** any de-striding
+      scheme must beat. Measured: the per-`k` `copyto!` that 51ccdf6 deleted is
+      **1585 µs** (5x over — that is why it lost); blocking it by the profile
+      axis, the trick that was worth 3.5x on `_bc_transpose!`, gets it only to
+      **592 µs**; a **fused single pass** over the columns writing all five stacks
+      is **269 µs** — 5.9x better than naive and the only one under budget, but it
+      leaves just 43 µs, i.e. **1.046x on the phase, ~1.4% end-to-end**, costs
+      **+3.0 MB per workspace** (bad exactly where the phase hurts most), and is a
+      **net loss in `:f32`** (781 vs 701 µs). It is also already at **18.3 GB/s**
+      against the ~21 GB/s this host delivers, so it will not improve.
+    - **Fusing the stack writes into `fill_harmonic_row_direct!` is dead, and for
+      a structural reason.** The appeal was zero extra reads — the interpolator
+      holds harmonic `h` in registers and `h` belongs to stack `k` when
+      `h % k == 0`. But `_group_store!` writes a *row* of a column-major matrix,
+      already strided by 976 B, and the stacks are the same shape. The pure
+      scatter stores alone, in the interpolator's harmonic-major order, are
+      **506 µs (`:f64`) / 395 µs (`:f32`)** — 1.6x and 3.1x over budget before any
+      arithmetic or transform. The same stores column-major are **147/103 µs**,
+      3.4x cheaper, which is just the fused gather again. The interpolator's loop
+      order is wrong for these buffers and cannot be fixed in place.
+    - The remaining layout escape, `(Nprof, Hₖ+1)` transforming along dim 2, is
+      **already recorded as 2–3x slower** (see the four measured dead ends above).
+    - **The isolated bench does NOT track the search in `:f32`.** Per chunk
+      (phase ÷ 4084 chunks): `:f64` 1041 µs in situ vs 972 isolated (1.07x), but
+      `:f32` **1153 in situ vs 701 isolated (1.64x)**. So this bench's 0.721x
+      `:f32` speedup is worth nothing in the real search, where `:f32` is a 10.9%
+      *loss* on this phase at `-t 1`. Score precision with `bench/precision_ab.jl`
+      only. **That 1.64x gap is unexplained and is now the more interesting
+      thread** — see the `:f32` entry below.
   - For `interp` the structural cost *was* the per-trial horizontal reduce; that
     was fixed by vectorising across trials (a159706) and then again by
     `Float32` weights, and at 13.8% it is no longer the place to look.
