@@ -839,7 +839,8 @@ re-deriving them.
     no `perf`): it reports the CPU's AVX-512 features, whether the shipped kernel
     emits a scatter, both kernels' throughput, and — the useful part on a host
     without `perf` — times a fixed *scalar* loop alternated with each kernel, so
-    a licence downclock shows up as unrelated scalar code getting slower.
+    a licence downclock shows up as unrelated scalar code getting slower. It has
+    been run on all three hosts; send it anywhere a new CPU needs classifying.
   - **`core_power.lvl{0,1,2}_turbo_license` is the right instrument, better than
     `cycles/ref-cycles`.** It names the licence level directly instead of leaving
     you to infer it from a clock ratio. It also *cleared FFTW* without an
@@ -856,8 +857,27 @@ re-deriving them.
     nest's 12.4/9.3/23.0, and the `Float64` nest's 15.2/**11.0**/46.8. The new
     kernel is deliberately **not** used for `Float64` profs, where the widening
     already makes the scatter unprofitable and it measures 36.6 vs 11.0 µs.
-  - **In isolation the fix is a wash (9.5 vs 9.3 µs); the win is entirely in what
-    it stops doing to the rest of the program.** That is the sharpest version yet
+  - **Confirmed on a THIRD microarchitecture, and the fix wins there for a
+    different reason.** A Zen 4 laptop (Ryzen 7 7840HS, AVX-512 double-pumped at
+    256 bits, no Skylake-style licensing) run by one of Scott's students,
+    2026-08-24 via `bench/avx512_probe.jl`:
+    - It emits the scatter **more** aggressively than fitzroy — 131 `zmm` and 24
+      scatters for `Float32` profs, and it scatters the **`Float64`** path too
+      (48 `zmm`, 8 scatters), which fitzroy does not.
+    - It has **no licence penalty**, exactly as predicted: the probe's scalar
+      neighbour reads 0.983x next to the scatter kernel against 0.970x next to
+      the aggregate one, i.e. no effect either way.
+    - **And the fix still wins 1.32x** on `Float32` in isolation (4.59 vs
+      6.08 µs), because scatter is simply a slow instruction there.
+    So: Skylake-SP pays for the scatter in *clock*, Zen 4 pays for it in
+    *throughput*, and `foops` never emits it. **Three hosts, three behaviours,
+    one fix** — which is a much better position than a host-specific flag.
+    - It also independently confirms the dispatch: the aggregate kernel on
+      `Float64` profs is **0.49x** there (14.47 vs 7.08 µs), the worst of the
+      three hosts. Restricting it to `profs::AbstractMatrix{T}` is not an
+      optimisation detail — using it everywhere would be a large regression.
+  - **In isolation the fix is a wash on fitzroy (9.5 vs 9.3 µs); the win there is
+    entirely in what it stops doing to the rest of the program.** That is the sharpest version yet
     of this file's standing warning about microbenchmarks: no per-kernel timing
     of `_bc_transpose!` could ever have found this.
 
