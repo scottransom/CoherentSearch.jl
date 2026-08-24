@@ -29,6 +29,33 @@ Best config becomes `:f32` + AVX2 at 11.92 s against the shipped default's
 `:f32` penalty evaporates or reverses (`interp` +34.6% -> -3.5%, `gate+metric`
 +51.7% -> -3.1%, `decim-metric` +46.4% -> -2.9%, `decim-brfft` +15.3% -> -25.6%).
 
+## Before anything: two bits of environment friction
+
+Both of these cost time today; neither is obvious from a fresh checkout.
+
+* **`bench/Manifest.toml` is gitignored.** A fresh clone cannot run anything in
+  `bench/` until you instantiate it, and the failure looks like "Package
+  CoherentSearch is required but does not seem to be installed", which sends you
+  looking in the wrong place:
+
+  ```sh
+  julia --project=bench -e 'using Pkg; Pkg.instantiate()'
+  ```
+
+  (`bench/Manifest.toml` resolves CoherentSearch by `path = ".."`, relative to
+  the project directory — so it picks up whichever checkout it sits in. That is
+  what makes `git worktree` A/Bs work, once the manifest is copied in.)
+
+* **The test data is untracked.** `PM0063_034C1_DM445.0_red.fft` (+ `.inf`) is
+  not in git. Confirm it is on the laptop before planning around it; if not,
+  either copy it from fitzroy or substitute another `.fft` and say which one was
+  used with every number — the timings are not comparable across inputs.
+
+* `crossval/` needs a Python that can `import coherent_search`, and the path
+  differs per host — on the laptop set
+  `COHERENT_PYTHON=/home/sransom/python_venvs/pixiPSR/.pixi/envs/default/bin/python`.
+  Not needed for any of the tasks below, only if you touch the metric.
+
 ## Task 1 — the laptop (do this first; it is cheap and it disambiguates a lot)
 
 **Establish whether the laptop can even exhibit this**, then decide what it means.
