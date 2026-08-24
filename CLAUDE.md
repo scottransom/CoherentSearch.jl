@@ -18,6 +18,23 @@ for multi-threaded performance and is numerically pinned to the Python original.
 - Scott is a pulsar astronomer and the author of PRESTO — pitch at expert level;
   be concise and don't over-explain domain basics.
 
+## The two hosts (quote the host with every number)
+
+Scott develops on both, and they have inverted each other's conclusions
+repeatedly — now with a known mechanism (see the AVX-512 entry below).
+
+- **`foops`** (laptop) — repo at `/home/sransom/git/CoherentSearch.jl`.
+  i7-10510U, Comet Lake, 4 cores / 8 threads, 8 MB L3. **No AVX-512**
+  (`avx avx2 fma` only), so `--cpu-target=skylake` is a no-op here. Throttles
+  under sustained load; quote `-t 1`.
+- **`fitzroy`** (workstation) — repo at `/data1/git/CoherentSearch.jl`, *not*
+  under `~/git`. `ssh fitzroy` works unattended. Xeon Silver 4114, Skylake-SP,
+  2x10 cores, 14 MB L3 per socket, nominal 2.2 GHz. **Has AVX-512.** `perf`
+  needs no root (`perf_event_paranoid = 2`), and
+  `core_power.lvl{0,1,2}_turbo_license` is available — that is the direct
+  license-level counter, better than inferring it from `cycles/ref-cycles`.
+  It is Scott's desktop: check `uptime` and top processes before timing.
+
 ## Architecture essentials
 
 - `src/fourierinterp.jl` — Fourier interpolation kernels (Eqn. 30 of
@@ -783,6 +800,67 @@ re-deriving them.
   - **Do not confuse this with the `Float32` interpolation *weights*, which ARE
     the default** (7361279). Two separate knobs; the profile-stage `--precision`
     has never been anything but `:f64`.
+- **FIXED (2026-08-24): the AVX-512 downclocking is gone, in source, and
+  `--precision f32` is now a win at `-t 1` on BOTH hosts. The cause was ONE
+  instruction — `vscatterqps` in `_bc_transpose!` — not a diffuse width problem.**
+  With `profs` already `Float32`, `BJ` being a compile-time constant fully
+  unrolls the `b` loop, exposing `i` as innermost; LLVM then vectorises *that*
+  (reads down a column are contiguous) and writes the tile with a **512-bit
+  scatter**. Scatter is microcoded *and* a heavy AVX-512 op, so it alone dropped
+  the core to turbo licence level 2 and taxed every other phase in the search.
+  The fix is a second `_bc_transpose!` method for `profs::AbstractMatrix{T}`
+  (same type as the tile) that gathers `BJ` values into an `NTuple` and stores it
+  as one 32-byte aggregate, which LLVM cannot turn back into a scatter.
+  - **Measured on fitzroy, `-t 1`, stock `native`, candidates byte-identical:**
+    `core_power.lvl2_turbo_license` **57.5% of all cycles → 0**, effective clock
+    **2.06 → 2.84 GHz**, and `precision_ab.jl` reads `:f64` 14.33 s vs `:f32`
+    **11.88 s (1.206x)** — i.e. `:f32` on `native` now equals the 11.92 s that
+    previously needed `--cpu-target=skylake`. Every phase Δ flipped negative
+    (`interp` +34.6% → **−1.4%**, `gate+metric` +51.7% → **−4.0%**,
+    `decim-metric` +46.4% → **−13.1%**, `decim-brfft` +15.3% → **−25.6%**).
+  - **The laptop agrees, and always would have**: `foops` has no AVX-512, so it
+    never emitted the scatter. Re-measured there `-t 1`, `:f32` is **1.190x**
+    (native) / 1.221x (`--cpu-target=skylake`, a no-op there) — against
+    fitzroy-under-AVX2's 1.189x. **The two hosts were never really disagreeing
+    about `:f32`; one of them was running a scatter.** The recorded
+    "do not merge at any thread count" verdict is dead on both.
+  - **`--cpu-target` is no longer needed for anything.** It stays useful only as
+    a diagnostic.
+  - **`:f32` is still not the default**, but the argument against it ("it loses
+    at `-t 1`") is now gone on both hosts — that is a decision to take
+    deliberately, since `:f32` candidates are not bit-identical to `:f64`.
+  - **Do NOT study fitzroy's codegen on the laptop.** `--cpu-target=skylake-avx512`
+    on `foops` reports **zero** `zmm` for these kernels — the host has no AVX-512
+    and Julia's JIT will not emit what it cannot run. It looks like a clean
+    answer and is an artifact. On fitzroy, `native`, `skylake-avx512` and
+    `native,prefer-256-bit` all emit the identical scatter, so this was never a
+    `prefer-vector-width` defaulting problem either.
+  - `bench/avx512_probe.jl` is a **standalone** reproducer (no package, no data,
+    no `perf`): it reports the CPU's AVX-512 features, whether the shipped kernel
+    emits a scatter, both kernels' throughput, and — the useful part on a host
+    without `perf` — times a fixed *scalar* loop alternated with each kernel, so
+    a licence downclock shows up as unrelated scalar code getting slower.
+  - **`core_power.lvl{0,1,2}_turbo_license` is the right instrument, better than
+    `cycles/ref-cycles`.** It names the licence level directly instead of leaving
+    you to infer it from a clock ratio. It also *cleared FFTW* without an
+    assumption: FFTW ignores `--cpu-target`, yet the `skylake` arm showed zero
+    lvl2 cycles, so the 512-bit code had to be Julia's.
+  - **What did NOT work, so it is not re-guessed:** dropping `@simd`, hand-
+    unrolling with `@nexprs`, making the `b` trip count opaque, and hoisting `i`
+    innermost all still scatter — LLVM re-derives it from the loop nest. Only
+    making the *store* a single aggregate stops it. `ntuple`-gather with a
+    *looped* store scatters again at `BJ >= 8`; a `VecElement` tuple store is
+    zmm-free only at `BJ = 4` and is 4x slower.
+  - **`BJ = 8` is still right for both methods** (fitzroy, µs/call, `B = 128`,
+    `nbins = 120`): new kernel 11.5/**9.5**/10.4 at `BJ = 4/8/16` against the old
+    nest's 12.4/9.3/23.0, and the `Float64` nest's 15.2/**11.0**/46.8. The new
+    kernel is deliberately **not** used for `Float64` profs, where the widening
+    already makes the scatter unprofitable and it measures 36.6 vs 11.0 µs.
+  - **In isolation the fix is a wash (9.5 vs 9.3 µs); the win is entirely in what
+    it stops doing to the rest of the program.** That is the sharpest version yet
+    of this file's standing warning about microbenchmarks: no per-kernel timing
+    of `_bc_transpose!` could ever have found this.
+
 - **FOUND (2026-08-24, fitzroy): every recorded `:f32` penalty was AVX-512
   license-based DOWNCLOCKING, not memory. `--cpu-target=skylake` turns `:f32`
   from 0.846x into 1.189x at `-t 1`, and the best configuration on this host is
@@ -825,23 +903,30 @@ re-deriving them.
     is this. So is the `decim-brfft` `:f32` penalty. Both were the clock.
   - **The recorded claim that "LLVM emits 256-bit vectors on Skylake-SP by
     default" (used to justify ignoring AVX-512 when tuning `DIRECT_GROUP_V` and
-    `_BC_BATCH`) is FALSE for these kernels.** Something in them goes wide enough
-    to trip a heavy AVX license.
-  - **Therefore treat every constant tuned by wall clock on fitzroy as suspect**:
+    `_BC_BATCH`) is FALSE for these kernels** — but only for one of them, and not
+    for the reason it sounds like. A codegen audit of every hot kernel (the
+    interpolator's `_group_lanes`/`_group_store!`, `_bc_scan_batch!`,
+    `_boxcar_scan`, `_boxcar_psum!`, `_median!`, `_select!`) finds **zero** 512-bit
+    code in all of them. The *only* source was `_bc_transpose!` on `Float32`
+    profs, and what it emitted was a scatter.
+  - **Treat every constant tuned by wall clock on fitzroy as suspect**:
     `_BC_BATCH = 128`, `_BC_TR_BJ = 8`, `DIRECT_GROUP_V = 32` were all tuned
-    *through* a variable license level, so their optima may move once vector width
-    is pinned. Re-sweep them under a fixed target before trusting them again.
+    *through* a variable license level, so their optima may move now the scatter
+    is gone. `_BC_TR_BJ = 8` has been re-confirmed for both transpose methods
+    (see the FIXED entry); `_BC_BATCH` and `DIRECT_GROUP_V` have **not** been
+    re-swept and remain open. Note this only ever mattered for `:f32` — the
+    `:f64` path never left licence level 1.
   - **Also re-read the four "the microbenchmark inverted in situ" entries in this
     file.** They are recorded as cache-warmth stories; some may be this instead,
     since a different instruction mix trips a different license. In this
     investigation three harnesses disagreed about the *direction* of the `:f32`
     effect for exactly that reason.
-  - **Open: how to apply this without a process-wide flag.** `--cpu-target=skylake`
-    is the diagnostic instrument, not the fix — it is process-wide, user-supplied,
-    and disables AVX-512 for code that may want it. The targeted knob is LLVM's
-    `prefer-vector-width=256`; whether Julia can apply it per function is unknown.
-    FFTW is unaffected either way (compiled C, its own runtime dispatch), so the
-    `brfft` phases will not move.
+  - **CLOSED — this was the open question, and the answer was not a flag.** See
+    the FIXED entry above: it is one `vscatterqps` in `_bc_transpose!`, removed in
+    source. `prefer-vector-width` was a red herring; the vectoriser was choosing a
+    *scatter*, not merely a wide vector, and pinning the width would not have
+    stopped it. FFTW is unaffected either way (compiled C, its own runtime
+    dispatch) — confirmed by the licence counters, not assumed.
   - **Threaded: measured, and the win grows with thread count exactly as
     package-wide licensing predicts.** Whole search, wall clock, candidates
     identical (3) in all sixteen arms:

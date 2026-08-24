@@ -488,6 +488,55 @@ if isfile(EXAMPLE_FFT)
         @test got == ref
     end
 
+    @testset "the same-type tile transpose matches the widening one" begin
+        # `_bc_transpose!` has a second method for the case `--precision f32`
+        # produces: `profs` already the tile's eltype.  It exists because the
+        # generic nest lets LLVM vectorise the `i` loop and write the tile with a
+        # 512-bit SCATTER, which on Skylake-SP drops the core to turbo licence
+        # level 2 and taxes the whole search (see the kernel's comment).  It is a
+        # second implementation of the same copy, so it must produce the same
+        # bytes -- widening to `Float64` and back is exact, so the generic nest
+        # on a widened copy is an exact reference.
+        CS = CoherentSearch
+        params = SearchParams(nharms=60, m=32)
+        nbins = 2params.nharms
+        Nprof = 2CS._BC_BATCH
+        ws = CS.Workspace(params, Nprof)
+        dplans = CS.build_direct_plans(params, 10010.0)
+        CS.fill_chunk_profiles!(ws, dplans, ft, params, 10010.0,
+                                params.hidr / params.nharms, Nprof; t0=0)
+        B = CS._BC_BATCH
+        T = CS._BC_TILE
+        p32 = T.(ws.profs)                      # what a `:f32` Workspace holds
+        p64 = Float64.(p32)                     # exact widening
+
+        # The dispatch itself is the fragile part: the two methods were
+        # AMBIGUOUS on first writing (`T` unconstrained is not a subset of
+        # `<:AbstractFloat`), so the fast path silently never ran.  Pin it.
+        @test which(CS._bc_transpose!,
+                    Tuple{Vector{T},Matrix{T},Int,Int,Val{B},Val{CS._BC_TR_BJ}}) !==
+              which(CS._bc_transpose!,
+                    Tuple{Vector{T},Matrix{Float64},Int,Int,Val{B},Val{CS._BC_TR_BJ}})
+
+        ref = Vector{T}(undef, B * nbins)
+        got = similar(ref)
+        for bj in (1, 2, 4, 8, 16, 32, 64, B)
+            for j0 in (0, B)
+                CS._bc_transpose!(ref, p64, j0, nbins, Val(B), Val(bj))
+                fill!(got, NaN32)
+                CS._bc_transpose!(got, p32, j0, nbins, Val(B), Val(bj))
+                @test got == ref
+            end
+        end
+        # It writes exactly `B * nbins` elements and not one more.
+        big = fill(T(NaN), B * nbins + 8)
+        CS._bc_transpose!(big, p32, 0, nbins, Val(B), Val(CS._BC_TR_BJ))
+        @test all(isnan, @view big[(B * nbins + 1):end])
+        @test_throws BoundsError CS._bc_transpose!(Vector{T}(undef, B * nbins - 1),
+                                                   p32, 0, nbins, Val(B),
+                                                   Val(CS._BC_TR_BJ))
+    end
+
     @testset "per-harmonic alignment is more accurate at low harmonics" begin
         # The whole point of per-harmonic numbetween: low harmonics, whose
         # finterp grid is coarse relative to their curvature at a fixed

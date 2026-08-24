@@ -743,6 +743,42 @@ const _BC_TR_BJ = 8
 # that host actually delivers at this footprint, and the rate's independence of
 # size was the signature of an access-pattern limit, which is what `BJ` fixes.
 # The output is bit-identical for every `BJ` — this is a loop nest, not a method.
+# When `profs` is ALREADY the tile's type (`--precision f32`), the nest above is
+# a trap: with `BJ` a compile-time constant the `b` loop fully unrolls, exposing
+# the `i` loop as the innermost one, and LLVM then vectorises *that* — reads down
+# a column are contiguous, so it takes them wide and writes the tile with a
+# 512-bit SCATTER (`vscatterqps`).  On Skylake-SP that is doubly bad: scatter is
+# microcoded, and it is a *heavy* AVX-512 op, so it drops the core to turbo
+# licence level 2.  Measured on fitzroy (2026-08-24), whole `:f32` search at
+# `-t 1`: 57.5% of all cycles at licence level 2 and an effective 2.06 GHz,
+# against 2.77 GHz for `:f64`, which never leaves level 1.  That one loop was
+# taxing every other phase in the search — which is why `--cpu-target=skylake`
+# (no AVX-512, hence no scatter) made `interp`, `decim-brfft` and the metric all
+# get faster in `:f32` even though none of them emits 512-bit code.
+#
+# The fix is to make the store an *aggregate*: gather `BJ` values into an
+# `NTuple` and write it as one `BJ*sizeof(T)`-byte unit, which LLVM cannot turn
+# back into a scatter.  Isolated it is a wash (9.5 vs 9.3 µs per call at
+# `BJ = 8`, `B = 128`, `nbins = 120`); in situ it removes the downclock.
+# It is *not* used for the `Float64 -> Float32` case, where the conversion
+# already makes the scatter unprofitable, LLVM emits no 512-bit code, and this
+# form measures 36.6 µs against the plain nest's 11.0.
+#
+# Output is bit-identical to the nest above for every `BJ` — this is a copy.
+@inline function _bc_transpose!(tile::Vector{T}, profs::AbstractMatrix{T},
+                                j0::Int, nbins::Int, ::Val{B},
+                                ::Val{BJ}=Val(_BC_TR_BJ)) where {T<:AbstractFloat,B,BJ}
+    B % BJ == 0 || throw(ArgumentError("_BC_BATCH=$B must be a multiple of BJ=$BJ"))
+    length(tile) >= B * nbins || throw(BoundsError(tile, B * nbins))
+    GC.@preserve tile begin
+        p = pointer(tile)
+        @inbounds for b0 in 0:BJ:(B - 1), i in 1:nbins
+            v = ntuple(b -> @inbounds(profs[i, j0 + b0 + b]), Val(BJ))
+            unsafe_store!(Ptr{NTuple{BJ,T}}(p + (((i - 1) * B + b0) * sizeof(T))), v)
+        end
+    end
+end
+
 @inline function _bc_transpose!(tile::Vector{T}, profs::AbstractMatrix{<:AbstractFloat},
                                 j0::Int, nbins::Int, ::Val{B},
                                 ::Val{BJ}=Val(_BC_TR_BJ)) where {T,B,BJ}
