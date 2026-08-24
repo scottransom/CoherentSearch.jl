@@ -842,10 +842,26 @@ re-deriving them.
     `prefer-vector-width=256`; whether Julia can apply it per function is unknown.
     FFTW is unaffected either way (compiled C, its own runtime dispatch), so the
     `brfft` phases will not move.
-  - **Not yet measured: threaded.** Licensing is package-wide and tightens as more
-    cores go active, so `-t 16`/`-t 20` should show a LARGER effect — and this is
-    the likeliest explanation for the `-t 20` anomaly (1.029x against `-t 16`'s
-    1.384x) recorded above.
+  - **Threaded: measured, and the win grows with thread count exactly as
+    package-wide licensing predicts.** Whole search, wall clock, candidates
+    identical (3) in all sixteen arms:
+
+    | threads | `:f64` native | `:f32` native | `:f64` AVX2 | **`:f32` AVX2** | best vs shipped default |
+    |---|---|---|---|---|---|
+    | 1 | 13.50 s | 15.96 s | 14.18 s | **11.92 s** | **1.13x** |
+    | 4 | 4.49 s | 4.67 s | 4.44 s | **3.54 s** | **1.27x** |
+    | 16 | 1.84 s | 1.51 s | 1.74 s | **1.13 s** | **1.63x** |
+    | 20 | 1.75 s | 1.38 s | 1.60 s | **1.01 s** | **1.73x** |
+
+    `:f32` + AVX2 is the best configuration at *every* thread count, `-t 1`
+    included. `:f64` barely cares about the target (13.50/14.18, 1.84/1.74,
+    1.75/1.60) — it is `:f32` that AVX-512 was punishing.
+  - **The `-t 20` anomaly did NOT reproduce, and licensing does not explain it.**
+    The earlier run read 1.384x at `-t 16` and 1.029x at `-t 20`; re-measured the
+    same day these are 1.220x and 1.268x, i.e. monotone. That earlier `-t 20`
+    point was scatter, not a cross-socket or licensing effect — **do not build on
+    it.** For the same reason the recorded "`-t 20` is no longer faster than
+    `-t 16`" needs re-checking: `:f64` here is 1.84 s at 16 and 1.75 s at 20.
 - **Done (2026-08-22, workstation): `Float32` interpolation weights are now the
   DEFAULT, and the old "1.64x SLOWER" verdict was not merely void but backwards.**
   That verdict blamed the per-trial cross-lane reduce; the trials-axis kernel

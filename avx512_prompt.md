@@ -62,38 +62,28 @@ Compare the two `f32 vs f64` ratios and the per-phase table. On a host with no
 AVX-512 they should be the same to within scatter; if they are not, something
 other than licensing is in play and that is worth knowing.
 
-## Task 2 — finish fitzroy (via ssh; a sweep was left running)
+## Task 2 — fitzroy is DONE (do not re-run it)
 
-A `-t 4 / 16 / 20` x `native / skylake` x `f64 / f32` sweep was started and may
-not have completed. Check for it first:
+The `-t 4 / 16 / 20` x `native / skylake` x `f64 / f32` sweep completed; the
+table is in `CLAUDE.md`. Summary: `:f32` + AVX2 wins at every thread count, by
+1.13x (`-t 1`), 1.27x (`-t 4`), 1.63x (`-t 16`), 1.73x (`-t 20`) against the
+shipped default. `:f64` barely responds to the target; it is `:f32` that AVX-512
+was punishing.
+
+**One correction carried into that entry:** the `-t 20` anomaly (1.029x against
+`-t 16`'s 1.384x) that this investigation started out trying to explain **did not
+reproduce** — re-measured the same day it is 1.268x against 1.220x, i.e.
+monotone. It was scatter. Licensing does *not* explain it, and the recorded
+"`-t 20` is no longer faster than `-t 16`" also needs re-checking, since `:f64`
+measured 1.84 s at 16 threads and 1.75 s at 20.
+
+If you do want fresh fitzroy numbers over ssh, **check the machine is idle
+first** — it is Scott's desktop, and Chrome and Zoom alone move these numbers by
+more than the effects being measured:
 
 ```sh
-ssh fitzroy 'ls -l /tmp/claude-*/**/scratchpad/cputarget_threads.txt' 2>/dev/null
+ssh fitzroy 'uptime; ps -eo pcpu,comm --sort=-pcpu | head'
 ```
-
-If it is missing or partial, re-run it (each `skylake` arm pays a full package
-recompile, so budget ~20 min):
-
-```sh
-ssh fitzroy 'for t in 4 16 20; do
-  for tgt in native skylake; do
-    echo "### -t $t $tgt"
-    if [ "$tgt" = native ]; then EXTRA=""; else EXTRA="--cpu-target=$tgt"; fi
-    julia $EXTRA --project=bench -t $t bench/precision_ab.jl \
-       PM0063_034C1_DM445.0_red.fft --arms f64,f32 --reps 5 2>&1 |
-       sed -n "/=== medians ===/,/^$/p"
-  done
-done'
-```
-
-**Prediction to test, not to assume:** licensing is package-wide and tightens as
-more cores go active, so the AVX-512 penalty should be *larger* threaded. If so
-it also explains the recorded `-t 20` anomaly (1.029x against `-t 16`'s 1.384x),
-which is currently written up as a possible cross-socket effect.
-
-**Make sure nobody is using fitzroy.** It is Scott's desktop; Chrome and Zoom
-alone move these numbers by more than the effects being measured. `uptime` and
-`ps -eo pcpu,comm --sort=-pcpu | head` before trusting anything.
 
 ## Task 3 — the actual fix (the open question)
 
