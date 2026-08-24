@@ -1930,14 +1930,25 @@ noise floor falls with it — FAP=1e-5 goes 6.367 -> 6.167 at `k=1` and 5.681 ->
 saying otherwise would overclaim. The genuine gains are the broad-duty row of the
 table above, and having a threshold whose FAP is calculable at all.
 
-**It did NOT close the S/N gap to `rseek`, and that is the useful finding.**
-`--preset matched`, one fold depth per side: rseek **12.60** (`w=13`, ducy 10.3%)
-vs ours 12.10 -> **11.84** (`H=65`, ducy 14.6%). Since the metric is now provably
-identical *on identical profiles*, the entire remaining gap is the **profile
-estimator** — our 65-harmonic coherent Fourier fold against riptide's time-domain
-FFA fold — and/or sigma-hat. **That is the next thing to investigate if the
-per-fold S/N gap matters**, and it is now cleanly separated from the S/N
-definition, which is where it had been hiding.
+**On the residual difference from `rseek` — and why it is NOT evidence about
+sensitivity.** `--preset matched`, one fold depth per side: rseek **12.60**
+(`w=13`, ducy 10.3%) vs ours 12.10 -> **11.84** (`H=65`, ducy 14.6%).
+
+What that licenses is a *decomposition*, not a conclusion: since the metric is
+now provably identical given identical profiles, whatever difference exists on
+any given observation comes from the **profile estimator** (our 65-harmonic
+coherent Fourier fold against riptide's time-domain FFA fold) and/or sigma-hat,
+and no longer from the S/N definition. That statement holds at any sample size.
+
+**Its magnitude does not.** This is one pulsar in one observation — a single
+noise realization, whose extreme-value scatter on a single detection is far
+larger than the ~0.8 separating the two numbers, and larger again than the ~1%
+sigma-hat jitter recorded in §3.1. **Do not read a sensitivity difference out of
+it, in either direction, and do not open a bug hunt on the strength of it.**
+Relative sensitivity is exactly what §3.2's injection Monte Carlo is for: many
+realizations, paired noise, detection fraction against injected S/N and duty
+cycle. Until that runs, the honest statement is that the two codes' S/N values
+are now the same statistic and the per-observation difference is un-interpreted.
 
 **Cost.** ~8% off the metric phase: `bench/metric_bench.jl` reads 1092 -> 950 us
 per chunk, after correcting the ~6% whole-machine drift visible in the

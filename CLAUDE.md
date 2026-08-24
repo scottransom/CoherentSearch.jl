@@ -222,9 +222,11 @@ optimisation below (1.84x vs 1.26x on the same code and the same data).
   **But rseek still wins the pulsar in that config: S/N 12.60 (`w=13`, ducy 10.3%)
   vs our 12.10 (H=65, ducy 14.6%) at the same depth — 11.84 after 2026-08-24.**
   Our 13.27 comes from the decimated fold, so "we detect more strongly" is a
-  statement about the *ladder*, not about the per-fold detector. And since the
-  metric is now riptide's exactly, that per-fold gap is now known to be the
-  *profile estimator*, not the S/N definition.
+  statement about the *ladder*, not about the per-fold detector. Since the metric
+  is now riptide's exactly, any such per-fold difference is the *profile
+  estimator*, not the S/N definition — but every number in this bullet is one
+  pulsar in one observation, so treat them as anecdotes and let §3.2's Monte
+  Carlo decide anything about sensitivity.
 - **Our S/N IS riptide's S/N as of 2026-08-24 — same statistic, not merely
   comparable.** `_boxcar_scan`, the Python oracle's `snr_metric` and riptide's
   `cpp/snr.hpp:snr1` all correlate the profile against the width-`w` boxcar made
@@ -258,12 +260,15 @@ optimisation below (1.84x vs 1.26x on the same code and the same data).
     (FAP=1e-5 at `k=4`: 5.681 → 5.514; at `k=1`: 6.367 → 6.167, from 8.36M trials
     per rung). Candidates ≥ 6.0 go 21 → 7 — **mostly the rescale, not a real
     reduction in false alarms**; at matched FAP the counts are comparable.
-  - **It did NOT close the gap to `rseek` on that pulsar, and that is the useful
-    part.** `--preset matched`, same depth: rseek 12.60 (w=13), ours 12.10 → 11.84
-    (H=65). Since the metric is now provably identical on identical profiles, the
-    whole remaining gap is the **profile estimator** — our 65-harmonic coherent
-    Fourier fold vs riptide's time-domain FFA fold — and/or σ̂. That is the next
-    thing to look at if the S/N gap matters; it was never the normalisation.
+  - **The residual difference from `rseek` is n=1 — do not read sensitivity into
+    it.** `--preset matched`, same depth: rseek 12.60 (w=13), ours 12.10 → 11.84
+    (H=65). What follows is only a *decomposition*: the metric is now provably
+    identical on identical profiles, so whatever difference exists comes from the
+    **profile estimator** (our coherent Fourier fold vs riptide's time-domain FFA
+    fold) and/or σ̂, never from the S/N definition. **The size of it means nothing
+    — one pulsar, one noise realisation, and the single-detection extreme-value
+    scatter is much larger than the 0.8 between them.** Relative sensitivity is
+    what §3.2's injection Monte Carlo settles; do not start a bug hunt on this.
   - Worth ~8% of the metric phase (1092 → 950 µs/chunk, after correcting the ~6%
     whole-machine drift visible in the untouched σ̂ and transpose columns): the
     median rescan is gone, against ~1% added to the scan by the `δ·S_tot` term.
