@@ -783,6 +783,69 @@ re-deriving them.
   - **Do not confuse this with the `Float32` interpolation *weights*, which ARE
     the default** (7361279). Two separate knobs; the profile-stage `--precision`
     has never been anything but `:f64`.
+- **FOUND (2026-08-24, fitzroy): every recorded `:f32` penalty was AVX-512
+  license-based DOWNCLOCKING, not memory. `--cpu-target=skylake` turns `:f32`
+  from 0.846x into 1.189x at `-t 1`, and the best configuration on this host is
+  now `:f32` + AVX2 at 11.92 s against the shipped default's 13.50 s (1.13x) —
+  single-threaded, which was the entire argument against `:f32`.**
+  - **The measurement that found it, after five wall-clock hypotheses had died.**
+    `perf` needs no root here (`perf_event_paranoid = 2` already allows
+    user-space counters, which is all this workload is). Per gate call at `k=1`:
+
+    | | cycles | instructions | uops | IPC | cycles/ref | effective clock |
+    |---|---|---|---|---|---|---|
+    | `:f64` | 1,197,983 | 1,391,085 | 2,641,773 | 1.16 | 1.327 | **2.92 GHz** |
+    | `:f32` | **857,300** | **1,235,295** | **2,302,730** | **1.44** | 0.807 | **1.78 GHz** |
+
+    `:f32` does strictly *less* work by every counter and still loses, because the
+    core drops to 1.78 GHz. `ref-cycles` ticks at the nominal 2.2 GHz, so
+    **`cycles/ref-cycles` IS the turbo ratio** — that one ratio is the whole
+    diagnosis, and nothing in a wall-clock A/B can see it.
+  - **Confirmed by removing AVX-512.** Gate µs/call, `nbuf` = distinct profile
+    buffers cycled: with AVX-512, `:f64` 361.6/455.6 and `:f32` 520.3/660.1 at
+    `nbuf` 1/64; with `--cpu-target=haswell`, `:f64` 335.7/434.3 and `:f32`
+    342.8/**375.2**. The `:f32` penalty vanishes, and `:f64` gets *faster* too —
+    AVX-512 is a net loss for both precisions here, merely catastrophic for `:f32`.
+  - **Whole search, `-t 1`, phase Δ for `:f32` vs `:f64`** — every recorded
+    penalty evaporates or reverses:
+
+    | phase | AVX-512 | AVX2 (`--cpu-target=skylake`) |
+    |---|---|---|
+    | interp | +34.6% | **−3.5%** |
+    | decim-metric | +46.4% | **−2.9%** |
+    | gate+metric | +51.7% | **−3.1%** |
+    | decim-brfft | +15.3% | **−25.6%** |
+    | zero-ftprofs | −59.9% | −72.5% |
+
+    Wall clock: `:f64` 13.50 s (native) / 14.18 s (skylake); `:f32` 15.96 s /
+    **11.92 s**. Candidates unchanged (3) in all four arms.
+  - **This closes two long-standing "cause unidentified" items.** The `interp`
+    `:f32` penalty — where `Float32` *weights* were tried and did not fix it, and
+    the note concluded "that hypothesis is wrong and the cause is unidentified" —
+    is this. So is the `decim-brfft` `:f32` penalty. Both were the clock.
+  - **The recorded claim that "LLVM emits 256-bit vectors on Skylake-SP by
+    default" (used to justify ignoring AVX-512 when tuning `DIRECT_GROUP_V` and
+    `_BC_BATCH`) is FALSE for these kernels.** Something in them goes wide enough
+    to trip a heavy AVX license.
+  - **Therefore treat every constant tuned by wall clock on fitzroy as suspect**:
+    `_BC_BATCH = 128`, `_BC_TR_BJ = 8`, `DIRECT_GROUP_V = 32` were all tuned
+    *through* a variable license level, so their optima may move once vector width
+    is pinned. Re-sweep them under a fixed target before trusting them again.
+  - **Also re-read the four "the microbenchmark inverted in situ" entries in this
+    file.** They are recorded as cache-warmth stories; some may be this instead,
+    since a different instruction mix trips a different license. In this
+    investigation three harnesses disagreed about the *direction* of the `:f32`
+    effect for exactly that reason.
+  - **Open: how to apply this without a process-wide flag.** `--cpu-target=skylake`
+    is the diagnostic instrument, not the fix — it is process-wide, user-supplied,
+    and disables AVX-512 for code that may want it. The targeted knob is LLVM's
+    `prefer-vector-width=256`; whether Julia can apply it per function is unknown.
+    FFTW is unaffected either way (compiled C, its own runtime dispatch), so the
+    `brfft` phases will not move.
+  - **Not yet measured: threaded.** Licensing is package-wide and tightens as more
+    cores go active, so `-t 16`/`-t 20` should show a LARGER effect — and this is
+    the likeliest explanation for the `-t 20` anomaly (1.029x against `-t 16`'s
+    1.384x) recorded above.
 - **Done (2026-08-22, workstation): `Float32` interpolation weights are now the
   DEFAULT, and the old "1.64x SLOWER" verdict was not merely void but backwards.**
   That verdict blamed the per-trial cross-lane reduce; the trials-axis kernel
