@@ -216,7 +216,7 @@ end
 
 # --- how far the Float32 gate can stray from the exact Float64 bound --------
 println("\n", "="^104)
-println("Float32 gate error vs the Float64 gate (this is what must stay under boxcar_medmargin)")
+println("Float32 gate error vs the Float64 gate (this is what must stay under boxcar_gatemargin)")
 for nbins in schedule
     widths = boxcar_widths(nbins)
     wmax = widths[end]

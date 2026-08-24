@@ -26,9 +26,10 @@ function parse_cmdline(argv)
         with PRESTO's `rednoise` routine, which also removes red noise.  The FFT
         should also be barycentered and have known RFI zapped.  The detection
         metric is the peak boxcar matched-filter S/N over a geometric bank of
-        top-hat widths, whose pure-noise distribution is analytic and flat across
-        harmonic decimations, so one --threshold means one false-alarm rate for
-        every k.
+        top-hat widths -- riptide's `snr1` statistic exactly, so S/N values are
+        directly comparable with rseek's -- whose pure-noise distribution is
+        analytic and flat across widths and harmonic decimations, so one
+        --threshold means one false-alarm rate for every k.
         Near-identical candidates are collapsed by default (--noremove disables it),
         as are harmonically-related ones -- the f/2, 2f, 3f/2, ... family of a real
         signal (--noharmremove disables it, --numharm sets the max harmonic).

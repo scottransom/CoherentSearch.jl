@@ -277,6 +277,8 @@ and a byte-identical candidate-file diff:
      On real data this computes the median for only ~1% of trials (the rest are
      pure noise, safely below threshold) while keeping every candidate exact. The
      metricstats/normalize/reference paths force the exact median (`medcut = −∞`).
+     **(Superseded 2026-08-24: there is no median baseline any more, so the gate
+     is the whole metric and the second pass is a `Float64` re-score. See §3.4.)**
    Together: **median-select 31.2% → 5.5%** (≈20.4 s → 2.5 s, ~8×), full run
    **65.3 s → 45.5 s**.
 
@@ -286,7 +288,7 @@ Grouped: interp/FFT ≈ 68%, metric ≈ 31% — the balance has **flipped back**
 **FFTW is now unambiguously the top cost.** The next lever is therefore the
 `ComplexF32` interpolation (§3), which Scott notes is precision-safe (PRESTO
 interpolates at `ComplexF32`), so the work there is re-pinning tests, not a
-numerical risk. *Caveat on the gate:* `boxcar_medmargin` is the safety dial — it
+numerical risk. *Caveat on the gate (superseded — see §3.4):* `boxcar_medmargin` was the safety dial — it
 must exceed `|med|·√wₘₐₓ/σ` for every threshold-crossing trial; 2.0 clears the
 observed 1.23 with headroom, but widen it if broader real-data validation ever
 shows a near-threshold broad-signal miss.
@@ -564,7 +566,10 @@ byte-identical candidate file confirms. It does rely on the profile mean being 0
 (DC is held at zero), which keeps the prefix sum from drifting away from the
 boxcar sums it must resolve.
 
-**The gate had no test; it does now.** The adaptive zero-baseline gate landed
+**The gate had no test; it does now.** (Names below predate 2026-08-24:
+`boxcar_medmargin` → `boxcar_gatemargin`, `medcut` → `exactcut`, and the "exact
+median path" is now just the `Float64` path — see §3.4.) The adaptive
+zero-baseline gate landed
 without an equivalence pin, so nothing was checking the property the whole
 optimisation rests on. `test/test_search.jl` adds two: a full `search` against
 one with `boxcar_medmargin = Inf` (which forces `medcut = -Inf`, i.e. the exact
@@ -1666,30 +1671,21 @@ and should not be re-derived:
   is written for. A fair population study should probably also run riptide the
   way its pipeline does — several narrow-`bins` ranges tiling the band — and
   report that as a third configuration.
-- **The S/N statistics ARE the same quantity, up to `√(1−duty)`** — an earlier
-  version of this note said otherwise and was wrong. Both are a boxcar matched
-  filter maximised over phase on a folded profile; they differ only in template
-  normalisation. riptide correlates against a *zero-mean, unit-L2* boxcar
-  (`cpp/snr.hpp:snr1`), so its per-phase statistic has variance exactly 1. We sum
-  `w` median-subtracted on-pulse bins and divide by `σ√w`, normalising as though
-  the baseline were known rather than estimated from the same profile — which
-  makes our per-phase variance `1 − duty`. Working the templates out gives
-  `ours = √(1 − w/nbins) × riptide's` pointwise, and on 200k pure-noise 120-bin
-  profiles the measured ratio matches that to four decimals at every width
-  (0.9962 at `w=1`, 0.8758 at `w=28`).
-  - So the paper **can** plot one against the other, after multiplying ours by
-    `1/√(1−ducy)`. Detection fraction at fixed injected S/N and the recovered
-    duty cycle remain the primary observables, but the S/N scales are now
-    reconcilable rather than incommensurable.
-  - **This is also an open item in its own right, not just a comparison detail.**
-    A fixed threshold on our metric is effectively `threshold/√(1−duty)` in
-    unit-variance terms — 8.0 at `w=1` but 9.6 at 30% duty — so the search is
-    systematically biased against broad pulses, by ~16% at the top of the bank
-    and exactly where the decimation ladder's shallow folds work (`nbins = 20`,
-    `w = 6`). The fix is a deterministic per-width factor in `_boxcar_scan`;
-    the cost is that it moves every reported S/N, so it wants doing deliberately
-    alongside the threshold-calibration work in §3, not as a drive-by. It also
-    interacts with the `Hₖ` threshold-comparability item recorded there.
+- **The S/N statistics are now the SAME statistic, full stop — settled
+  2026-08-24, see §3.4.** This bullet used to record the `√(1−duty)` discrepancy
+  as an open item; it is closed. Our metric is riptide's `snr1` exactly, verified
+  against the riptide binary at 1.4e-7 (its own `Float32`), so the paper can plot
+  one against the other with no correction factor at all. **The correction this
+  bullet used to prescribe would have been wrong** — §3.4 says why.
+  Detection fraction at fixed injected S/N and the recovered duty cycle remain
+  the primary observables, but the S/N scales are now directly comparable rather
+  than merely reconcilable.
+  - **What this does NOT fix is the `Hₖ` threshold-comparability item** — the
+    per-`(k, frequency)` drift of the noise floor recorded in §3. Measured on
+    PM0063 after the change (8.36M trials per rung), the FAP=1e-4 metric runs
+    4.855 at `k=6` to 5.127 at `k=1`; before it ran 4.988 to 5.164. The spread
+    across the ladder barely moved, so `--normalize` is still the answer there,
+    not the metric definition.
 - **Injection mechanics.** We read `.fft`, riptide reads `.dat`; inject in the
   time domain once and hand each code its own view of the same realisation, so
   the noise is common and the comparison is paired rather than independent.
@@ -1860,6 +1856,101 @@ divisible by `_BC_TR_BJ`.
   kernel, not against the obvious way to write it.
 * **Fusing the transpose into the prefix sum** was re-tested at `B = 128` (it was
   a wash at 32 and worse at 64): **0.98x**. Still not it.
+
+---
+
+### 3.4 The metric IS riptide's `snr1` (2026-08-24) — the median baseline is gone
+
+**What changed.** `_boxcar_scan`, the batched gate, `boxcar_best_width` and the
+Python oracle's `snr_metric` all now correlate each profile against the width-`w`
+boxcar made **zero-mean and unit-L2** — riptide's `cpp/snr.hpp:snr1`:
+
+```
+h = sqrt((n-w)/(n*w))     on the w on-pulse bins
+b = w/(n-w)*h             subtracted from all n bins
+snr = ((h+b)*max_p S_w(p) - b*S_tot) / sigma
+    = (max_p S_w(p) - d*S_tot) / (sigma*sqrt(w*(1-d))),      d = w/n
+```
+
+The per-profile **median baseline is gone**, and with it `_boxcar_exact`,
+`_baseline_median!`, `_median_net!`, `_batcher_pairs`, `_MED_NET_MAX`,
+`_NO_MEDPAIRS`, and the `medbuf`/`medpairs` fields of `Workspace` and `DecimBuf`.
+`boxcar_medmargin` (2.0) became `boxcar_gatemargin` (0.01): the second pass is no
+longer a median rescue but a `Float64` re-score of the `Float32` gate, so the
+margin only has to clear the gate's ~3e-6 rounding. Note that makes the margin
+**two-sided** — the gate is no longer a lower *bound*, just a lower-precision
+evaluation of the same number.
+
+**Verification.** Against the riptide binary on identical profiles with identical
+sigma: **1.4e-7** on real PM0063 folds, **2.0e-7** on pure noise — riptide's own
+`Float32` accumulation. `test/test_search.jl` pins `snr_metrics` against a
+longhand `snr1` at machine precision, pins the template's zero-mean/unit-L2
+properties, pins unit variance per (phase, width) on 20k noise realisations, and
+pins baseline invariance of `_boxcar_scan`. The Python oracle moved in step, so
+`crossval_accuracy.jl` still reads **1.416e-16** on the metric. 548 tests, up
+from 462.
+
+**Why the median had to go, and why the obvious fix would have been wrong.**
+
+* The prescription in §3.2 was "a deterministic per-width factor in
+  `_boxcar_scan`". **That would have over-corrected.** `ours = sqrt(1-d) x riptide`
+  is exact for the *zero-baseline gate*, which is where the analysis had been
+  done — but `_boxcar_scan` runs with the **median** baseline for every reported
+  candidate, and the median's own variance already compensates part of the
+  factor. Measured per-(phase,width) noise sd at `nbins = 120`: 1.001 (`w=1`) to
+  **0.951** (`w=28`), not to 0.876. Applying `1/sqrt(1-d)` on top gives 1.005 to
+  1.086, turning a bias against broad pulses into a bias for them (12% at
+  `nbins = 20`). **The analysis had been done on the gate; the shipped path was
+  not the gate.**
+* **The median recovered nothing.** DC is held at zero, so `S_off == -S_w`
+  identically: the true off-pulse level is `-S_w/(n-w)`, and subtracting it is
+  *exactly* a `1/(1-d)` rescale of `S_w`. Verified to 9 decimals against an
+  oracle off-pulse baseline. The pulse's DC power was never lost when the profile
+  was forced to zero mean — the constraint had already put all of it into `S_w`,
+  where the boxcar picks it up.
+* **What the *sample* median actually did was make the normalisation depend on
+  the source.** It sits near 0 in noise and near the off-pulse level for a bright
+  pulse, so the ratio to riptide's statistic drifted **0.981 -> 1.065** with
+  injected amplitude at 5% duty (0.90 -> 1.03 at 15% duty). A statistic whose
+  scale depends on the signal has no calculable false-alarm rate at any
+  threshold, which is a worse problem than the one §3.2 set out to fix.
+* **At matched false-alarm rate the zero-mean template is strictly better**
+  (Gaussian pulses, FAP 1e-3, `nbins = 120`, detection fraction at amplitude 8):
+
+  | ducy | 0.02 | 0.05 | 0.10 | 0.20 | 0.30 |
+  |---|---|---|---|---|---|
+  | median baseline, `/sigma*sqrt(w)` | 0.999 | 0.993 | 0.893 | 0.142 | 0.010 |
+  | riptide's template | 0.999 | 0.998 | **0.971** | **0.274** | **0.019** |
+
+**Effect on real data (PM0063, `-t 4`, threshold 6, 0.1-33.3 Hz).** The 7.1185 Hz
+pulsar reads **13.27 -> 12.30** (`k = 4` both times, ducy 10%), and the empirical
+noise floor falls with it — FAP=1e-5 goes 6.367 -> 6.167 at `k=1` and 5.681 ->
+5.514 at `k=4`, from 8.36M trials per rung. Candidates >= 6.0 go 21 -> 7, but
+**that is mostly the rescale**: at matched FAP the counts are comparable, and
+saying otherwise would overclaim. The genuine gains are the broad-duty row of the
+table above, and having a threshold whose FAP is calculable at all.
+
+**It did NOT close the S/N gap to `rseek`, and that is the useful finding.**
+`--preset matched`, one fold depth per side: rseek **12.60** (`w=13`, ducy 10.3%)
+vs ours 12.10 -> **11.84** (`H=65`, ducy 14.6%). Since the metric is now provably
+identical *on identical profiles*, the entire remaining gap is the **profile
+estimator** — our 65-harmonic coherent Fourier fold against riptide's time-domain
+FFA fold — and/or sigma-hat. **That is the next thing to investigate if the
+per-fold S/N gap matters**, and it is now cleanly separated from the S/N
+definition, which is where it had been hiding.
+
+**Cost.** ~8% off the metric phase: `bench/metric_bench.jl` reads 1092 -> 950 us
+per chunk, after correcting the ~6% whole-machine drift visible in the
+*untouched* sigma-hat (193.4 -> 181.0) and transpose (437.6 -> 410.8) columns —
+the removed median rescan, against ~1% added to the scan by the `d*S_tot` term.
+End to end that is inside this host's run-to-run scatter (`-t 1`: 17.45 s ->
+17.34 s, median of 3, ~15% spread), so **do not quote a wall-clock speedup for
+this change.**
+
+**One API note.** `boxcar_widths` now caps at `nbins-1` (riptide's
+`check_trial_widths` requires `w < bins`) and rejects `nbins < 2`: the zero-mean
+unit-L2 template of a full-width boxcar is the zero vector, and `sqrt(w*(1-w/n))`
+would be 0. At the default `maxfrac = 0.3` the cap only bites for `nbins <= 3`.
 
 ---
 

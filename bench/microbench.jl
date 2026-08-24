@@ -39,10 +39,10 @@ show(stdout, MIME"text/plain"(), b_chunk); println("\n", "-"^70)
 CS.fill_chunk_profiles!(ws, dplans, ft, params, rstart, lodr, Nprof; t0=0)
 
 # --- Bucket 3: the boxcar metric over a full chunk of profiles ----------------
-# Two parts: (a) one per-block robust σ (_block_sigma: two MADs over a strided
+# Two parts: (a) one per-block robust σ (_block_sigma: a MAD over a strided
 # subsample), amortised across the whole block; (b) _profile_boxcar per profile
-# (per-profile median + prefix sum + width×phase matched-filter scan).
-let profs = ws.profs, nbins = 2nharms, medbuf = ws.medbuf,
+# (prefix sum + width×phase matched-filter scan).
+let profs = ws.profs, nbins = 2nharms,
     widths = ws.bcwidths, psum = ws.bcpsum, sigbuf = ws.bcsig
     println("boxcar widths (nbins=$nbins): ", widths, "   (", length(widths), " widths)")
 
@@ -53,15 +53,15 @@ let profs = ws.profs, nbins = 2nharms, medbuf = ws.medbuf,
 
     sigma = CS._block_sigma(profs, nbins, Nprof, sigbuf)
     invsigma = sigma > 0 ? 1.0 / sigma : 0.0
-    function boxcar_all(profs, medbuf, psum, widths, nbins, invsigma, n)
+    function boxcar_all(profs, psum, widths, nbins, invsigma, n)
         s = 0.0
         @inbounds for j in 1:n
-            s += CS._profile_boxcar(profs, j, medbuf, psum, widths, nbins, invsigma)
+            s += CS._profile_boxcar(profs, j, psum, widths, nbins, invsigma)
         end
         s
     end
-    b = @benchmark $boxcar_all($profs, $medbuf, $psum, $widths, $nbins, $invsigma, $Nprof)
-    println("_profile_boxcar x$Nprof (median + prefix-sum + $(length(widths))-width scan, nbins=$nbins):  ",
+    b = @benchmark $boxcar_all($profs, $psum, $widths, $nbins, $invsigma, $Nprof)
+    println("_profile_boxcar x$Nprof (prefix-sum + $(length(widths))-width scan, nbins=$nbins):  ",
             BenchmarkTools.prettytime(minimum(b).time),
             "  => ", round(minimum(b).time/Nprof; digits=1), " ns/call")
 end

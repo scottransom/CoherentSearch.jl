@@ -776,9 +776,13 @@ def main(argv=None):
     print(f"  matched by both: {both}   coherent_search only: {conly}   rseek only: {ronly}"
           + (f" (of which {ronly_harm} are harmonics of a matched signal)" if ronly_harm else ""))
     print()
-    print("  S/N is NOT the same statistic on both sides (time-domain matched filter")
-    print("  vs coherent Fourier boxcar) -- compare which signals are found, and the")
-    print("  duty cycles, which ARE defined identically.")
+    print("  S/N IS the same statistic on both sides as of 2026-08-24: both are the")
+    print("  peak of riptide's zero-mean unit-L2 boxcar matched filter (cpp/snr.hpp:")
+    print("  snr1), verified to 1.4e-7 on identical profiles.  What still differs is")
+    print("  the PROFILE each computes it on -- our coherent Fourier fold vs riptide's")
+    print("  time-domain FFA fold -- and the sigma-hat, so a residual S/N gap is a")
+    print("  statement about the folds, not about the detector.  Duty cycles are")
+    print("  defined identically on both sides too.")
     print("  rseek does no harmonic filtering; we collapse harmonic families by")
     print("  default.  Pass --noharmremove for a like-for-like candidate count.")
 

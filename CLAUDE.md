@@ -135,6 +135,11 @@ at `../riptide`), not the Python original. Run
 **And we detect more strongly**: the 7.1185 Hz pulsar at S/N 13.27 vs riptide's
 11.80, plus two candidates it does not report. riptide's two extra entries are
 the `f/2` and `2f` of the pulsar, which it does not filter and we collapse.
+**Both of those numbers predate the 2026-08-24 metric change** — the pulsar now
+reads **12.30** on the same config, against a noise floor that fell with it (see
+the metric entry below). Since our S/N is now riptide's statistic exactly, the
+two columns are finally the same quantity and a re-measurement of this table is
+the first thing to do on the next benchmarking pass.
 
 **This section has read "we are slower" for its whole life and no longer does —
 check the date before quoting it.** The history on the laptop is 29.3 s
@@ -215,27 +220,54 @@ optimisation below (1.84x vs 1.26x on the same code and the same data).
   clock, 1.91x on pure compute** (9.03 s against its 17.27 s). The `bench` deficit
   was never the code, and there is no longer a deficit in either preset.
   **But rseek still wins the pulsar in that config: S/N 12.60 (`w=13`, ducy 10.3%)
-  vs our 12.10 (H=65, ducy 14.6%) at the same depth.** Our 13.27 comes from the
-  decimated fold, so "we detect more strongly" is a statement about the *ladder*,
-  not about the per-fold detector.
-- **Our S/N and riptide's are the SAME statistic, up to `√(1−duty)` — and that
-  factor is our bug, not a difference of definition (2026-08-16).** Both are a
-  boxcar matched filter maximised over phase on a folded profile. riptide
-  (`cpp/snr.hpp:snr1`) correlates against a *zero-mean, unit-L2* boxcar, so its
-  per-phase statistic has variance exactly 1. `_boxcar_scan` sums `w`
-  median-subtracted on-pulse bins and divides by `σ√w` — normalising as if the
-  baseline were known rather than estimated from the same profile — so **our
-  per-phase variance is `1 − duty`, not 1**, and the code comment claiming
-  "dividing by σ√w makes every trial unit-variance regardless of w or nbins" is
-  wrong at the wide end. Working the templates out: `ours = √(1 − w/nbins) ×
-  riptide's`, pointwise. Measured on 200k pure-noise 120-bin profiles, the ratio
-  of per-width means matches to four decimals: 0.9962 at `w=1` → 0.8758 at
-  `w=28`. Consequences: (a) the two codes' S/N are comparable after multiplying
-  ours by `1/√(1−ducy)`; (b) a fixed threshold is effectively `thr/√(1−duty)`,
-  i.e. 8.0 at `w=1` but 9.6 at 30% duty, so **we are systematically biased
-  against broad pulses** — worst exactly where the shallow decimation folds live
-  (`nbins=20`, `w=6`). Fix is a deterministic per-width factor, but it moves
-  every reported S/N; see `Summary_and_Future_Work.md` §3.2.
+  vs our 12.10 (H=65, ducy 14.6%) at the same depth — 11.84 after 2026-08-24.**
+  Our 13.27 comes from the decimated fold, so "we detect more strongly" is a
+  statement about the *ladder*, not about the per-fold detector. And since the
+  metric is now riptide's exactly, that per-fold gap is now known to be the
+  *profile estimator*, not the S/N definition.
+- **Our S/N IS riptide's S/N as of 2026-08-24 — same statistic, not merely
+  comparable.** `_boxcar_scan`, the Python oracle's `snr_metric` and riptide's
+  `cpp/snr.hpp:snr1` all correlate the profile against the width-`w` boxcar made
+  *zero-mean and unit-L2* (`h = √((n−w)/(nw))` on-pulse, `−b = −w/(n−w)·h` off),
+  which is `(S_w − δ·S_tot)/(σ√(w(1−δ)))` with `δ = w/n`. Verified against the
+  riptide binary itself on real PM0063 folds and on pure noise: **1.4e-7 and
+  2.0e-7 max relative**, which is riptide's own `Float32` accumulation.
+  `test_search.jl` pins it against a longhand `snr1` at machine precision.
+  - **What this replaced, and why the obvious fix would have been wrong.** The
+    metric used to subtract each profile's *median* and divide by `σ√w`. Against
+    the zero baseline that really is `√(1−δ) ×` riptide's, exactly and
+    pointwise — but `_boxcar_scan` is called with the *median* baseline for every
+    reported candidate, and the median's own variance already compensates part of
+    it: measured per-(phase,width) noise sd at `nbins=120` ran 1.001 (`w=1`) to
+    0.951 (`w=28`), not to `√(1−δ) = 0.876`. **So the prescribed "deterministic
+    per-width factor in `_boxcar_scan`" would have over-corrected by 9% at
+    `nbins=120` and 12% at `nbins=20`**, turning a bias against broad pulses into
+    a bias for them. Read that as another instance of the standing lesson: the
+    analysis had been done on the gate, and the shipped path was not the gate.
+  - **The median recovered nothing.** DC is held at zero, so `S_off ≡ −S_w`
+    identically and subtracting the true off-pulse level is *exactly* a `1/(1−δ)`
+    rescale of `S_w` (verified to 9 decimals). What the *sample* median does is
+    slide between 0 (noise) and that level (bright pulse), so the old metric's
+    ratio to riptide's drifted **0.981 → 1.065 with source brightness at 5%
+    duty** — a normalisation that depended on the signal, hence no calculable
+    false-alarm rate. At matched FAP the zero-mean template detects strictly
+    better at every duty: equal below ~5%, **0.274 vs 0.142** detection fraction
+    at 20% duty, 0.019 vs 0.010 at 30% (Gaussian pulses, FAP 1e-3, `nbins=120`).
+  - **Cost on real data, measured:** PM0063's 7.1185 Hz pulsar reads 13.27 → 12.30
+    (bench config, `k=4` both), and the empirical noise floor falls with it
+    (FAP=1e-5 at `k=4`: 5.681 → 5.514; at `k=1`: 6.367 → 6.167, from 8.36M trials
+    per rung). Candidates ≥ 6.0 go 21 → 7 — **mostly the rescale, not a real
+    reduction in false alarms**; at matched FAP the counts are comparable.
+  - **It did NOT close the gap to `rseek` on that pulsar, and that is the useful
+    part.** `--preset matched`, same depth: rseek 12.60 (w=13), ours 12.10 → 11.84
+    (H=65). Since the metric is now provably identical on identical profiles, the
+    whole remaining gap is the **profile estimator** — our 65-harmonic coherent
+    Fourier fold vs riptide's time-domain FFA fold — and/or σ̂. That is the next
+    thing to look at if the S/N gap matters; it was never the normalisation.
+  - Worth ~8% of the metric phase (1092 → 950 µs/chunk, after correcting the ~6%
+    whole-machine drift visible in the untouched σ̂ and transpose columns): the
+    median rescan is gone, against ~1% added to the scan by the `δ·S_tot` term.
+    End to end that is inside this host's run-to-run scatter.
 - **riptide is width-limited at large `b`, and that is why its S/N is lower.**
   `generate_width_trials` is called with **`bins_min`**, and `rseek` hardcodes
   `ducy_max = 0.3`, so the bank is `[1,2,3,4,6]` for *every* profile regardless
@@ -277,7 +309,7 @@ re-deriving them.
   `fill_chunk_profiles!` into zeroing / interp / transform, and times the
   decimated transforms, on the production `Workspace`), `metric_bench.jl` (the
   same treatment for the metric: σ̂ / transpose / width scan / gate / gate+rescan,
-  per fold depth, plus the fraction of trials clearing `medcut`). Run single-threaded (`-t 1`)
+  per fold depth, plus the fraction of trials clearing `exactcut`). Run single-threaded (`-t 1`)
   for clean profile attribution; warm up before timing to exclude JIT. Example
   FFT for longer runs: `PM0063_034C1_DM445.0_red.fft`.
 - **`bench/thread_scaling.jl` is the standard scaling check** (it replaced the
@@ -341,8 +373,8 @@ re-deriving them.
   (`Float32` tile, what ships). Two traps: **`B` must be a `Val`** — with a
   runtime `Int` batching is *slower* than the scalar path it replaces — and the
   `Float32` is sound only *because it is a gate* (error ≤7e-7 vs the
-  `boxcar_medmargin=2.0` slack, so it cannot move which trials get scored
-  exactly). `bench/boxcar_bench.jl` re-measures both axes; two new pins in
+  `boxcar_gatemargin=0.01` slack, so it cannot move which trials get re-scored
+  in `Float64`). `bench/boxcar_bench.jl` re-measures both axes; two new pins in
   `test/test_search.jl` cover the gate, which previously had none.
 - **Done (2026-08-09): `_block_sigma` 839 → 289 µs/chunk (2.90x), 1.08x
   end-to-end**, bit-identical σ̂. (a) The strided gather recomputed `(i,j)` from a
@@ -555,7 +587,8 @@ re-deriving them.
     on the workstation.** The "~15.8 GB/s L3 wall" that justified the verdict was
     not a wall at all; see the transpose entry below); and a cheap upper bound to
     skip profiles outright (after ladder pruning the bank is all narrow, and the
-    tightest cheap bound sits at 5.9 against `medcut = 4.0`).
+    tightest cheap bound sits at 5.9 against the then-`medcut = 4.0`; the cut is
+    now `threshold − 0.01`, which makes such a bound useless outright).
 - **Done (2026-08-22, follow-up): σ̂ folds about the structural zero — another
   12.2% off the metric, 1.04x end-to-end.** DC is held at zero, so every profile's
   bin mean is *exactly* 0 and the pooled distribution is symmetric about it;
@@ -569,7 +602,7 @@ re-deriving them.
     MAD-about-the-sample-median that upstream `snr_metric` does, `snr_metrics`
     forwards it as `sigma_center`, and `crossval/crossval_accuracy.jl` passes
     `:median` — so the metric pin stays at **1.365e-16** and still covers the
-    width bank, the per-profile median baseline and the scan arithmetic. Loosening
+    width bank, the boxcar template and the scan arithmetic. Loosening
     that tolerance to ~1e-2 to swallow the difference would have been the wrong
     trade: it would hide a real bug in any of those three.
   - `test/test_search.jl` pins `:zero` against `:median` (≤2% at every fold depth,

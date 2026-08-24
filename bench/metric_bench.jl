@@ -28,7 +28,7 @@ params = SearchParams(nharms=NHARMS, threshold=THRESH,
                       decimations=decimation_set(NHARMS, MAXDEC))
 ws = CS.Workspace(params, NPROF)
 dplans = CS.build_direct_plans(params, rstart)
-medcut = THRESH - params.boxcar_medmargin
+exactcut = THRESH - params.boxcar_gatemargin
 
 # One genuine chunk into ws.ftprofs / ws.profs (and hence every db.dprofs).
 function fillchunk!()
@@ -63,21 +63,20 @@ end
 # Rows: one per fold depth, k=1 first.
 struct Fold
     k::Int; nbins::Int; profs::Matrix{Float64}; widths::Vector{Int}
-    bb::Any; medbuf::Vector{Float64}; psum::Vector{Float64}
-    bcsig::Vector{Float64}; medpairs::Vector{Tuple{Int,Int}}
+    bb::Any; psum::Vector{Float64}; bcsig::Vector{Float64}
 end
 
 function main()
     fillchunk!()
-    folds = Fold[Fold(1, 2NHARMS, ws.profs, ws.bcwidths, ws.bcbatch, ws.medbuf,
-                      ws.bcpsum, ws.bcsig, ws.medpairs)]
+    folds = Fold[Fold(1, 2NHARMS, ws.profs, ws.bcwidths, ws.bcbatch,
+                      ws.bcpsum, ws.bcsig)]
     for db in ws.decims
         push!(folds, Fold(db.k, 2db.Hk, db.dprofs, db.bcwidths, db.bcbatch,
-                          db.medbuf, db.bcpsum, db.bcsig, db.medpairs))
+                          db.bcpsum, db.bcsig))
     end
 
-    @printf("metric bench — %s  f=%.4g Hz  nharms=%d  Nprof=%d  maxdecim=%d  medcut=%.1f\n\n",
-            FILE, FREQ, NHARMS, NPROF, MAXDEC, medcut)
+    @printf("metric bench — %s  f=%.4g Hz  nharms=%d  Nprof=%d  maxdecim=%d  exactcut=%.2f\n\n",
+            FILE, FREQ, NHARMS, NPROF, MAXDEC, exactcut)
     @printf("  %-3s %6s %-26s %8s %8s %8s %8s %8s %7s\n",
             "k", "nbins", "widths", "sigma", "transp", "scan", "gate", "metric", "rescan%")
     tot = zeros(5)
@@ -90,11 +89,11 @@ function main()
         t_sc  = us(@benchmark scan_only!($(f.bb), $NPROF, $(f.widths), $(f.nbins), $invt) evals=1 samples=100)
         t_g   = us(@benchmark CS._boxcar_gate!($(f.bb), $(f.profs), $NPROF, $(f.psum),
                                                $(f.widths), $(f.nbins), $invs) evals=1 samples=100)
-        t_m   = us(@benchmark CS.boxcar_metrics!($(f.bb), $(f.profs), $NPROF, $(f.medbuf),
+        t_m   = us(@benchmark CS.boxcar_metrics!($(f.bb), $(f.profs), $NPROF,
                                                  $(f.psum), $(f.widths), $(f.nbins), $invs,
-                                                 $(f.medpairs), $medcut) evals=1 samples=100)
+                                                 $exactcut) evals=1 samples=100)
         CS._boxcar_gate!(f.bb, f.profs, NPROF, f.psum, f.widths, f.nbins, invs)
-        nres = count(>=(medcut), @view f.bb.mvals[1:NPROF])
+        nres = count(>=(exactcut), @view f.bb.mvals[1:NPROF])
         @printf("  %-3d %6d %-26s %8.1f %8.1f %8.1f %8.1f %8.1f %6.2f%%\n",
                 f.k, f.nbins, string(f.widths), t_sig, t_tr, t_sc, t_g, t_m,
                 100 * nres / NPROF)

@@ -89,11 +89,11 @@ function classify(sf)
     (occursin("fft", lowercase(file)) || occursin("FFTW", file)) && return "FFTW"
     occursin("sort", file)                             && return "median-sort"
     (fn in ("_median!", "_select!", "_swap!"))         && return "median-select"
-    # The batched cross-profile gate (the ~99% path) is split out from the exact
-    # median rescan, since they now scale with quite different things.
+    # The batched cross-profile gate (the ~99% path) is split out from the
+    # Float64 re-score, since they scale with quite different things.
     (fn == "_boxcar_gate!" || fn == "_bc_scan_batch!" ||
      fn == "_bc_transpose!")                           && return "boxcar-gate (batched)"
-    (fn == "_profile_boxcar" || fn == "_boxcar_exact" ||
+    (fn == "_profile_boxcar" ||
      fn == "boxcar_metrics!" || fn == "_boxcar_scan" ||
      fn == "_boxcar_psum!")                            && return "boxcar-metric"
     fn == "_block_sigma"                               && return "block-sigma"

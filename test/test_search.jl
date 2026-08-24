@@ -110,6 +110,85 @@ end
     @test snr_metrics(small) == snr_metrics(small; sigma_samples=CoherentSearch._BOXCAR_SIGMA_SAMPLES)
 end
 
+# riptide's `cpp/snr.hpp:snr1`, written out longhand: correlate against the
+# width-`w` boxcar made zero-mean and unit-L2, maximise over phase and width.
+# This is the definition our `_boxcar_scan` and the Python oracle's `snr_metric`
+# both implement in prefix-sum form.
+function _snr1_longhand(prof, widths, stdnoise)
+    n = length(prof)
+    stot = sum(prof)
+    best = -Inf
+    for w in widths
+        h = sqrt((n - w) / (n * w))                 # boxcar height  = +h
+        b = w / (n - w) * h                         # boxcar baseline = -b
+        dmax = maximum(sum(prof[mod1(p + i, n)] for i in 0:(w - 1)) for p in 1:n)
+        best = max(best, ((h + b) * dmax - b * stot) / stdnoise)
+    end
+    return best
+end
+
+@testset "the metric IS riptide's snr1 (zero-mean, unit-L2 boxcar template)" begin
+    CS = CoherentSearch
+
+    # The two properties that define the template, and that make the statistic
+    # unit-variance per (phase, width).  If either fails, the normalisation below
+    # is not a matched filter and no threshold has a calculable false-alarm rate.
+    for nbins in (20, 30, 64, 120), w in boxcar_widths(nbins)
+        h = sqrt((nbins - w) / (nbins * w))
+        b = w / (nbins - w) * h
+        t = fill(-b, nbins); t[1:w] .= h
+        @test abs(sum(t)) < 1e-13                   # zero mean
+        @test isapprox(sum(abs2, t), 1.0; rtol=1e-13)   # unit L2
+    end
+
+    # `snr_metrics` against that definition, on profiles built the way the search
+    # builds them (DC held at zero) plus one carrying a real pulse.  This is the
+    # pin that says our prefix-sum form and riptide's template form agree; it was
+    # measured against the riptide binary itself at 1.4e-7, which is riptide's own
+    # Float32 accumulation, so the tolerance here is machine precision instead.
+    rng = MersenneTwister(20260824)
+    for nbins in (20, 30, 120)
+        P = randn(rng, nbins, 32)
+        P .-= sum(P, dims=1) ./ nbins
+        P[3:5, 7] .+= 6.0
+        widths = boxcar_widths(nbins)
+        sigma = CS._block_sigma(copy(P), nbins, size(P, 2), Vector{Float64}(undef, length(P)))
+        got = snr_metrics(P)
+        want = [_snr1_longhand(view(P, :, j), widths, sigma) for j in 1:size(P, 2)]
+        @test maximum(abs.(got .- want)) < 1e-12 * maximum(abs.(want))
+    end
+
+    # Unit variance per (phase, width), which is the whole point of the change.
+    # Checked on the longhand template at a *fixed* phase (the peak over phase is
+    # an extreme value, not N(0,1)); the pin above ties our code to it.  The old
+    # `median baseline / σ√w` metric gave 0.951 here at w = 28, which this
+    # tolerance would catch.
+    nbins = 120
+    N = 20_000
+    rng2 = MersenneTwister(31415)
+    X = randn(rng2, nbins, N)
+    X .-= sum(X, dims=1) ./ nbins                   # DC held at zero
+    for w in (1, 4, 13, 28)
+        h = sqrt((nbins - w) / (nbins * w))
+        b = w / (nbins - w) * h
+        z = [(h + b) * sum(view(X, 1:w, j)) - b * sum(view(X, :, j)) for j in 1:N]
+        sd = sqrt(sum(abs2, z .- sum(z) / N) / (N - 1))
+        @test isapprox(sd, 1.0; atol=0.03)
+    end
+
+    # Invariant to any constant baseline already removed from the profile — which
+    # is what lets the hot loop prefix-sum against 0 while `snr_metrics` removes
+    # the mean for conditioning, and still get the same number.
+    prof = randn(MersenneTwister(5), 60)
+    widths = boxcar_widths(60)
+    psum = Vector{Float64}(undef, 60 + widths[end] + 1)
+    vals = map((0.0, sum(prof) / 60, 37.0, -1.0e3)) do base
+        CS._boxcar_psum!(psum, prof, 60, widths[end], base)
+        CS._boxcar_scan(psum, widths, 60, 1.0)
+    end
+    @test all(isapprox(v, vals[1]; rtol=1e-10) for v in vals)
+end
+
 @testset "remove_duplicates collapses clusters" begin
     # Two tight clusters (near-identical r) plus one isolated candidate; each
     # cluster should collapse to its single strongest member.
@@ -285,26 +364,26 @@ if isfile(EXAMPLE_FFT)
     end
 
     @testset "boxcar fast gate does not change the candidate list" begin
-        # The production :boxcar path scores ~99% of trials with only a cheap
-        # zero-baseline *lower bound* (batched across profiles, in Float32), and
-        # pays for the exact median baseline only when that bound comes within
-        # `boxcar_medmargin` of `threshold`.  `boxcar_medmargin = Inf` forces
-        # `medcut = -Inf`, i.e. the exact scalar path for every trial — so the
-        # two runs must produce byte-identical candidates.  This is the pin for
-        # both the gate itself and the cross-profile SIMD batching behind it.
+        # The production :boxcar path scores ~99% of trials with only the
+        # batched `Float32` kernel, and re-scores in `Float64` only those that
+        # land within `boxcar_gatemargin` of `threshold`.
+        # `boxcar_gatemargin = Inf` forces `exactcut = -Inf`, i.e. the `Float64`
+        # scalar path for every trial — so the two runs must produce
+        # byte-identical candidates.  This is the pin for both the gate itself
+        # and the cross-profile SIMD batching behind it.
         gated = SearchParams(nharms=60, m=32,
                              decimations=decimation_set(60, 4))
         exact = SearchParams(nharms=60, m=32,
                              decimations=decimation_set(60, 4),
-                             boxcar_medmargin=Inf)
+                             boxcar_gatemargin=Inf)
         kw = (lofreq=9.5, hifreq=10.5, threshold=6.0, blocksize=512)
         cg = search(ft, gated; kw...)
         ce = search(ft, exact; kw...)
         @info "boxcar gate vs exact" ngated=length(cg) nexact=length(ce)
         @test length(cg) == length(ce)
         @test all(a.freq == b.freq && a.nharm == b.nharm for (a, b) in zip(cg, ce))
-        # Candidates come from the exact path in both runs, so even the metric
-        # is bit-for-bit equal — the Float32 gate only decides *what* to score.
+        # Candidates come from the `Float64` path in both runs, so even the
+        # metric is bit-for-bit equal — the gate only decides *what* to re-score.
         @test all(a.metric == b.metric for (a, b) in zip(cg, ce))
     end
 
@@ -344,9 +423,10 @@ if isfile(EXAMPLE_FFT)
 
     @testset "batched boxcar gate matches the scalar gate" begin
         # Directly: the cross-profile SIMD gate against the per-column scalar
-        # one it replaces, on real profiles.  Float32 tiles make this close, not
-        # exact; the bound that matters is that it stays far under
-        # `boxcar_medmargin` (2.0), which is the slack the rescue reserves.
+        # one it replaces, on real profiles.  Both now compute the *same*
+        # statistic, so the only difference is the `Float32` tile; what matters
+        # is that it stays far under `boxcar_gatemargin` (0.01), the slack the
+        # `Float64` re-score reserves.
         CS = CoherentSearch
         params = SearchParams(nharms=60, m=32)
         nbins = 2params.nharms
@@ -362,11 +442,11 @@ if isfile(EXAMPLE_FFT)
         CS._boxcar_gate!(ws.bcbatch, ws.profs, Nprof, ws.bcpsum, ws.bcwidths,
                          nbins, PIN_PROFT(invsigma))
         got = copy(ws.bcbatch.mvals[1:Nprof])
-        want = [Float64(CS._profile_boxcar(ws.profs, j, ws.medbuf, ws.bcpsum, ws.bcwidths,
-                                           nbins, invsigma, ws.medpairs, Inf)) for j in 1:Nprof]
+        want = [Float64(CS._profile_boxcar(ws.profs, j, ws.bcpsum, ws.bcwidths,
+                                           nbins, invsigma)) for j in 1:Nprof]
         err = maximum(abs.(got .- want))
-        @info "batched vs scalar boxcar gate" maxabs=err medmargin=params.boxcar_medmargin
-        @test err < 1e-3 * params.boxcar_medmargin
+        @info "batched vs scalar boxcar gate" maxabs=err gatemargin=params.boxcar_gatemargin
+        @test err < 1e-3 * params.boxcar_gatemargin
         # The `< _BC_BATCH` tail columns take the scalar kernel, so they are exact.
         ntail = Nprof - (Nprof ÷ CS._BC_BATCH) * CS._BC_BATCH
         @test all(got[j] == want[j] for j in (Nprof - ntail + 1):Nprof)
@@ -735,26 +815,29 @@ end
     prof = zeros(nbins); prof[63:64] .= 1.0; prof[1:2] .= 1.0
     @test boxcar_best_width(prof)[1] == 4
 
-    # The width is independent of scale and of an additive baseline (the median
-    # is subtracted, and sigma is a common factor across widths) -- which is what
-    # licenses measuring it on an isolated profile, with no block statistics.
+    # The width is independent of scale and of an additive baseline (the
+    # zero-mean template kills any constant, and sigma is a common factor across
+    # widths) -- which is what licenses measuring it on an isolated profile, with
+    # no block statistics.
     prof = zeros(nbins); prof[20:25] .= 1.0
     w0, _ = boxcar_best_width(prof)
     @test boxcar_best_width(1e6 .* prof)[1] == w0
     @test boxcar_best_width(prof .+ 37.0)[1] == w0
 
-    # Pin the prefix-sum machinery to a naive, obviously-correct scan: subtract
-    # the median, sum every circular window of every bank width, divide by sqrt(w).
-    # The wrapped-window indexing is the part that could plausibly be wrong.
+    # Pin the prefix-sum machinery to a naive, obviously-correct scan: sum every
+    # circular window of every bank width and score it with riptide's zero-mean,
+    # unit-L2 boxcar template written out longhand.  The wrapped-window indexing
+    # is the part that could plausibly be wrong.
     function naive_best(prof, nb)
-        s = sort(prof)
-        med = isodd(nb) ? s[(nb + 1) ÷ 2] : 0.5 * (s[nb ÷ 2] + s[nb ÷ 2 + 1])
-        z = prof .- med
+        stot = sum(prof)
         best, bw = -Inf, 0
         for w in boxcar_widths(nb)
+            h = sqrt((nb - w) / (nb * w))          # riptide cpp/snr.hpp:snr1
+            b = w / (nb - w) * h
             for p in 1:nb
-                s = sum(z[mod1(p + i, nb)] for i in 0:(w - 1)) / sqrt(w)
-                s > best && (best = s; bw = w)
+                s = sum(prof[mod1(p + i, nb)] for i in 0:(w - 1))
+                c = (h + b) * s - b * stot
+                c > best && (best = c; bw = w)
             end
         end
         return bw
