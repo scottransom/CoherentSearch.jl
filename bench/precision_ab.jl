@@ -111,12 +111,16 @@ function main()
     for a in OPT.arms; @printf("%10s", a); end
     length(OPT.arms) == 2 && @printf("%10s", "Δ")
     println()
+    # Slots 10.. (`decim-brfft-k*`) are nested *inside* `decim-brfft`, so summing
+    # every row double-counts the decimated transforms.  Exclude them from the
+    # total; the accounted sum should land just under the wall clock at `-t 1`.
+    nested(k) = startswith(k, "decim-brfft-k")
     tot = Dict(a => 0.0 for a in OPT.arms)
     for k in keys_all
         @printf("  %-18s", k)
         for a in OPT.arms
             v = get(phases[a], k, 0.0) / OPT.reps
-            tot[a] += v
+            nested(k) || (tot[a] += v)
             @printf("%10.2f", v)
         end
         if length(OPT.arms) == 2
@@ -126,7 +130,7 @@ function main()
         end
         println()
     end
-    @printf("  %-18s", "TOTAL (phases)")
+    @printf("  %-18s", "TOTAL (top-level)")
     for a in OPT.arms; @printf("%10.2f", tot[a]); end
     println()
 end
