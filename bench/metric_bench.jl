@@ -18,13 +18,14 @@ const CS = CoherentSearch
 const FILE   = length(ARGS) >= 1 ? ARGS[1] : "PM0063_034C1_DM445.0_red.fft"
 const FREQ   = length(ARGS) >= 2 ? parse(Float64, ARGS[2]) : 10.0
 const MAXDEC = length(ARGS) >= 3 ? parse(Int, ARGS[3]) : 6
+const PREC   = length(ARGS) >= 4 ? Symbol(ARGS[4]) : :f64
 const NHARMS = 60
 const NPROF  = 2048
 const THRESH = 6.0
 
 ft = FFTFile(FILE)
 rstart = FREQ * ft.T
-params = SearchParams(nharms=NHARMS, threshold=THRESH,
+params = SearchParams(nharms=NHARMS, threshold=THRESH, precision=PREC,
                       decimations=decimation_set(NHARMS, MAXDEC))
 ws = CS.Workspace(params, NPROF)
 dplans = CS.build_direct_plans(params, rstart)
@@ -61,28 +62,29 @@ function scan_only!(bb, n, widths, nbins, invsig)
 end
 
 # Rows: one per fold depth, k=1 first.
-struct Fold
-    k::Int; nbins::Int; profs::Matrix{Float64}; widths::Vector{Int}
-    bb::Any; psum::Vector{Float64}; bcsig::Vector{Float64}
+struct Fold{P<:AbstractFloat}
+    k::Int; nbins::Int; profs::Matrix{P}; widths::Vector{Int}
+    bb::Any; psum::Vector{P}; bcsig::Vector{P}
 end
 
 function main()
     fillchunk!()
-    folds = Fold[Fold(1, 2NHARMS, ws.profs, ws.bcwidths, ws.bcbatch,
-                      ws.bcpsum, ws.bcsig)]
+    folds = [Fold(1, 2NHARMS, ws.profs, ws.bcwidths, ws.bcbatch,
+                  ws.bcpsum, ws.bcsig)]
     for db in ws.decims
         push!(folds, Fold(db.k, 2db.Hk, db.dprofs, db.bcwidths, db.bcbatch,
                           db.bcpsum, db.bcsig))
     end
 
-    @printf("metric bench — %s  f=%.4g Hz  nharms=%d  Nprof=%d  maxdecim=%d  exactcut=%.2f\n\n",
-            FILE, FREQ, NHARMS, NPROF, MAXDEC, exactcut)
+    @printf("metric bench — %s  f=%.4g Hz  nharms=%d  Nprof=%d  maxdecim=%d  precision=%s  exactcut=%.2f\n\n",
+            FILE, FREQ, NHARMS, NPROF, MAXDEC, PREC, exactcut)
     @printf("  %-3s %6s %-26s %8s %8s %8s %8s %8s %7s\n",
             "k", "nbins", "widths", "sigma", "transp", "scan", "gate", "metric", "rescan%")
     tot = zeros(5)
     for f in folds
         sig = CS._block_sigma(f.profs, f.nbins, NPROF, f.bcsig)
-        invs = 1.0 / sig
+        P = eltype(f.profs)
+        invs = one(P) / P(sig)          # the search's own type, not always Float64
         invt = CS._BC_TILE(invs)
         t_sig = us(@benchmark CS._block_sigma($(f.profs), $(f.nbins), $NPROF, $(f.bcsig)) evals=1 samples=100)
         t_tr  = us(@benchmark transpose_only!($(f.bb), $(f.profs), $NPROF, $(f.nbins)) evals=1 samples=100)

@@ -727,11 +727,47 @@ re-deriving them.
   1.030x at `-t 4`, 1.173x at `-t 8`, 1.167x at `-t 16`, 1.337x at `-t 20`** —
   against the 2026-08-16 figures of 0.82/0.92/0.98/1.01 for the same four points.
   Every point improved and the crossover sits between 1 and 4 threads.
-  - The mechanism is visible in the phase table and is exactly what was predicted:
-    the metric's bandwidth-bound half gets cheaper (`decim-metric` −5.4%,
+  - **RE-MEASURED 2026-08-24 on an idle fitzroy, and the ratios above do NOT
+    reproduce — re-baseline before quoting them.** Same config, `precision_ab.jl`,
+    5 reps: **0.875x at `-t 1`, 0.981x at `-t 4`, 1.384x at `-t 16`, 1.029x at
+    `-t 20`.** The shape is the same (loses at 1 thread, wins big threaded) but
+    every number moved, and `-t 20` is now well below `-t 16` — this is a
+    dual-socket box and 20 threads crosses sockets, so confirm that point before
+    quoting it.
+  - **The recorded "mechanism" below is WRONG for the two metric rows.** It read:
+    "the metric's bandwidth-bound half gets cheaper (`decim-metric` −5.4%,
     `gate+metric` −8.1%, `zero-ftprofs` −62%, base `brfft` −18%) while
-    `decim-brfft` (+23%) and `interp` (+27%) get worse. At one thread the second
-    group wins; with 20 threads competing for L3 the first does.
+    `decim-brfft` (+23%) and `interp` (+27%) get worse." Re-measured, the
+    non-metric rows roughly hold (`zero-ftprofs` −60%, `interp` +32%,
+    `decim-brfft` +16%, base `brfft` −30%) but **the metric rows invert:
+    `decim-metric` +33.8% and `gate+metric` +46.1%.** Checked at `5bc46ad`, i.e.
+    *before* the 2026-08-24 metric change, so this is not a regression from that
+    work — the record was already wrong or was taken on different code.
+  - **The `:f32` gate penalty is real, reproducible, and UNEXPLAINED. Five
+    hypotheses are dead; do not re-guess them.** Measured on the production
+    buffers with a genuine chunk (`bench/metric_bench.jl`, now precision-aware):
+
+    | | transpose | scan | sum | gate (interleaved) |
+    |---|---|---|---|---|
+    | `:f64` | 415.0 | 352.3 | 767.3 | **765.8** — additive |
+    | `:f32` | 314.8 | 336.4 | 651.2 | **1037.4** — +386 µs |
+
+    Both kernels are individually *faster* in `:f32`; alternating them, as
+    `_boxcar_gate!` does, `:f32` costs 36% more. Ruled out: (1) something about
+    the shipped function — a hand-written copy of its loop reproduces it exactly;
+    (2) a type instability — zero allocations in both arms; (3) `_BC_TR_BJ` being
+    tuned in `:f64` — swept inside the *interleaved* loop, `BJ=8` is optimal for
+    both and `:f32` is worse at every value (2/4/8/16/32/64/128 → f64
+    948/824/**781**/2207/2179/2159/1922, f32 1395/1122/**1040**/1942/1907/1899/1907);
+    (4) type-based alias analysis (tile and profs both `Float32` defeating TBAA) —
+    a 2×2 on tile type × profile type does not fit that pattern (f64 profs
+    767/1191 for a `Float32`/`Float64` tile, f32 profs 1046/1109), though it does
+    confirm the shipped `Float32` tile is right; (5) small-transform or bandwidth
+    effects — the sum of the parts is *cheaper* in `:f32`, so the cost is created
+    by the interleaving itself. **`perf` is not available on fitzroy**, so the
+    hardware counters that would settle it could not be read. Next step if anyone
+    resumes this: bisect the interleaved loop by stubbing each kernel, or get
+    counter access.
   - **`Float32` interpolation *weights* do not fix the `interp` penalty** — tried,
     on the theory that it was a `ComplexF64`→`ComplexF32` store conversion. It is
     still +31% with `Float32` weights, so that hypothesis is wrong and the cause
@@ -741,7 +777,12 @@ re-deriving them.
   - **Still not the default**, because it loses at `-t 1` and the deployment model
     that matters for real searches is one single-threaded process per DM (§3.1).
     But `--precision f32` is now the right flag for a `-t 16`-and-up run, which it
-    was not on 2026-08-16.
+    was not on 2026-08-16. Note the `-t 16` win of **1.384x is achieved while
+    carrying the unexplained gate penalty above** — so that penalty is a reason
+    `:f32` is not better still, not a reason to avoid it.
+  - **Do not confuse this with the `Float32` interpolation *weights*, which ARE
+    the default** (7361279). Two separate knobs; the profile-stage `--precision`
+    has never been anything but `:f64`.
 - **Done (2026-08-22, workstation): `Float32` interpolation weights are now the
   DEFAULT, and the old "1.64x SLOWER" verdict was not merely void but backwards.**
   That verdict blamed the per-trial cross-lane reduce; the trials-axis kernel
