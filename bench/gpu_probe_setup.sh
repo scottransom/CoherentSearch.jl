@@ -3,9 +3,16 @@
 # bench/gpu_probe.jl.  Needs NO root, NO system CUDA toolkit, and nothing from
 # this repo except gpu_probe.jl itself -- scp the two files and run this.
 #
-#   ./gpu_probe_setup.sh                  # installs under ~/.gpuprobe, runs the probe
+#   ./gpu_probe_setup.sh                        # install, then run gpu_probe.jl
+#   ./gpu_probe_setup.sh bench/gpu_interp_bench.jl   # ...or any other bench/gpu* script
 #   PREFIX=/scratch/$USER/gpuprobe ./gpu_probe_setup.sh
 #   JULIA_DEPOT_PATH=/fast/local/depot ./gpu_probe_setup.sh
+#
+# If it is run from inside a CoherentSearch.jl checkout it ALSO `Pkg.develop`s the
+# package into the environment, so the scripts that need it (gpu_interp_bench.jl,
+# test/test_gpu.jl) work too.  CUDA is added to that separate environment, never
+# to the repo's own Project.toml -- CUDA is a weak dependency there on purpose,
+# and adding it as a hard one would undo the whole point (gpu_design.md 3.4).
 #
 # Only an NVIDIA *driver* is required: CUDA.jl downloads its own toolkit as
 # artifacts, so `nvcc` and a module-loaded CUDA are irrelevant (and a
@@ -21,7 +28,20 @@
 set -euo pipefail
 
 PREFIX="${PREFIX:-$HOME/.gpuprobe}"
-PROBE="${PROBE:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gpu_probe.jl}"
+BENCHDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# First positional argument selects the script to run; default the probe.
+SCRIPT="${1:-$BENCHDIR/gpu_probe.jl}"
+[ -f "$SCRIPT" ] || SCRIPT="$BENCHDIR/$(basename "$SCRIPT")"
+PROBE="${PROBE:-$SCRIPT}"
+# A checkout looks like <repo>/bench/this-script, with <repo>/Project.toml naming
+# the package.
+REPO="$(dirname "$BENCHDIR")"
+if grep -q '^name = "CoherentSearch"' "$REPO/Project.toml" 2>/dev/null; then
+    HAVE_REPO=1
+else
+    HAVE_REPO=0
+    REPO=""
+fi
 JULIA_VERSION="${JULIA_VERSION:-1.12.7}"
 
 [ -f "$PROBE" ] || { echo "error: probe script not found at $PROBE" >&2; exit 1; }
@@ -67,13 +87,24 @@ fi
 ENVDIR="$PREFIX/env"
 mkdir -p "$ENVDIR"
 echo "== depot: ${JULIA_DEPOT_PATH:-$HOME/.julia}  (CUDA artifacts are ~2.2 GB)"
-echo "== adding CUDA.jl (first run precompiles for several minutes)"
-"$JULIA" --project="$ENVDIR" -e 'using Pkg; Pkg.add("CUDA"); Pkg.precompile()'
+if [ "$HAVE_REPO" = 1 ]; then
+    echo "== repo detected at $REPO; adding CUDA + CoherentSearch (dev) to $ENVDIR"
+    echo "== (first run precompiles for several minutes)"
+    "$JULIA" --project="$ENVDIR" -e "using Pkg; Pkg.add(\"CUDA\"); Pkg.develop(path=\"$REPO\"); Pkg.precompile()"
+else
+    echo "== no repo checkout alongside; adding CUDA only (gpu_probe.jl needs nothing else)"
+    echo "== (first run precompiles for several minutes)"
+    "$JULIA" --project="$ENVDIR" -e 'using Pkg; Pkg.add("CUDA"); Pkg.precompile()'
+fi
 
 # --- run ------------------------------------------------------------------
 echo
 echo "== running the probe"
 "$JULIA" --project="$ENVDIR" "$PROBE"
 echo
-echo "Re-run later without reinstalling:"
-echo "  $JULIA --project=$ENVDIR $PROBE"
+echo "Re-run later without reinstalling (any bench/gpu* script, or the GPU tests):"
+echo "  $JULIA --project=$ENVDIR $BENCHDIR/gpu_probe.jl"
+if [ "$HAVE_REPO" = 1 ]; then
+echo "  $JULIA --project=$ENVDIR $BENCHDIR/gpu_interp_bench.jl [FILE.fft]"
+echo "  $JULIA --project=$ENVDIR -e 'using CUDA; include(\"$REPO/test/test_gpu.jl\")'"
+fi

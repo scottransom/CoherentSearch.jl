@@ -19,9 +19,44 @@ using CoherentSearch, CUDA, Printf
 const CS = CoherentSearch
 const Ext = Base.get_extension(CoherentSearch, :CoherentSearchCUDAExt)
 
-fftfile = length(ARGS) >= 1 ? ARGS[1] :
-          "/data1/git/CoherentSearch.jl/PM0063_034C1_DM445.0_red.fft"
-ft = FFTFile(fftfile)
+# Data: a real `.fft` if one is given (or the reference file happens to be here),
+# otherwise a SYNTHETIC one of the same shape, so the bench runs on any GPU host
+# with nothing staged.
+#
+# **The synthetic fallback is sound for the GPU column and NOT for the CPU one.**
+# Measured on fitzroy 2026-08-25: the GPU arm moves 2% between real and synthetic
+# amplitudes (0.2745 -> 0.2689 ns), while the CPU arm moves 30% (4.85 -> 6.31 ns)
+# -- and the CPU arm is otherwise stable to +-0.5% across repeats on the real
+# file.  The interpolator's arithmetic genuinely does not depend on the amplitude
+# values, so this is placement, not work: the real file is an mmap of the page
+# cache while the synthetic array is freshly heap-allocated, and on a dual-socket
+# box first-touch NUMA placement decides whether the reads are local or remote.
+# The GPU is immune because it reads from device memory after an upload.
+#
+# So: with synthetic data, quote the GPU column and IGNORE the "x one core"
+# ratio.  Pass a real `.fft` whenever the ratio matters.
+const REF_FFT = "/data1/git/CoherentSearch.jl/PM0063_034C1_DM445.0_red.fft"
+
+function load_or_synth(path)
+    if path !== nothing && isfile(path)
+        return FFTFile(path), basename(path)
+    end
+    # PM0063's geometry, so every ns/(harmonic,trial) here is comparable to the
+    # numbers recorded in gpu_design.md.
+    N, dt = 8388608, 0.00025
+    T = N * dt
+    # Normalised noise: mean power 1 means Re and Im each have variance 1/2.
+    amps = Vector{ComplexF32}(undef, N ÷ 2)
+    @inbounds for i in eachindex(amps)
+        amps[i] = ComplexF32(randn(Float32) * 0.70710678f0, randn(Float32) * 0.70710678f0)
+    end
+    inf = SimpleInf("synthetic.inf", "GPUBENCH", 5.0e4, N, dt, 0.0)
+    return FFTFile("synthetic.fft", amps, inf, N, T, 1.0 / T, true, true,
+                   real(amps[1]), imag(amps[1])), "synthetic (PM0063 geometry)"
+end
+
+fftfile = length(ARGS) >= 1 ? ARGS[1] : (isfile(REF_FFT) ? REF_FFT : nothing)
+ft, ftname = load_or_synth(fftfile)
 params = SearchParams(nharms = 60, m = 16, decimations = collect(1:6))
 r_lo = 0.1 * ft.T
 WT = Float32
@@ -30,7 +65,10 @@ bestof(f, n = 5) = minimum(begin
     t0 = time_ns(); f(); (time_ns() - t0) / 1e9
 end for _ in 1:n)
 
-println("file    : ", basename(fftfile))
+println("file    : ", ftname)
+const SYNTH = !(fftfile !== nothing && isfile(fftfile))
+SYNTH && println("          *** synthetic data: the GPU column is valid, the CPU column and\n" *
+                 "          *** the \"x one core\" ratio are NOT -- see the header. Pass a .fft.")
 println("params  : nharms=", params.nharms, " m=", params.m, " weights=", WT)
 println("threads : ", Threads.nthreads(), " (Julia)")
 
