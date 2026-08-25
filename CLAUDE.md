@@ -348,10 +348,26 @@ optimisation below (1.84x vs 1.26x on the same code and the same data).
 - This laptop throttles (`scaling MHz: 67%`); the **threaded** number is the
   least reliable, since back-to-back heavy runs clock the CPU down. Quote `-t 1`.
 
-## Performance work (current focus)
+## GPU support (active track) — see `gpu_design.md`
 
-The project is feature-complete; the active focus is profiling and speeding up
-the hot loop. See `Summary_and_Future_Work.md` (§3) for the roadmap.
+**`--gpu` runs a full search as of 2026-08-25.** A package extension
+(`ext/CoherentSearchCUDAExt.jl`, CUDA under `[weakdeps]`), so a CPU-only user
+downloads nothing and `src/search.jl` is untouched. **`gpu_design.md` is the
+running log — read it before touching any of this**; it keeps the wrong turns in
+on purpose. Headlines: GTX 1080 is 1.24-1.30x fitzroy's 20-core Xeon with
+byte-identical candidates on PM0063; the workload wants **SMs and bandwidth, not
+FLOPs**; `--blocksize` is a per-device parameter worth 2.3x and the cards want
+opposite ends of the range. `bench/gpu_probe_setup.sh` classifies a new host in
+one command. **fitzroy's GPU drives Scott's desktop — prefer another host for
+anything large.**
+
+## CPU performance work (the optimisation phase is CLOSED)
+
+Scott declared it complete on 2026-08-24, after the AVX-512 scatter fix and the
+`:f32` default. The record below is kept because it is where every measurement
+trap in this project was learned, and those recur — but do not re-open these
+items looking for wins. See `Summary_and_Future_Work.md` (§3) for the roadmap;
+the live items are the §3.2 Monte Carlo, the paper, and the GPU track above.
 
 **Planned: a detection-efficiency Monte Carlo against riptide, for a paper**
 (`Summary_and_Future_Work.md` §3.2). Injected Gaussian pulses over the full band
