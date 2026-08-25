@@ -254,6 +254,44 @@ single phase.** The two cards disagree about what to optimise, exactly as
 **And the host has two cards**, which in §7.2's throughput mode is **~9-10x the
 20-core Xeon aggregate** — from a pair of small workstation GPUs.
 
+### Pre-registered prediction for the RTX 2080 Super (sm_75)
+
+Recorded **before** the run, so it is a test rather than a post-hoc story. The
+2080 Super is the opposite corner from the Ada **at matched SM count**, which
+isolates what the 40 MB L2 actually buys:
+
+| | GTX 1080 | RTX 2080 Super | RTX 4000 SFF Ada |
+|---|---|---|---|
+| arch | Pascal sm_61 | **Turing sm_75** | Ada sm_89 |
+| SMs x cores/SM | 20 x 128 | **48 x 64** | 48 x 128 |
+| FP32 peak | 8.9 TF | ~11.2 TF | 19.2 TF |
+| bandwidth peak | 320 GB/s | **~496 GB/s** | 280 GB/s |
+| L2 | 2 MB | **~4 MB** | **40 MB** |
+
+It is **bandwidth-rich and L2-poor** — roughly 2x the DRAM bandwidth of *either*
+other card and a fortieth of the Ada's cache. So:
+
+1. **Almost no row should read above 100%.** With ~4 MB of L2, only the very
+   smallest working sets can be cache-resident. If rows go L2-resident anyway,
+   the §0.3 reading is wrong.
+2. **`Nprof` should prefer the LARGE end**, like the 1080 and unlike the Ada,
+   because nothing fits in cache and only occupancy is left to optimise.
+3. **The transform stage should land ~0.12–0.16 s** — roughly half the 1080's
+   0.275 s, tracking its ~2x bandwidth, and roughly 2x the Ada's 0.071 s.
+
+**What each outcome would mean.** If it comes in near 0.14 s, the story holds:
+the transform stage is bandwidth-bound *unless* a large cache lifts it out, and
+the sub-batching win of §0.3 is specifically a big-L2 phenomenon. **If it comes
+in near the Ada's 0.071 s, the cache story is wrong** — raw bandwidth would be
+substituting for residency, which would make cheap high-bandwidth cards the right
+target and would demote the per-rung sub-batching item. Either answer is worth
+the ten minutes.
+
+A secondary reading: Turing has **64** FP32 cores per SM against Ada's 128, so if
+the interpolation kernel really is issue/latency-bound (§4.1) rather than
+FLOP-bound, it should scale with *SM count* and clock — i.e. land much closer to
+the Ada than the 2.3x FP32 ratio between them would suggest.
+
 ### Two verdicts that survived, and one caution
 
 - **The direct-DFT is still beaten**, 3.09x / 2.87x against cuFFT (the 1080 said
