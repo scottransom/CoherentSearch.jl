@@ -27,6 +27,10 @@ export finterp_coeffs, fourier_interp, fourier_interpolate, finterp_multi,
        nearby_fourier_bin_range, next_pow_of_2, next_smooth, is_smooth
 include("fourierinterp.jl")
 
+# --- Compute-backend TYPES (the methods come after `search.jl`; see below) ---
+export SearchBackend, CPUBackend, gpu_backend, has_gpu, require_gpu
+include("backendtypes.jl")
+
 # --- Search ---
 export SearchParams, Candidate, search, search_block, block_metrics, coherent_profiles,
        reference_profiles, snr_metrics, chunk_ngoodbins, remove_duplicates,
@@ -45,12 +49,8 @@ export DirectPlan, build_direct_plans, trial_grid_rational,
        finterp_direct, finterp_direct!
 include("directinterp.jl")
 
-# --- Compute backends (the GPU one lives in a package extension) ---
-# Included AFTER `search.jl` and `directinterp.jl`: the backend entry points
-# annotate their arguments with `SearchParams`/`FFTFile`, and a method signature's
-# types are resolved when the method is DEFINED, not when it is called.
-export SearchBackend, CPUBackend, gpu_backend, has_gpu, require_gpu,
-       chunk_ftprofs, gpu_chunk_ftprofs,
+# --- Compute-backend METHODS (after `search.jl`/`directinterp.jl`; see above) ---
+export chunk_ftprofs, gpu_chunk_ftprofs,
        chunk_profiles, gpu_chunk_profiles, chunk_boxcar, gpu_chunk_boxcar
 include("backend.jl")
 

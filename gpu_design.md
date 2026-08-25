@@ -860,9 +860,8 @@ stage-3 megakernel (§3.3).*
 (`src/backend.jl`, `ext/CoherentSearchCUDAExt.jl`), the interpolation kernel, and
 `test/test_gpu.jl`. *Gate passed on accuracy, missed on speed — see §4.1.*
 
-**Stage 2 — the whole chunk pipeline (K1–K3). Transform and gate DONE
-2026-08-25**; candidate compaction (K4) and `search` integration remain.
-*Equivalence green at ~1e-7 across all six rungs; see §4.2.*
+**Stage 2 — the whole chunk pipeline. DONE 2026-08-25**, including candidate
+extraction and the `--gpu` CLI. *See §4.2–§4.5.*
 
 **Stage 3 — fusion.** Megakernel / direct-DFT experiment, chunk-size sweep,
 `Nprof` sweep. *Gate: measure, and be willing to keep stage 2 if fusion does not
@@ -1036,6 +1035,59 @@ the boxcar are 18% and 21%. Note this ordering is a GTX 1080 statement — §0.3
 measured the Ada doing the transform stage 3.9x faster on its 40 MB L2, which
 would leave the *boxcar* as that card's largest phase. Re-measure per card before
 optimising, as always.
+
+### 4.5 End to end — `--gpu` works, and the loop cost more than the kernels
+
+```sh
+julia --project=. bin/coherent_search.jl --gpu --blocksize 131072 FILE.fft
+```
+
+**Candidate lines are byte-identical to the CPU path** on PM0063 at threshold 6 —
+all seven, including the 7.1185 Hz pulsar at 12.11 and the 144.91 Hz `k>1`
+detection. That is better than promised: the two agree to ~2e-7, which happens to
+round identically at the reported precision. **Do not read it as a guarantee** —
+`--gpu` is documented as producing comparable, not bit-identical, candidates, and
+a near-threshold trial could still cross either way.
+
+**Warm in-process search, PM0063 0.1–33.3 Hz, GTX 1080 against fitzroy's 20 cores:
+GPU 0.739 s vs CPU 0.959 s — 1.30x.**
+
+**Three design points worth keeping:**
+
+- **Candidate extraction is a download, not a device compaction.** One `Float32`
+  per (trial, rung) is ~200 MB over the whole workload, ~0.02 s of PCIe, measured
+  at 8.3% of loop time. Atomic compaction would save nothing and add a capacity
+  guard and a failure mode.
+- **There is no `Float64` rescan and none is needed.** The CPU gates in `Float32`
+  and re-scores within `boxcar_gatemargin` of threshold in `Float64`; the GPU is
+  `Float32` throughout and agrees to ~2e-7 — four orders inside the 0.01 margin,
+  so it cannot move which trials become candidates.
+- **`@eval using CUDA` inside `main` raises "method too new to be called from this
+  world context"**, because the extension's `_region!` is defined after `main`
+  started. `Base.invokelatest` on the GPU path is the fix, once per file.
+
+**What actually cost the time, and none of it was a kernel.** The first working
+version ran 1.536 s against 0.699 s of measured GPU work. Three rounds of
+instrumentation:
+
+1. **Six synchronous `copyto!`s per chunk** — one per rung, each blocking until
+   its kernel retired. Batching them into one column-major download: 1.536 →
+   1.376 s. Real, and much smaller than expected.
+2. **A first instrumentation pass blamed the host scan at 90.6% (7.27 s).** That
+   was the harness's own bug — an inline loop over *script globals*, i.e. type
+   instability, not the shipped code, which has the same loop inside a function.
+   Behind a function barrier it is **0.0000 s**. A measurement harness can have
+   the bug it is looking for.
+3. **The real cost was CPU work outside the loop**: `search` sized the host
+   `Workspace` and `_sigma_sanity_check` to the GPU's `Nprof`. At 131072 that
+   allocated hundreds of MB, planned FFTW transforms for it, and then ran three
+   *CPU* chunks of 131072 trials — **~0.68 s against 0.70 s of GPU work, doubling
+   the search.** The sanity check is a property of the data, so the workspace is
+   now capped at 2048 on a non-CPU backend. **1.376 → 0.739 s.**
+
+**Deferred, and they error clearly rather than silently doing something else:**
+`--sigma measured` (needs a device MAD), `--normalize` (needs the two-pass
+per-`(k, frequency)` statistics), `--metricstats`.
 
 ---
 

@@ -170,6 +170,9 @@ function parse_cmdline(argv)
         "--plot"
             help = "Plot the candidate pulse profiles. Off by default: it loads CairoMakie (~9 s) and holds every input's mmap live until the end of the run, neither of which a pipeline wants. Plot afterwards from the candidate files with bin/plot_candidates.jl"
             action = :store_true
+        "--gpu"
+            help = "Run the search on a CUDA GPU.  Loads CUDA.jl on demand (~6 s once per invocation, amortised across a multi-file run).  Requires --sigma analytic (the default); --normalize and --metricstats are CPU-only for now.  Candidates are NOT bit-identical to the CPU path -- the GPU sums the same kernel in a different order and agrees to ~2e-7 -- so compare candidate lists, not file bytes"
+            action = :store_true
         "--noplot"
             help = "Accepted and ignored -- plotting is already off unless --plot is given. Kept so existing pipelines and scripts do not break"
             action = :store_true
@@ -235,6 +238,31 @@ function main(argv)
         sigma = Symbol(a["sigma"]),
     )
 
+    # `--gpu` loads CUDA.jl on demand.  It is a WEAK dependency, so it is not in
+    # the manifest of a CPU-only install and `using CoherentSearch` never pays for
+    # it; the cost lands here, once per invocation (~6 s), and a run over many
+    # files amortises it to nothing -- which is the deployment mode that matters
+    # (see gpu_design.md §7.2).
+    backend = CPUBackend()
+    if a["gpu"]
+        Symbol(a["sigma"]) === :analytic || error(
+            "--gpu currently requires --sigma analytic (the default).  The measured " *
+            "scale is a per-chunk MAD and has no device implementation yet; " *
+            "gpu_design.md stage 4.")
+        a["normalize"] && error("--gpu does not support --normalize yet (it needs the " *
+                                "two-pass per-(k,frequency) statistics); run on the CPU.")
+        a["metricstats"] && error("--gpu does not support --metricstats yet; run on the CPU.")
+        @info "Loading CUDA (once per invocation)"
+        try
+            @eval Main using CUDA
+        catch e
+            error("--gpu needs CUDA.jl installed in this environment: " *
+                  "`using Pkg; Pkg.add(\"CUDA\")`.  ($(sprint(showerror, e)))")
+        end
+        backend = require_gpu()
+        @info "GPU backend active" device=string(backend)
+    end
+
     cache = SearchCache()
     # Deferred plotting: (FFTFile, candidates, stem) per file with something to
     # show.  Holding the `FFTFile`s costs only virtual address space (they are
@@ -245,7 +273,7 @@ function main(argv)
         nfiles > 1 && @info "File $i of $nfiles" file=path
         ft = FFTFile(path)
         outfile = output_path(path, a["outputfilenm"], outdir, nfiles)
-        cands = search_one(ft, params, a, cache)
+        cands = search_one(ft, params, a, cache, backend)
         write_candidates(cands, outfile, a["threshold"])
         if a["plot"] && !isempty(cands)
             push!(toplot, (ft, cands, plot_stem(a["plotstem"], outfile, path)))
@@ -279,12 +307,18 @@ end
 Search one FFT file with the parsed options `a`, reusing `cache`'s plans and
 workspaces, and return its top `--ncands` candidates best-metric first.
 """
-function search_one(ft::FFTFile, params::SearchParams, a, cache::SearchCache)
-    @info "Searching" file=ft.path T=ft.T nharms=params.nharms decimations=params.decimations threads=nthreads()
+function search_one(ft::FFTFile, params::SearchParams, a, cache::SearchCache,
+                    backend::SearchBackend = CPUBackend())
+    @info "Searching" file=ft.path T=ft.T nharms=params.nharms decimations=params.decimations threads=nthreads() backend=nameof(typeof(backend))
 
     progress = a["noprogress"] ? :none : (a["progressbar"] ? :bar : :text)
     mstats = a["metricstats"] ? MetricStats() : nothing
-    cands = search(ft, params;
+    # `--gpu` loads CUDA (and hence the extension's `_region!` method) from
+    # inside `main`, so that method is NEWER than the running function's world
+    # age and a direct call raises "method too new to be called from this world
+    # context".  Routing through `invokelatest` is the standard fix; it is only
+    # needed on the GPU path, and only once per file, so it costs nothing.
+    _dosearch() = search(ft, params;
                    lofreq = a["lofreq"], hifreq = a["hifreq"], lobin = a["lobin"],
                    blocksize = a["blocksize"], threshold = a["threshold"],
                    remove = !a["noremove"], dr_tol = a["drtol"],
@@ -293,7 +327,8 @@ function search_one(ft::FFTFile, params::SearchParams, a, cache::SearchCache)
                    normalize = a["normalize"], verbose = a["verbose"],
                    wisdom = !a["nowisdom"],
                    wisdom_file = isempty(a["wisdomfile"]) ? nothing : a["wisdomfile"],
-                   cache = cache)
+                   cache = cache, backend = backend)
+    cands = backend isa CPUBackend ? _dosearch() : Base.invokelatest(_dosearch)
 
     if mstats !== nothing
         # Per-file stem, so a multi-file run does not overwrite one file's tables

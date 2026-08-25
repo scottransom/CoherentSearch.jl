@@ -12,13 +12,14 @@ precompilation.  Hence `CUDABackend` and dispatch on it.  See `gpu_design.md` §
 module CoherentSearchCUDAExt
 
 using CoherentSearch, CUDA
-using CoherentSearch: SearchBackend, SearchParams, FFTFile, DirectPlan,
-                      build_direct_plans, DIRECT_GROUP_V, ladder_boxcar_widths
+using CoherentSearch: SearchBackend, SearchParams, FFTFile, DirectPlan, Candidate,
+                      build_direct_plans, DIRECT_GROUP_V, ladder_boxcar_widths,
+                      _analytic_sigma, _render_progress
 using LinearAlgebra: mul!
 using CUDA.CUFFT: plan_brfft
 # `import`, not `using`: extending a function from another module requires the
 # name be brought in for extension, not merely for reference.
-import CoherentSearch: chunk_ftprofs, chunk_profiles, chunk_boxcar
+import CoherentSearch: chunk_ftprofs, chunk_profiles, chunk_boxcar, _region!
 
 """
     CUDABackend
@@ -527,7 +528,7 @@ end
 const _GPU_BC_B = 32          # trials per block; see bench/gpu_boxcar_bench.jl
 const _GPU_BC_VARIANT = 3     # 1 = per-width scan, 2 = register sliding, 3 = width-fused
 
-function gpu_boxcar!(out::CuVector{Float32}, profs::CuMatrix, n::Integer,
+function gpu_boxcar!(out, profs::CuMatrix, n::Integer,
                      nbins::Integer, widths::CuVector{Int32}, wmax::Integer,
                      invsigma::Real; B::Integer = _GPU_BC_B,
                      variant::Integer = _GPU_BC_VARIANT)
@@ -693,6 +694,106 @@ end
 function _fill_stack_gather!(gc::GPUChunk, i::Integer)
     k = gc.ks[i]
     copyto!(gc.cpulayout[i], view(gc.ftprofs, :, 1:k:(gc.Hk[i] * k + 1)))
+end
+
+# ---------------------------------------------------------------------------
+# The chunk loop.  Mirrors `_search_region!`, and everything outside it -- the
+# trial grid, the plans, the analytic-sigma sanity check, duplicate and harmonic
+# collapsing, the candidate file -- is backend-independent and unchanged.
+#
+# **Candidate extraction is a plain download, not a device-side compaction.**
+# One `Float32` per (trial, rung) is 6 floats per trial: ~200 MB over the whole
+# reference workload, or ~0.02 s of PCIe. A device compaction with atomics would
+# save nothing measurable and would add a capacity guard and a failure mode.
+#
+# **There is no `Float64` exact rescan**, and it is not needed. The CPU runs a
+# `Float32` gate and re-scores everything within `boxcar_gatemargin` of the
+# threshold in `Float64`; here the whole metric is `Float32` throughout and
+# agrees with the CPU's `Float64` value to ~2e-7 (§4.2) -- four orders of
+# magnitude inside the 0.01 gate margin, so it cannot move which trials become
+# candidates, only the seventh digit of their reported S/N.
+# ---------------------------------------------------------------------------
+function _region!(::CUDABackend, ft::FFTFile, params::SearchParams,
+                  workspaces::Vector, nbins::Integer,
+                  r_lo::Real, r_hi::Real, lodr::Real, total::Integer,
+                  Nprof::Integer, nchunks::Integer, nt::Integer;
+                  threshold::Real, norm, metricstats, progress::Symbol,
+                  dplans::AbstractVector)
+    params.sigma === :analytic || error(
+        "the CUDA backend requires sigma = :analytic; the measured scale is a " *
+        "per-chunk MAD with no device implementation yet (gpu_design.md stage 4)")
+    norm === nothing || error("the CUDA backend does not support --normalize yet")
+    metricstats === nothing || error("the CUDA backend does not support --metricstats yet")
+
+    WT = eltype(dplans[1].W)
+    gc = GPUChunk(WT, params, Nprof)
+    gp = GPUInterpPlan(dplans)
+    d_amps = CuArray(ft.amps)
+    # One column per rung, so the whole chunk's metrics come back in ONE D2H
+    # copy.  Six separate `copyto!`s were six synchronisation points per chunk --
+    # each blocking until its boxcar kernel retired, which serialised the queue
+    # and cost more than every kernel in it.
+    nk = length(gc.ks)
+    out = CUDA.zeros(Float32, Nprof, nk)
+    hostm = Matrix{Float32}(undef, Nprof, nk)
+    nvalids = Vector{Int}(undef, nk)
+    cands = Candidate[]
+    nyq = ft.N / 2
+
+    for c in 1:nchunks
+        i0 = (c - 1) * Nprof
+        n = min(Nprof, total - i0)
+        rstart = r_lo + i0 * lodr
+        # Zeroed every chunk: the interpolator writes only the harmonics that
+        # carry data, and a harmonic that gives up must leave a ZERO row -- which
+        # is also what the DC row (never written) has to be.
+        fill!(gc.ftprofs, 0)
+        filled = gpu_fill_ftprofs!(gc.ftprofs, gp, d_amps, ft, i0, n)
+        fill_stacks!(gc, n)
+        for i in eachindex(gc.ks)
+            mul!(gc.profs[i], gc.plans[i], gc.cpulayout[i])
+        end
+        for i in eachindex(gc.ks)
+            k = gc.ks[i]
+            Hk = gc.Hk[i]
+            # Valid decimated trials are the prefix j = 1..nvalid; past-Nyquist
+            # columns are partly zero-padded and are skipped, exactly as
+            # `decim_pass!` does.
+            nvalid = n
+            if k > 1
+                nvalid = 0
+                while nvalid < n && k * (rstart + nvalid * lodr) < nyq
+                    nvalid += 1
+                end
+            end
+            nvalids[i] = nvalid
+            nvalid == 0 && continue
+            sig = _analytic_sigma(filled, k, Hk)
+            invsig = sig > 0 ? 1.0 / sig : 0.0
+            gpu_boxcar!(view(out, :, i), gc.profs[i], nvalid, 2Hk, gc.widths[i],
+                        gc.hwidths[i][end], invsig)
+        end
+        # One copy for the whole chunk, after every rung has been queued.  The
+        # offset form, not `copyto!(view(...), view(...))`: a SubArray of a
+        # CuArray falls back to scalar indexing, which CUDA.jl refuses outright.
+        copyto!(hostm, 1, out, 1, Nprof * nk)
+        thr = Float32(threshold)
+        @inbounds for i in 1:nk
+            k = gc.ks[i]
+            Hk = gc.Hk[i]
+            for j in 1:nvalids[i]
+                hostm[j, i] > thr || continue          # Float32 compare: no conversion
+                rf = k * (rstart + (j - 1) * lodr)
+                push!(cands, Candidate(rf / ft.T, Float64(hostm[j, i]), rf, Hk))
+            end
+        end
+        _render_progress(progress, c, nchunks)
+    end
+    if progress !== :none
+        _render_progress(progress, nchunks, nchunks)
+        println(stderr)
+    end
+    return cands
 end
 
 end # module

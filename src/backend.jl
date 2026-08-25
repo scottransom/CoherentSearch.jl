@@ -1,88 +1,11 @@
-# ---------------------------------------------------------------------------
-# Compute-backend selection.
+# Backend-dispatched entry points.  Split from `backendtypes.jl` because these
+# annotate their arguments with `SearchParams`/`FFTFile`, and a method
+# signature's types are resolved when the method is DEFINED -- so they must come
+# after `search.jl`, while the TYPES must come before it (`search` takes a
+# `backend` keyword).
 #
-# The GPU implementation lives in a package *extension*
-# (`ext/CoherentSearchCUDAExt.jl`, weak dependency on CUDA), so a CPU-only user
-# never downloads, precompiles or loads CUDA — verified, not assumed: with CUDA
-# declared under `[weakdeps]` it does not appear in the user's Manifest at all,
-# and `using CoherentSearch` is unchanged.  See `gpu_design.md` §3.4.
-#
-# **An extension may only add methods on NEW types.**  It must never redefine a
-# method this module already owns — that is method overwriting, which Julia
-# rejects outright during precompilation.  Hence the shape here: an abstract
-# `SearchBackend` plus a `Ref` that the extension *populates* in its `__init__`,
-# and every backend-specific entry point dispatches on its first argument.  A
-# consequence worth stating: every existing CPU method keeps its current
-# definition, so the three correctness pins are untouched by construction rather
-# than by testing.
-# ---------------------------------------------------------------------------
-
-"""
-    SearchBackend
-
-Abstract supertype for compute backends.  [`CPUBackend`](@ref) is always
-available; `CUDABackend` is defined by the CUDA extension and registers itself
-when `CUDA` is loaded and functional.
-"""
-abstract type SearchBackend end
-
-"""
-    CPUBackend
-
-The threaded CPU implementation — the default, and the one every oracle and
-equivalence pin is written against.
-"""
-struct CPUBackend <: SearchBackend end
-
-# Populated by `CoherentSearchCUDAExt.__init__` when CUDA is functional.  `Any`
-# rather than `Union{Nothing,SearchBackend}` because the concrete type does not
-# exist until the extension loads; it is read once per search, never in a hot loop.
-const _GPU_BACKEND = Ref{Any}(nothing)
-
-"""
-    gpu_backend() -> backend or nothing
-
-The registered GPU backend, or `nothing` if no GPU backend is loaded.
-"""
-gpu_backend() = _GPU_BACKEND[]
-
-"""
-    has_gpu() -> Bool
-
-Whether a functional GPU backend is loaded.  `false` until `CUDA` is loaded *and*
-`CUDA.functional()` — so it stays `false` on a machine with the package but no
-driver, which is the case that should degrade politely rather than crash.
-"""
-has_gpu() = _GPU_BACKEND[] !== nothing
-
-"""
-    require_gpu() -> backend
-
-The registered GPU backend, or a `MethodError`-free explanation of how to get one.
-"""
-function require_gpu()
-    b = _GPU_BACKEND[]
-    b === nothing && error("""
-        No GPU backend is loaded.  GPU support lives in a package extension, so
-        it activates only once CUDA.jl is present and functional:
-
-            julia> using Pkg; Pkg.add("CUDA")
-            julia> using CUDA, CoherentSearch
-
-        From the CLI, `--gpu` loads CUDA for you.  If CUDA is already loaded and
-        this still fails, `CUDA.functional()` is false — usually a missing or
-        mismatched NVIDIA driver; `CUDA.versioninfo()` says which.""")
-    return b
-end
-
-
-# ---------------------------------------------------------------------------
-# Backend-dispatched entry points.
-#
-# Declared here with no method for the GPU: the extension adds one, on its own
-# `CUDABackend` type.  The `gpu_*` wrappers exist so a caller gets `require_gpu`'s
-# explanation rather than a `MethodError` when no GPU backend is loaded.
-# ---------------------------------------------------------------------------
+# The extension adds methods here on its own `CUDABackend`; it must never
+# redefine one this module owns.  See `gpu_design.md` §3.4.
 
 """
     chunk_ftprofs(backend, ft, params, rstart, n; t0=0, weights=Float32)
@@ -175,3 +98,19 @@ end
 
 gpu_chunk_profiles(args...; kwargs...) = chunk_profiles(require_gpu(), args...; kwargs...)
 gpu_chunk_boxcar(args...; kwargs...) = chunk_boxcar(require_gpu(), args...; kwargs...)
+
+
+"""
+    _region!(backend, ft, params, workspaces, nbins, r_lo, r_hi, lodr,
+             total, Nprof, nchunks, nt; kwargs...) -> Vector{Candidate}
+
+Run the chunk loop over `[r_lo, r_hi]` on `backend` and return the
+above-`threshold` candidates.  The CPU method is the threaded `_search_region!`
+that every pin is written against; the CUDA extension adds a method on its own
+backend type.  Everything outside this call -- the trial grid, the plans, the
+analytic-sigma sanity check, duplicate and harmonic collapsing, and all output --
+is backend-independent and runs unchanged.
+"""
+function _region! end
+
+_region!(::CPUBackend, args...; kwargs...) = _search_region!(args...; kwargs...)

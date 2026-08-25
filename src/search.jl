@@ -2189,7 +2189,8 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
                 metricstats::Union{Nothing,MetricStats}=nothing,
                 normalize::Bool=false, verbose::Bool=false,
                 wisdom::Bool=true, wisdom_file::Union{Nothing,AbstractString}=nothing,
-                cache::Union{Nothing,SearchCache}=nothing)
+                cache::Union{Nothing,SearchCache}=nothing,
+                backend::SearchBackend=CPUBackend())
     progress in (:none, :text, :bar) ||
         throw(ArgumentError("progress must be :none, :text or :bar, got :$progress"))
     _check_sigma(params)
@@ -2217,14 +2218,25 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
     # The direct interpolator's phase tables key off the *global* trial index, so
     # they are built once here against `r_lo` and shared read-only by every task.
     dplans = build_direct_plans(params, r_lo)
-    nt = max(1, min(nthreads(), nchunks))
+    # A GPU backend runs the whole band on the device, so it needs exactly one
+    # host workspace -- and it needs that one, because `_sigma_sanity_check` is a
+    # CPU computation and must stay so: its whole job is to check the analytic
+    # scale against a MEASURED one.
+    nt = backend isa CPUBackend ? max(1, min(nthreads(), nchunks)) : 1
+    # The GPU wants a chunk of ~10^5 trials; the CPU host workspace exists only
+    # for `_sigma_sanity_check`, which is a property of the DATA and needs no such
+    # thing.  Sizing it to the GPU's `Nprof` allocated hundreds of MB, planned
+    # FFTW transforms for it, and then ran three CPU chunks of that size --
+    # measured at ~0.68 s against 0.70 s of actual GPU work, i.e. it doubled the
+    # search.  Cap it.
+    ws_Nprof = backend isa CPUBackend ? Nprof : min(Nprof, 2048)
     # `PATIENT` is worth ~9% of the decimated transforms and costs ~1 s of
     # planning, which the wisdom file amortises to nothing.  With no wisdom file
     # there is nothing to amortise into, so fall back to `MEASURE` (see
     # `_PLAN_RIGOR`).  Only the *first* workspace pays: FFTW's wisdom is
     # process-global, so the other `nt-1` are lookups.
     workspaces = with_plan_rigor(wisdom ? FFTW.PATIENT : FFTW.MEASURE) do
-        _plans!(cache, params, Nprof, nt)
+        _plans!(cache, params, ws_Nprof, nt)
     end
 
     wisdom && export_wisdom!(wpath)
@@ -2232,7 +2244,7 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
     # The analytic scale's one assumption is checkable in ~0.1% of the runtime,
     # and its failure is silent, so check it.
     params.sigma === :analytic &&
-        _sigma_sanity_check(ft, params, workspaces[1], dplans, r_lo, lodr, total, Nprof)
+        _sigma_sanity_check(ft, params, workspaces[1], dplans, r_lo, lodr, total, ws_Nprof)
 
     if verbose
         @printf(stderr, "Search: %d trials in %d chunks of %d over r = %.1f … %.1f bins (%.4f … %.4f Hz), %d thread(s)\n",
@@ -2264,21 +2276,21 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
         # internal one.  threshold=Inf skips candidate bookkeeping in this pass.
         normstats = metricstats === nothing ? MetricStats() : metricstats
         @info "Normalising: measuring per-(k,frequency) noise (pass 1/2)"
-        _search_region!(ft, params, workspaces, nbins, r_lo, r_hi, lodr,
-                        total, Nprof, nchunks, nt;
-                        threshold=Inf, norm=nothing, metricstats=normstats, progress=progress,
-                        dplans=dplans)
+        _region!(backend, ft, params, workspaces, nbins, r_lo, r_hi, lodr,
+                 total, Nprof, nchunks, nt;
+                 threshold=Inf, norm=nothing, metricstats=normstats, progress=progress,
+                 dplans=dplans)
         norm = build_metricnorm(normstats)
         @info "Built in-situ normalisation model; searching (pass 2/2)" windows=normstats.nwin
     end
 
     # Detection pass.  When normalising, stats were collected in pass 1, so pass 2
     # does not re-collect (metricstats=nothing here).
-    cands = _search_region!(ft, params, workspaces, nbins, r_lo, r_hi, lodr,
-                            total, Nprof, nchunks, nt;
-                            threshold=threshold, norm=norm,
-                            metricstats=(normalize ? nothing : metricstats), progress=progress,
-                            dplans=dplans)
+    cands = _region!(backend, ft, params, workspaces, nbins, r_lo, r_hi, lodr,
+                     total, Nprof, nchunks, nt;
+                     threshold=threshold, norm=norm,
+                     metricstats=(normalize ? nothing : metricstats), progress=progress,
+                     dplans=dplans)
 
     ntotal = length(cands)
     @info "Search complete; post-processing candidates" total_above_threshold=ntotal
