@@ -72,6 +72,41 @@ else
         end
     end
 
+    # --- stage 2: transform + boxcar gate ---------------------------------
+    # Pinned per rung, because each rung is a separately-planned transform over a
+    # separately-built dense stack, and a decimation bug would otherwise hide
+    # behind rung 1 being right.
+    @testset "profiles vs CPU, k=$k" for k in 1:4
+        for n in (256, 1024)
+            c = chunk_profiles(CPUBackend(), ft, params, r_lo, n; k = k)
+            g = chunk_profiles(CS.require_gpu(), ft, params, r_lo, n; k = k)
+            @test size(g) == size(c) == (2 * fld(params.nharms, k), n)
+            @test maximum(abs, g .- c) / maximum(abs, c) < 1e-5
+        end
+    end
+
+    # `invsigma` is supplied rather than estimated, so this pins the FILTER --
+    # width bank, wrapped prefix sums, the delta*S_tot baseline -- without either
+    # side having to agree about sigma estimation too.  The statistic is exactly
+    # linear in 1/sigma, so one value covers all of them.
+    @testset "boxcar metric vs CPU, k=$k" for k in 1:4
+        for n in (256, 1024), invsig in (1.0, 0.37)
+            c = chunk_boxcar(CPUBackend(), ft, params, r_lo, n; k = k, invsigma = invsig)
+            g = chunk_boxcar(CS.require_gpu(), ft, params, r_lo, n; k = k, invsigma = invsig)
+            @test length(g) == n
+            @test maximum(abs.(g .- c)) / maximum(abs, c) < 1e-5
+        end
+    end
+
+    # The metric is linear in 1/sigma; assert that on the GPU path itself, since
+    # the production search will supply a per-chunk sigma and this is what makes
+    # a single pinned value above sufficient.
+    @testset "boxcar is linear in invsigma" begin
+        a = chunk_boxcar(CS.require_gpu(), ft, params, r_lo, 512; invsigma = 1.0)
+        b = chunk_boxcar(CS.require_gpu(), ft, params, r_lo, 512; invsigma = 2.5)
+        @test maximum(abs.(b .- 2.5 .* a)) / maximum(abs, b) < 1e-6
+    end
+
     @testset "backend registry" begin
         @test CoherentSearch.has_gpu()
         @test CoherentSearch.require_gpu() === CoherentSearch.gpu_backend()

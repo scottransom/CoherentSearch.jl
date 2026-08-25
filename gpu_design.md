@@ -860,9 +860,9 @@ stage-3 megakernel (§3.3).*
 (`src/backend.jl`, `ext/CoherentSearchCUDAExt.jl`), the interpolation kernel, and
 `test/test_gpu.jl`. *Gate passed on accuracy, missed on speed — see §4.1.*
 
-**Stage 2 — the whole chunk pipeline (K1–K4), staged through global memory.**
-This is the deliverable that gives the headline number. *Gate: the §5 pins green
-and ≥3× the 20-core Xeon.*
+**Stage 2 — the whole chunk pipeline (K1–K3). Transform and gate DONE
+2026-08-25**; candidate compaction (K4) and `search` integration remain.
+*Equivalence green at ~1e-7 across all six rungs; see §4.2.*
 
 **Stage 3 — fusion.** Megakernel / direct-DFT experiment, chunk-size sweep,
 `Nprof` sweep. *Gate: measure, and be willing to keep stage 2 if fusion does not
@@ -934,6 +934,63 @@ it should not be dressed up: **on a GTX 1080 a good GPU port roughly ties a
 dual-socket 20-core server.** It also makes the newer card decisive rather than
 merely nice — §0.1 measured no architectural wall, and every ratio here is a
 property of a 2016 card with 20 SMs.
+
+### 4.2 Stage-2 results — and a layout assertion in §3.3 that was WRONG
+
+**Equivalence, all six rungs, PM0063:** profiles **1.1e-7 to 1.9e-7**, boxcar
+metric **1.2e-7 to 3.1e-7**, against a 1e-5 pin. On the 7.1185 Hz pulsar the GPU
+and CPU agree on the peak value *and* the argmax at both `k=1` and `k=4`.
+`test/test_gpu.jl` is **166 tests** (up from 117), pinned per rung so a
+decimation bug cannot hide behind rung 1 being right; the CPU suite is 747/747,
+unchanged.
+
+**The layout mistake.** §3.3 asserted the transposed `(Nprof, nharms+1)` store
+was "almost certainly right" and that the CPU's contrary verdict should not be
+carried across. Transposed *is* right for the interpolator — the CPU layout makes
+its store a 32-way scatter and costs **2.54–2.65x** — but §3.3 also assumed cuFFT
+would want it. Measured:
+
+| | k=1 | k=2 | k=3 | k=4 | k=5 | k=6 | all rungs |
+|---|---|---|---|---|---|---|---|
+| dim 1 (CPU layout) faster by | 2.02x | 1.80x | 1.76x | 1.75x | 1.68x | 1.43x | **1.84x** |
+
+**I verified the transposed layout for *correctness* (1.7e-7 against a CPU
+`irfft`) and never timed it against the alternative.** That is this file's
+standing microbenchmark lesson in a new form: *checking that something works is
+not evidence that it is fast.*
+
+**Neither pure layout wins** — transposed throughout pays ~0.23 s on the
+transform, CPU-layout throughout pays ~0.21 s on interpolation. So each phase
+keeps the layout it wants and a **dedicated transpose-and-decimate kernel** sits
+between them, staging a tile in shared memory so both the read and the write are
+coalesced. It also produces the six dense stacks in one pass, which is needed
+anyway: **cuFFT cannot transform a strided view** ("Illegal conversion of a
+DeviceMemory to a Ptr"), so the CPU's 2026-08-16 in-place stride trick does not
+port. The transpose costs **0.089 s against the strided `copyto!` gather's 0.687
+— 7.7x** — so the gather the CPU deleted for being pure duplicated traffic is
+even more wrong here.
+
+**Measured pipeline, GTX 1080, scaled to the reference workload:**
+
+| `Nprof` | interp | transpose | transform | boxcar | total | vs CPU `-t 20` |
+|---|---|---|---|---|---|---|
+| 16384 | 0.141 | 0.100 | 0.309 | 0.205 | 0.756 s | 1.34x |
+| 65536 | 0.125 | 0.092 | 0.282 | 0.162 | 0.661 s | 1.53x |
+| **131072** | **0.112** | **0.089** | **0.279** | **0.138** | **0.619 s** | **1.63x** |
+
+**Against §0.46's projection of 0.490 s this is 26% optimistic, and the
+accounting says exactly where.** Transform 0.279 vs 0.275 projected and interp
+0.112 vs 0.135 were both right; the metric came in at **0.138 against 0.080** (1.7x
+worse), and **the transpose phase was not in the projection at all** — it did not
+exist as a concept until cuFFT's stride limitation forced it. Every end-to-end
+number in §0.3–§0.46 that carries a projected metric column should be read as
+~25% optimistic until the metric is re-measured per card.
+
+**Two things the boxcar kernel has not had yet**, and it is now the largest phase
+after the transform: a block size sweep (`_GPU_BC_B = 32` is a first guess, and
+32 threads per block is poor occupancy), and the observation that at 0.138 s it
+is running ~3x off this card's bandwidth for the profile traffic it moves — so
+it is shared-memory/compute bound, not bandwidth bound, and there is headroom.
 
 ---
 

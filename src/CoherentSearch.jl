@@ -50,7 +50,8 @@ include("directinterp.jl")
 # annotate their arguments with `SearchParams`/`FFTFile`, and a method signature's
 # types are resolved when the method is DEFINED, not when it is called.
 export SearchBackend, CPUBackend, gpu_backend, has_gpu, require_gpu,
-       chunk_ftprofs, gpu_chunk_ftprofs
+       chunk_ftprofs, gpu_chunk_ftprofs,
+       chunk_profiles, gpu_chunk_profiles, chunk_boxcar, gpu_chunk_boxcar
 include("backend.jl")
 
 # --- FFTW plan-wisdom persistence (faster planning / start-up) ---

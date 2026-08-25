@@ -13,10 +13,12 @@ module CoherentSearchCUDAExt
 
 using CoherentSearch, CUDA
 using CoherentSearch: SearchBackend, SearchParams, FFTFile, DirectPlan,
-                      build_direct_plans, DIRECT_GROUP_V
+                      build_direct_plans, DIRECT_GROUP_V, ladder_boxcar_widths
+using LinearAlgebra: mul!
+using CUDA.CUFFT: plan_brfft
 # `import`, not `using`: extending a function from another module requires the
 # name be brought in for extension, not merely for reference.
-import CoherentSearch: chunk_ftprofs
+import CoherentSearch: chunk_ftprofs, chunk_profiles, chunk_boxcar
 
 """
     CUDABackend
@@ -135,7 +137,8 @@ function _interp_kernel!(ftp, amps, namps::Int32, t0::Int64, n::Int32,
                          tfirst::Int64, ngroups::Int32, ::Val{V},
                          q::Int32, res0, qint0, sadv, badv,
                          wbase, abase, gbase, rfloor0, m2::Int32,
-                         grow, goff, gnj, gcarry, gW, gA, active) where {V}
+                         grow, goff, gnj, gcarry, gW, gA, active,
+                         ::Val{TRANSPOSED}) where {V,TRANSPOSED}
     lane = threadIdx().x                                   # 1..V, the trial within the group
     gi = (blockIdx().x - Int32(1)) * blockDim().y + threadIdx().y   # 1..ngroups
     h = blockIdx().y                                       # 1..nharms
@@ -203,7 +206,18 @@ function _interp_kernel!(ftp, amps, namps::Int32, t0::Int64, n::Int32,
         jcol = (tfirst - t0) + Int64(gm1) * Int64(V) + Int64(lane)
         if 1 <= jcol <= n
             A = gA[abase[h] + (Int32(g) - Int32(1)) * V + lane]
-            ftp[jcol, h + 1] = A * Complex(ar, ai)
+            v = A * Complex(ar, ai)
+            # TRANSPOSED=true  -> (Nprof, nharms+1): consecutive lanes are
+            #   consecutive addresses, one coalesced 256 B write per warp.
+            # TRANSPOSED=false -> (nharms+1, Nprof), the CPU layout: consecutive
+            #   lanes are (nharms+1) apart, a 32-way scatter.  Slower here, but it
+            #   is the layout cuFFT transforms 1.75-1.88x faster (dim 1 vs dim 2),
+            #   which is the larger phase.  See gpu_design.md.
+            if TRANSPOSED
+                ftp[jcol, h + 1] = v
+            else
+                ftp[h + 1, jcol] = v
+            end
         end
     end
     return nothing
@@ -237,7 +251,7 @@ trials starting at global trial `t0`.  Returns the host `filled` flags.
 """
 function gpu_fill_ftprofs!(ftp::CuMatrix, gp::GPUInterpPlan, amps::CuVector,
                            ft::FFTFile, t0::Integer, n::Integer;
-                           groups_per_block::Int = 8)
+                           groups_per_block::Int = 8, transposed::Bool = true)
     V = DIRECT_GROUP_V
     act = _active_harmonics(gp, ft, t0, n)
     any(act) || return act
@@ -266,7 +280,8 @@ function gpu_fill_ftprofs!(ftp::CuMatrix, gp::GPUInterpPlan, amps::CuVector,
         Int64(tfirst), Int32(ngroups), Val(V), Int32(gp.q),
         CuArray(res0), CuArray(qint0), gp.sadv, gp.badv,
         gp.wbase, gp.abase, gp.gbase, gp.rfloor0, Int32(gp.m2),
-        gp.grow, gp.goff, gp.gnj, gp.gcarry, gp.gW, gp.gA, d_act)
+        gp.grow, gp.goff, gp.gnj, gp.gcarry, gp.gW, gp.gA, d_act,
+        transposed ? Val(true) : Val(false))
     return act
 end
 
@@ -284,6 +299,270 @@ function chunk_ftprofs(::CUDABackend, ft::FFTFile, params::SearchParams,
     # the production pipeline keeps the device layout and hands it to cuFFT.
     host = Array(ftp)
     return permutedims(host), filled
+end
+
+# ---------------------------------------------------------------------------
+# Stage 2: the inverse transform.
+#
+# Two cuFFT facts, both measured (2026-08-25) rather than assumed, and the second
+# overturns a CPU design decision:
+#
+# 1. **`brfft` along dimension 2 works on the transposed `(Nprof, nharms+1)`
+#    layout**, and agrees with a CPU `irfft` to 1.7e-7.  So the layout chosen for
+#    the interpolation kernel's coalesced stores is also the layout cuFFT wants,
+#    and the profile output `(Nprof, nbins)` is trial-major -- which is exactly
+#    what the boxcar gate below needs.  The CPU's tile transpose has no analogue
+#    here; the whole `_bc_transpose!` problem simply does not arise.
+#
+# 2. **cuFFT cannot transform a STRIDED VIEW** ("Illegal conversion of a
+#    DeviceMemory to a Ptr"), so the CPU's decimation trick -- letting FFTW take
+#    the stride and reading rows `1, k+1, 2k+1, ...` of `ftprofs` in place, worth
+#    1.36-1.60x on the CPU (2026-08-16) -- **does not port.**  The decimated stack
+#    has to be materialised.
+#
+# The answer to (2) is NOT the gather that the CPU deleted.  It is to have the
+# interpolation kernel write each harmonic into its rung buffers as well as into
+# `ftprofs`, since it already holds the value in registers: harmonic `h` belongs
+# to rung `k` when `k` divides `h`, landing at position `h/k + 1`.  CLAUDE.md
+# records that fusing the stack writes into the interpolator was measured and
+# REJECTED on the CPU, because there `ftprofs` is `(nharms+1, Nprof)` and a row
+# write is strided by 976 B.  **In the transposed device layout every one of
+# those stores is coalesced**, so the CPU's structural objection does not carry --
+# one more verdict that does not travel between the two.
+# ---------------------------------------------------------------------------
+
+"""
+    GPUChunk{WT}
+
+Device-side scratch for one chunk: the harmonic stack, one dense decimated stack
+per rung `k > 1`, the real profiles per rung, and their cuFFT plans.  Built once
+per `(params, Nprof)` and reused across chunks and files, exactly as the CPU's
+`SearchCache` reuses `Workspace`s.
+"""
+struct GPUChunk{WT,P}
+    Nprof::Int
+    ks::Vector{Int}                       # decimation factors, ks[1] == 1
+    Hk::Vector{Int}                       # harmonics summed per rung
+    ftprofs::CuMatrix{Complex{WT}}        # (Nprof, nharms+1), what the interpolator writes
+    cpulayout::Vector{CuMatrix{Complex{WT}}} # per rung: (Hk+1, Nprof), DENSE, what cuFFT reads
+    profs::Vector{CuMatrix{WT}}           # per rung: (2Hk, Nprof)
+    plans::Vector{P}
+    widths::Vector{CuVector{Int32}}       # per rung, the ladder-pruned boxcar bank
+    hwidths::Vector{Vector{Int}}          # host copies
+end
+
+function GPUChunk(::Type{WT}, params::SearchParams, Nprof::Integer) where {WT}
+    nh = params.nharms
+    ks = sort!(unique(params.decimations))
+    ks[1] == 1 || throw(ArgumentError("decimations must include 1"))
+    Hk = [fld(nh, k) for k in ks]
+    ftprofs = CUDA.zeros(Complex{WT}, Nprof, nh + 1)
+    cpulayout = CuMatrix{Complex{WT}}[]
+    profs = CuMatrix{WT}[]
+    plans = []
+    hwidths = Vector{Int}[]
+    widths = CuVector{Int32}[]
+    for (i, k) in enumerate(ks)
+        src = CUDA.zeros(Complex{WT}, Hk[i] + 1, Nprof)
+        push!(cpulayout, src)
+        dst = CUDA.zeros(WT, 2Hk[i], Nprof)
+        push!(profs, dst)
+        push!(plans, plan_brfft(src, 2Hk[i], 1))     # dim 1: 1.75-1.88x faster
+        w = ladder_boxcar_widths(2Hk[i], k, params)
+        push!(hwidths, w)
+        push!(widths, CuArray(Int32.(w)))
+    end
+    pl = [p for p in plans]
+    return GPUChunk{WT,eltype(pl)}(Int(Nprof), ks, Hk, ftprofs, cpulayout, profs,
+                                   pl, widths, hwidths)
+end
+
+# ---------------------------------------------------------------------------
+# Stage 2: the boxcar gate.
+#
+# One thread per trial, the profile's wrapped prefix sum staged in shared memory.
+# `profs` is `(Nprof, nbins)`, so `profs[trial, i]` for consecutive trials is
+# contiguous: the load is coalesced with no transpose, and the shared array is
+# indexed `[(i-1)*B + tid]` so the per-width scan is bank-conflict free too.
+#
+# This is `_boxcar_psum!` + `_boxcar_scan` with the zero baseline, in the same
+# operation order per profile.  DC is held at zero so the profile mean is already
+# ~0 and the `delta*S_tot` term is the rounding-level correction the CPU applies.
+# ---------------------------------------------------------------------------
+function _boxcar_kernel!(out, profs, n::Int32, nbins::Int32, wmax::Int32,
+                         widths, nw::Int32, invsigma::Float32, ::Val{B}) where {B}
+    tid = threadIdx().x
+    j = (blockIdx().x - Int32(1)) * Int32(B) + tid          # trial
+    ps = CuDynamicSharedArray(Float32, (Int(nbins) + Int(wmax) + 1) * B)
+    live = j <= n
+    @inbounds begin
+        ps[tid] = 0.0f0
+        acc = 0.0f0
+        for i in Int32(1):(nbins + wmax)
+            idx = i > nbins ? i - nbins : i                 # wrap: a boxcar may straddle phase 0
+            # `profs` is (nbins, Nprof), so profs[idx, j] for the block's B
+            # consecutive trials is a contiguous B-element run -- coalesced with no
+            # transpose.  This is the GPU form of the CPU's `_bc_transpose!`, and
+            # it costs nothing because the prefix sum needed shared memory anyway.
+            acc += live ? profs[idx, j] : 0.0f0
+            ps[i * B + tid] = acc
+        end
+        live || return nothing
+        stot = ps[nbins * B + tid] - ps[tid]
+        best = -Inf32
+        for wi in Int32(1):nw
+            w = widths[wi]
+            duty = Float32(w) / Float32(nbins)
+            invsw = invsigma / sqrt(Float32(w) * (1.0f0 - duty))
+            m = ps[w * B + tid] - ps[tid]                   # finite seed, as on the CPU
+            for p in Int32(2):nbins
+                o = (p - Int32(1)) * B + tid
+                d = ps[o + w * B] - ps[o]
+                m = ifelse(d > m, d, m)
+            end
+            c = (m - duty * stot) * invsw
+            best = ifelse(c > best, c, best)
+        end
+        out[j] = best
+    end
+    return nothing
+end
+
+const _GPU_BC_B = 32          # trials per block; shared use is (nbins+wmax+1)*B floats
+
+function gpu_boxcar!(out::CuVector{Float32}, profs::CuMatrix, n::Integer,
+                     nbins::Integer, widths::CuVector{Int32}, wmax::Integer,
+                     invsigma::Real)
+    B = _GPU_BC_B
+    shmem = (Int(nbins) + Int(wmax) + 1) * B * sizeof(Float32)
+    @cuda threads = B blocks = cld(n, B) shmem = shmem _boxcar_kernel!(
+        out, profs, Int32(n), Int32(nbins), Int32(wmax), widths,
+        Int32(length(widths)), Float32(invsigma), Val(B))
+    return out
+end
+
+# --- stage-2 equivalence entry points --------------------------------------
+
+function chunk_profiles(::CUDABackend, ft::FFTFile, params::SearchParams,
+                        rstart::Real, n::Integer; t0::Integer = 0,
+                        weights::Type{<:AbstractFloat} = Float32, k::Integer = 1)
+    gc = GPUChunk(weights, params, n)
+    plans = build_direct_plans(weights, params, rstart)
+    gp = GPUInterpPlan(plans)
+    d_amps = CuArray(ft.amps)
+    gpu_fill_ftprofs!(gc.ftprofs, gp, d_amps, ft, t0, n)
+    i = findfirst(==(k), gc.ks)
+    i === nothing && throw(ArgumentError("k=$k not in decimations $(gc.ks)"))
+    fill_stacks!(gc, n)
+    mul!(gc.profs[i], gc.plans[i], gc.cpulayout[i])
+    return Array(gc.profs[i])[:, 1:n]               # already (nbins, n)
+end
+
+function chunk_boxcar(::CUDABackend, ft::FFTFile, params::SearchParams,
+                      rstart::Real, n::Integer; t0::Integer = 0,
+                      weights::Type{<:AbstractFloat} = Float32, k::Integer = 1,
+                      invsigma::Real = 1.0)
+    gc = GPUChunk(weights, params, n)
+    plans = build_direct_plans(weights, params, rstart)
+    gp = GPUInterpPlan(plans)
+    d_amps = CuArray(ft.amps)
+    gpu_fill_ftprofs!(gc.ftprofs, gp, d_amps, ft, t0, n)
+    i = findfirst(==(k), gc.ks)
+    i === nothing && throw(ArgumentError("k=$k not in decimations $(gc.ks)"))
+    fill_stacks!(gc, n)
+    mul!(gc.profs[i], gc.plans[i], gc.cpulayout[i])
+    out = CUDA.zeros(Float32, n)
+    gpu_boxcar!(out, gc.profs[i], n, 2gc.Hk[i], gc.widths[i],
+                gc.hwidths[i][end], invsigma)
+    return Float64.(Array(out))
+end
+
+# ---------------------------------------------------------------------------
+# Transpose-and-decimate: `(Nprof, nharms+1)` -> one dense `(Hk+1, Nprof)` stack
+# per rung.
+#
+# **Why this kernel exists, measured 2026-08-25.** The interpolator wants the
+# transposed layout (its store is then one coalesced 256 B write per warp; the
+# CPU layout makes it a 32-way scatter and costs **2.54-2.65x** on the interp
+# kernel). cuFFT wants the CPU layout (**dim 1 is 1.75-1.88x faster than dim 2**
+# at every rung and every `Nprof`). Neither pure layout wins: transposed
+# throughout pays 0.23 s on the transform, CPU-layout throughout pays 0.21 s on
+# interpolation. So the two phases keep the layout each wants and a dedicated
+# transpose sits between them, where a shared-memory tile makes both the read and
+# the write coalesced.
+#
+# **§3.3 of `gpu_design.md` asserted the transposed layout was "almost certainly
+# right" for cuFFT. It was verified for CORRECTNESS and never timed against the
+# alternative, and it is wrong.** Recorded as the mistake it was: this file's
+# standing lesson about benchmarking against the shipped kernel rather than the
+# obvious one has a twin -- verifying that something *works* is not evidence that
+# it is *fast*.
+#
+# It also replaces the strided `copyto!` this started as, which measured 0.40 s
+# on the reference workload -- a gather doing exactly what the CPU deleted in
+# 2026-08-16 for the same reason.
+# ---------------------------------------------------------------------------
+const _GPU_TR_T = 32          # trials per tile
+
+function _transpose_stack_kernel!(dst, src, n::Int32, nrow::Int32, k::Int32,
+                                  ::Val{T}) where {T}
+    tile = CuDynamicSharedArray(ComplexF32, (T + 1) * Int(nrow))
+    t0 = (blockIdx().x - Int32(1)) * Int32(T)
+    tx = threadIdx().x
+    ty = threadIdx().y
+    @inbounds begin
+        # The block is sized `max(T, nrow)` in x because the two phases use x for
+        # DIFFERENT axes: the trial when reading, the row when writing.  Each phase
+        # must therefore guard against the other's bound -- getting this wrong is an
+        # out-of-bounds shared write, not a wrong answer.
+        if tx <= Int32(T)
+            # read: consecutive threadIdx().x are consecutive TRIALS -> coalesced
+            r = ty
+            while r <= nrow
+                t = t0 + tx
+                v = t <= n ? src[t, (r - Int32(1)) * k + Int32(1)] : zero(eltype(src))
+                tile[(r - Int32(1)) * (T + 1) + tx] = v
+                r += blockDim().y
+            end
+        end
+        sync_threads()
+        # write: consecutive threadIdx().x are consecutive ROWS -> coalesced
+        c = ty
+        while c <= Int32(T)
+            t = t0 + c
+            if t <= n && tx <= nrow
+                dst[tx, t] = tile[(tx - Int32(1)) * (T + 1) + c]
+            end
+            c += blockDim().y
+        end
+    end
+    return nothing
+end
+
+"""
+    fill_stacks!(gc, n)
+
+Fill every rung's dense stack (and rung 1's, which is the plain transpose) from
+the transposed `ftprofs`, for `n` trials.
+"""
+function fill_stacks!(gc::GPUChunk, n::Integer)
+    T = _GPU_TR_T
+    for i in eachindex(gc.ks)
+        k = gc.ks[i]
+        dst = gc.cpulayout[i]
+        nrow = gc.Hk[i] + 1
+        shmem = (T + 1) * nrow * sizeof(ComplexF32)
+        @cuda threads = (max(T, nrow), 8) blocks = cld(n, T) shmem = shmem _transpose_stack_kernel!(
+            dst, gc.ftprofs, Int32(n), Int32(nrow), Int32(k), Val(T))
+    end
+    return gc
+end
+
+# Kept for the record and for the bench's baseline column: the strided gather
+# this replaced.  Do not use it in the pipeline.
+function _fill_stack_gather!(gc::GPUChunk, i::Integer)
+    k = gc.ks[i]
+    copyto!(gc.cpulayout[i], view(gc.ftprofs, :, 1:k:(gc.Hk[i] * k + 1)))
 end
 
 end # module

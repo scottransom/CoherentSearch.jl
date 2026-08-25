@@ -124,3 +124,54 @@ end
 [`chunk_ftprofs`](@ref) on the registered GPU backend.
 """
 gpu_chunk_ftprofs(args...; kwargs...) = chunk_ftprofs(require_gpu(), args...; kwargs...)
+
+
+"""
+    chunk_profiles(backend, ft, params, rstart, n; t0=0, weights=Float32, k=1)
+
+The real coherent-fold profiles for one chunk at decimation `k`, as an
+`(nbins, n)` matrix with `nbins = 2*fld(nharms, k)`.  Stage-2 equivalence gate.
+"""
+function chunk_profiles end
+
+"""
+    chunk_boxcar(backend, ft, params, rstart, n; t0=0, weights=Float32, k=1, invsigma=1)
+
+Peak boxcar matched-filter S/N of every profile in the chunk at decimation `k`,
+with the noise scale supplied rather than estimated.  Passing `invsigma`
+explicitly is what makes this a clean test of the *filter* arithmetic: the
+statistic is exactly linear in `1/sigma`, so pinning it at `invsigma = 1` covers
+the width bank, the wrapped prefix sums and the `delta*S_tot` baseline without
+either side having to agree about sigma estimation as well.
+"""
+function chunk_boxcar end
+
+function chunk_profiles(::CPUBackend, ft::FFTFile, params::SearchParams,
+                        rstart::Real, n::Integer; t0::Integer = 0,
+                        weights::Type{<:AbstractFloat} = Float32, k::Integer = 1)
+    ws = Workspace(params, n)
+    dplans = build_direct_plans(weights, params, rstart)
+    fill_chunk_profiles!(ws, dplans, ft, params, rstart,
+                         params.hidr / params.nharms, n; t0 = t0)
+    k == 1 && return copy(ws.profs[:, 1:n])
+    db = ws.decims[findfirst(d -> d.k == k, ws.decims)]
+    mul!(db.dprofs, db.brfftplan, db.src)
+    return copy(db.dprofs[:, 1:n])
+end
+
+function chunk_boxcar(::CPUBackend, ft::FFTFile, params::SearchParams,
+                      rstart::Real, n::Integer; t0::Integer = 0,
+                      weights::Type{<:AbstractFloat} = Float32, k::Integer = 1,
+                      invsigma::Real = 1.0)
+    profs = chunk_profiles(CPUBackend(), ft, params, rstart, n;
+                           t0 = t0, weights = weights, k = k)
+    nbins = size(profs, 1)
+    widths = ladder_boxcar_widths(nbins, k, params)
+    psum = Vector{Float64}(undef, nbins + widths[end] + 1)
+    P64 = Matrix{Float64}(profs)
+    return [_profile_boxcar(P64, j, psum, widths, nbins, Float64(invsigma))
+            for j in 1:n]
+end
+
+gpu_chunk_profiles(args...; kwargs...) = chunk_profiles(require_gpu(), args...; kwargs...)
+gpu_chunk_boxcar(args...; kwargs...) = chunk_boxcar(require_gpu(), args...; kwargs...)
