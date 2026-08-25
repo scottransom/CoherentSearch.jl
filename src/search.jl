@@ -140,7 +140,7 @@ Base.@kwdef struct SearchParams
                                        # Float32 batched gate lands within this of
                                        # `threshold` (see `boxcar_metrics!`)
     decimations::Vector{Int} = [1]  # harmonic-decimation factors k (see decimation_design.md)
-    precision::Symbol = :f64   # profile-stage element type — :f64 or :f32 (see `proftype`)
+    precision::Symbol = :f32   # profile-stage element type — :f32 or :f64 (see `proftype`)
 end
 
 """

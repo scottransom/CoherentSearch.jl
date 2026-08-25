@@ -77,6 +77,18 @@ oracle/equivalence pins green. There are three, and they chain:
 - **Python oracle** (`crossval/crossval_accuracy.jl`, needs the sibling repo and
   a Python that can import it): `finterp_fft` at 3.9e-16, `reference_profiles`
   at 1.4e-16, and `snr_metrics` (the boxcar matched filter) at 7.0e-17. Run it
+  **The printed path does NOT tell you the sibling repo is up to date, and that
+  cost an hour on 2026-08-24.** The metric check read `rel = 5.694e-02` against
+  its `1e-9` tolerance on a laptop whose `../coherent_search` checkout predated
+  the `snr1` metric change — the *old* `(Σ(Pᵢ − median))/(σ√w)` against our
+  zero-mean unit-L2 template, which differ by exactly `√(1−δ)` (16% at the widest
+  bank member, bracketing the 5.7% seen). `git pull` in the sibling repo restored
+  it to **1.393e-16**. So the recorded warning about a stale *install* has a twin:
+  a stale *checkout* prints exactly the path you expect. **When only the metric
+  check fails and the kernel/profile checks stay at ~1e-16, suspect the sibling
+  repo before the Julia, and check its log against the last metric change** —
+  `sigma_center=:median` reconciles the σ̂ centring, not the template, so it will
+  not paper over this. **Do not "fix" it by loosening the 1e-9.**
   after touching anything in `fourierinterp.jl`, `reference_profiles`, or the
   metric. **The oracle prefers the sibling repo's `src/` over any installed copy
   and prints the path it used** — a stale non-editable install once pinned this
@@ -623,7 +635,8 @@ re-deriving them.
     not hidden.** `_block_sigma(...; center = :median)` still computes the classic
     MAD-about-the-sample-median that upstream `snr_metric` does, `snr_metrics`
     forwards it as `sigma_center`, and `crossval/crossval_accuracy.jl` passes
-    `:median` — so the metric pin stays at **1.365e-16** and still covers the
+    `:median` — so the metric pin stays at **1.365e-16** (re-verified 2026-08-24
+    at 1.393e-16) and still covers the
     width bank, the boxcar template and the scan arithmetic. Loosening
     that tolerance to ~1e-2 to swallow the difference would have been the wrong
     trade: it would hide a real bug in any of those three.

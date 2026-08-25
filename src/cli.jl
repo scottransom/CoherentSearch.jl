@@ -114,9 +114,9 @@ function parse_cmdline(argv)
             default = 16
             range_tester = x -> x > 0 && iseven(x)
         "--precision"
-            help = "Element type of the profile stage (interpolated harmonic amplitudes, the batched inverse FFT, and the folded profiles the metric reads): 'f64' (default) or 'f32'. Everything reported stays Float64; f32 halves the bandwidth of the bulk arrays and is a win once several threads contend for memory"
+            help = "Element type of the profile stage (interpolated harmonic amplitudes, the batched inverse FFT, and the folded profiles the metric reads): 'f32' (default) or 'f64'. Everything reported stays Float64; f32 halves the bandwidth of the bulk arrays and is faster at every thread count on both development hosts (1.21x at -t 1). Use f64 to reproduce a pre-2026-08-24 run, or when a candidate's S/N must be bit-comparable with the reference path"
             arg_type = String
-            default = "f64"
+            default = "f32"
             range_tester = x -> x in ("f64", "f32")
         "--blocksize"
             help = "Trial fundamentals per parallel chunk (Nprof)"

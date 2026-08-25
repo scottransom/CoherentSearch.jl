@@ -10,11 +10,16 @@ const EXAMPLE_FFT = joinpath(@__DIR__, "..", "..", "coherent_search",
                              "examples", "harmonics_hi.fft")
 
 # Tolerance for the optimised-vs-reference equivalence pins.  The profile stage's
-# precision is a runtime choice (`SearchParams.precision`), and these pins run at
-# the default `:f64`, where they are machine-precision pins.  `PIN_PRECISION` is
-# the knob a `:f32` sweep flips; the bound is *derived* from it rather than
-# relaxed by hand, and a real regression is orders of magnitude larger than
-# either bound.
+# precision is a runtime choice (`SearchParams.precision`), and since 2026-08-24
+# the *shipped default is `:f32`* — so these pins pass `precision=PIN_PRECISION`
+# EXPLICITLY rather than inheriting it.  At `:f64` they are machine-precision
+# statements about the chunking, the tabulation and the harmonic gather; run at
+# the default they would silently fold the profile stage's ~1e-7 into a bound
+# whose whole job is to catch those bugs at 1e-8.  `PIN_PRECISION` is the knob a
+# `:f32` sweep flips; the bound is *derived* from it rather than relaxed by hand,
+# and a real regression is orders of magnitude larger than either bound.
+# `test/test_search.jl`'s "precision=:f32 tracks the :f64 profile stage" testset
+# is what covers the shipped default.
 const PIN_PRECISION = :f64
 const PIN_TOL = PIN_PRECISION === :f32 ? 1e-6 : 1e-8
 const PIN_PROFT = PIN_PRECISION === :f32 ? Float32 : Float64
@@ -243,7 +248,7 @@ if isfile(EXAMPLE_FFT)
         # but only because both sides shared an interpolator carrying a ~1e-2
         # error, so it could not have caught the interpolator being wrong.  This
         # one is looser in the number and stronger in what it asserts.
-        params = SearchParams(nharms=32, m=32)
+        params = SearchParams(nharms=32, m=32, precision=PIN_PRECISION)
         lodr = params.hidr / params.nharms
         rstart = 10010.0
         n = 256
@@ -428,7 +433,7 @@ if isfile(EXAMPLE_FFT)
         # is that it stays far under `boxcar_gatemargin` (0.01), the slack the
         # `Float64` re-score reserves.
         CS = CoherentSearch
-        params = SearchParams(nharms=60, m=32)
+        params = SearchParams(nharms=60, m=32, precision=PIN_PRECISION)
         nbins = 2params.nharms
         Nprof = 500          # deliberately not a multiple of _BC_BATCH (tail path)
         lodr = params.hidr / params.nharms
@@ -461,7 +466,10 @@ if isfile(EXAMPLE_FFT)
         # performance knob.  This is also what would catch `_BC_BATCH` being set
         # to something `_BC_TR_BJ` does not divide.
         CS = CoherentSearch
-        params = SearchParams(nharms=60, m=32)
+        # `:f64` explicitly: this testset is about the WIDENING nest, and the
+        # shipped `:f32` default would dispatch every call here to the same-type
+        # method instead.  The testset below covers that one.
+        params = SearchParams(nharms=60, m=32, precision=:f64)
         nbins = 2params.nharms
         Nprof = 2CS._BC_BATCH
         ws = CS.Workspace(params, Nprof)
@@ -470,6 +478,7 @@ if isfile(EXAMPLE_FFT)
                                 params.hidr / params.nharms, Nprof; t0=0)
         B = CS._BC_BATCH
         @test B % CS._BC_TR_BJ == 0
+        @test eltype(ws.profs) === Float64
         ref = Vector{CS._BC_TILE}(undef, B * nbins)
         CS._bc_transpose!(ref, ws.profs, 0, nbins, Val(B), Val(B))   # unblocked
         got = similar(ref)
@@ -498,7 +507,7 @@ if isfile(EXAMPLE_FFT)
         # bytes -- widening to `Float64` and back is exact, so the generic nest
         # on a widened copy is an exact reference.
         CS = CoherentSearch
-        params = SearchParams(nharms=60, m=32)
+        params = SearchParams(nharms=60, m=32, precision=:f64)
         nbins = 2params.nharms
         Nprof = 2CS._BC_BATCH
         ws = CS.Workspace(params, Nprof)
@@ -615,7 +624,8 @@ if isfile(EXAMPLE_FFT)
         for k in (2, 3, 4)
             nharms = 60
             Hk = fld(nharms, k)
-            params = SearchParams(nharms=nharms, m=32, decimations=[1, k])
+            params = SearchParams(nharms=nharms, m=32, decimations=[1, k],
+                                  precision=PIN_PRECISION)
             lodr = params.hidr / nharms
             rstart = 5000.0
             n = 64
