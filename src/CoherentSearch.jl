@@ -45,6 +45,14 @@ export DirectPlan, build_direct_plans, trial_grid_rational,
        finterp_direct, finterp_direct!
 include("directinterp.jl")
 
+# --- Compute backends (the GPU one lives in a package extension) ---
+# Included AFTER `search.jl` and `directinterp.jl`: the backend entry points
+# annotate their arguments with `SearchParams`/`FFTFile`, and a method signature's
+# types are resolved when the method is DEFINED, not when it is called.
+export SearchBackend, CPUBackend, gpu_backend, has_gpu, require_gpu,
+       chunk_ftprofs, gpu_chunk_ftprofs
+include("backend.jl")
+
 # --- FFTW plan-wisdom persistence (faster planning / start-up) ---
 export wisdom_path, import_wisdom!, export_wisdom!, prime_wisdom,
        production_params

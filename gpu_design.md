@@ -424,9 +424,9 @@ reachable; cuFFT excellent at all six fold depths; the DFT alternative measured
 and rejected. *Gate passed, and it corrected the target (§2) and killed the
 stage-3 megakernel (§3.3).*
 
-**Stage 1 — K1 alone, against the CPU.** Port the interpolator, compare
-`ftprofs` to `fill_chunk_profiles!`'s at `Float32`. *Gate: agreement ≲1e-6, and
-the interp phase faster than the CPU's ~19% share suggests.*
+**Stage 1 — K1 alone, against the CPU. DONE 2026-08-25.** Extension skeleton
+(`src/backend.jl`, `ext/CoherentSearchCUDAExt.jl`), the interpolation kernel, and
+`test/test_gpu.jl`. *Gate passed on accuracy, missed on speed — see §4.1.*
 
 **Stage 2 — the whole chunk pipeline (K1–K4), staged through global memory.**
 This is the deliverable that gives the headline number. *Gate: the §5 pins green
@@ -439,6 +439,69 @@ pay — this repo has four recorded cases of an isolated bench inverting in situ
 **Stage 4 — the parts deliberately deferred.**
 `--sigma measured` (device-side median), `--normalize`'s two-pass mode,
 `metricstats` histograms, multi-DM streaming, multi-GPU.
+
+### 4.1 Stage-1 results
+
+**Accuracy: passed, comfortably.** GPU vs CPU on the interpolated harmonic stack,
+PM0063, `nharms = 60`, over five (chunk, `t0`) combinations including ones that
+straddle 32-trial group boundaries: **max relative error 6.0e-8 to 9.8e-8 at
+`Float32` weights**, 2.9e-8 to 4.8e-8 at `Float64` — against a pin set at 1e-5.
+The `filled` flags agree exactly, so the two agree about *where a harmonic gives
+up* as well as about its value.
+
+**Batch invariance: BIT-EXACT**, at chunk sizes 1024 / 512 / 100 / 37 against one
+2048-trial chunk, with a CPU-vs-CPU control alongside. This is the §5 pin that
+protects the sensitivity Monte Carlo, and it is the property that lets the GPU
+run at `Nprof = 262144` while the CPU runs at 2048 without a single result
+moving. It holds because groups are anchored to the **global** trial index and
+partial end groups are computed in full and masked on store — the CPU design,
+transferred intact. `test/test_gpu.jl` pins it (117 tests).
+
+**Speed: 18.5x one Xeon core, which is only ~0.93x the 20-core socket.**
+ns per (harmonic, trial), `Float32` weights:
+
+| | `Nprof` = 2048 | 65,536 | 262,144 |
+|---|---|---|---|
+| CPU `-t 1` | **4.997** | 9.713 | — |
+| GPU | 0.685 | **0.270** | 0.280 |
+
+(The CPU's 2048 is its tuned point; at 65536 its plane buffers leave cache and it
+degrades 2x. `Nprof = 65536` is the GPU's knee, as §3.2 predicted.)
+
+**The kernel is at 4.8% of this card's achievable FP32, and two plausible
+explanations are now measured and dead:**
+
+1. **Not the 64-bit division.** `direct_chunk_state` is a `mod`/`fld` of a 64-bit
+   product, and GPUs have no hardware 64-bit divide. Replacing it with a host-
+   supplied `(res0, qint0)` plus a 32-bit recurrence, and switching the inner
+   loop from `o + (j-1)*V + lane` to running 32-bit indices, moved the time from
+   0.262 to 0.270 ns — **nothing, or very slightly worse.** The change is kept
+   (it is the more obviously correct code and it removes an overflow cliff) but
+   it bought no speed.
+2. **Not L2 bandwidth on the weight table.** The apparent traffic is ~110 B per
+   (harmonic, trial) = **407 GB/s**, above the 237 GB/s device copy, which reads
+   like a bandwidth wall. `bench/gpu_interp_probe.jl` varies *only* the weight
+   traffic, by 32x, holding the arithmetic and the access shape fixed:
+   **`real` 0.1773 vs `broadcast` 0.1766 ns — identical.** Volume is irrelevant.
+   Removing the load entirely is **1.73x**, so what costs is the load's issue
+   slot and latency.
+
+**So the remaining idea worth trying is register reuse, not shared memory.** The
+group residue cycles with period `ngrp`, so groups `gi` and `gi + ngrp` use the
+*identical* weight block; a warp that holds one block in registers across those
+repeats removes the load from the inner loop rather than making it cheaper.
+**1.73x is the ceiling that buys**, and the real kernel carries a further ~1.5x
+of per-group setup and store over the idealised loop. Staging weights in shared
+memory would cut bandwidth we are not short of.
+
+**What this does to the §2 projection — read this before quoting 2.2–2.9x.**
+Interp measures ~0.93x the socket, not the 3–5x §2 assumed, and cuFFT measures
+~1.9x. Weighting by the CPU's phase shares, a staged port on **this** card now
+projects **~1.3–1.5x the 20-core Xeon**, not 2.2–2.9x. That is a real result and
+it should not be dressed up: **on a GTX 1080 a good GPU port roughly ties a
+dual-socket 20-core server.** It also makes the newer card decisive rather than
+merely nice — §0.1 measured no architectural wall, and every ratio here is a
+property of a 2016 card with 20 SMs.
 
 ---
 
