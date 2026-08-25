@@ -2,7 +2,8 @@
 #
 #     julia --project=bench -t 1 bench/toy_vs_production.jl [FILE.fft] \
 #         [--lofreq 0.1] [--hifreq 0.4] [--nharms 60] [--maxdecim 6] [--m 16]
-#         [--threshold 6.0] [--reps 2] [--nband 4] [--sigma-only] [--no-sigma]
+#         [--threshold 6.0] [--reps 2] [--nband 4] [--prodsigma measured|analytic]
+#         [--sigma-only] [--no-sigma]
 #
 # Three things, in one process so both arms run under identical conditions:
 #
@@ -20,13 +21,18 @@
 #      scans the full geometric width bank where production prunes it across
 #      the decimation ladder (`ladder_boxcar_widths`).
 #
-#   3. SIGMA.  The open question this harness exists to answer: production
-#      measures sigma-hat per chunk (`_block_sigma`), at ~26% of all metric work
-#      and with ~1% sampling error that lands directly on every reported S/N
-#      (reported S/N is exactly 1/sigma-hat).  The toy computes it instead, from
-#      the input FFT being normalised.  This reports the two side by side, per
-#      fold depth, on the real data — which is the measurement that decides
-#      whether production can drop the estimator.
+#   3. SIGMA.  The question this harness was written to answer, and did:
+#      production used to measure sigma-hat per chunk (`_block_sigma`), at ~26%
+#      of all metric work and with ~1% sampling error landing directly on every
+#      reported S/N (reported S/N is exactly 1/sigma-hat).  The toy computes it
+#      instead, from the input FFT being normalised.  Measuring the two against
+#      the EXACT pooled MAD showed the closed form to be the closer of the pair,
+#      and production adopted it (`--sigma analytic`, now the default).
+#      This section stays because it is the ongoing check on that decision —
+#      the closed form's one assumption is a property of the DATA, so it has to
+#      be re-measured on any observation whose normalisation is in doubt.
+#      `--prodsigma` sets which estimator the production arm uses (default
+#      `measured`, so the comparison keeps its meaning).
 #
 # Note the toy is ~190x slower, so pick a NARROW band: the defaults search
 # 0.1-0.4 Hz — 75k trial fundamentals, which is ~18 s for the toy and ~0.1 s for
@@ -57,7 +63,7 @@ using .ToyCoherentSearch
 function parseargs(argv)
     o = (file = "PM0063_034C1_DM445.0_red.fft", lofreq = 0.1, hifreq = 0.4,
          nharms = 60, maxdecim = 6, m = 16, threshold = 6.0, reps = 2,
-         sigma_only = false, do_sigma = true, nband = 4)
+         sigma_only = false, do_sigma = true, nband = 4, prodsigma = :measured)
     d = Dict(pairs(o))
     i = 1
     while i <= length(argv)
@@ -70,6 +76,7 @@ function parseargs(argv)
         elseif a == "--threshold";  d[:threshold] = parse(Float64, argv[i += 1])
         elseif a == "--reps";       d[:reps]      = parse(Int, argv[i += 1])
         elseif a == "--nband";      d[:nband]     = parse(Int, argv[i += 1])
+        elseif a == "--prodsigma";  d[:prodsigma] = Symbol(argv[i += 1])
         elseif a == "--sigma-only"; d[:sigma_only] = true
         elseif a == "--no-sigma";   d[:do_sigma]   = false
         elseif !startswith(a, "--"); d[:file] = a
@@ -241,8 +248,12 @@ function main()
     ft = FFTFile(OPT.file)
     params = SearchParams(nharms = OPT.nharms, m = OPT.m, threshold = OPT.threshold,
                           decimations = decimation_set(OPT.nharms, OPT.maxdecim),
-                          precision = :f64)   # :f64 so the comparison is about
-                                              # the algorithm, not the profile width
+                          # :f64 so the comparison is about the algorithm, not
+                          # the profile width.  `sigma` is stated EXPLICITLY:
+                          # since 2026-08-24 production defaults to :analytic
+                          # too, and letting it default would quietly turn the
+                          # sigma comparison below into a comparison of nothing.
+                          precision = :f64, sigma = OPT.prodsigma)
     ntrials = length(ToyCoherentSearch.trial_grid(ft, OPT.lofreq, OPT.hifreq,
                                                   OPT.nharms, params.hidr))
     @printf("%s: T = %.1f s, N = %d\n", basename(ft.path), ft.T, ft.N)
@@ -295,7 +306,7 @@ function main()
     sort!(toycands; by = c -> c.metric, rev = true)
     sort!(prodcands; by = c -> c.metric, rev = true)
     candidate_table("toy (analytic sigma, full width bank)", toycands)
-    candidate_table("production (measured sigma, pruned ladder bank)", prodcands)
+    candidate_table("production ($(OPT.prodsigma) sigma, pruned ladder bank)", prodcands)
     crossmatch(toycands, prodcands)
     return nothing
 end

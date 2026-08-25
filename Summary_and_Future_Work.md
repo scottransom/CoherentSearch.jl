@@ -1965,6 +1965,103 @@ would be 0. At the default `maxfrac = 0.3` the cap only bites for `nbins <= 3`.
 
 ---
 
+### 3.5 The noise scale is computed, not measured (2026-08-24)
+
+`--sigma analytic` is the default as of 2026-08-24. This closed one of the
+longest-standing soft spots in the metric and made the search ~1.07x faster as a
+side effect, which is the opposite of the usual trade here.
+
+**The derivation.** The search is only meaningful on a normalised `.fft`, and
+that assumption already fixes the fold's noise. Mean Fourier power 1 means the
+real and imaginary part of each amplitude have variance ½, so the hot loop's
+unnormalised `brfft` of a stack holding harmonics `1 … H` with DC held at zero
+gives, at every phase bin,
+
+```
+var(P_j) = 4·(½)·(harmonics below the profile's Nyquist bin) + (½)·(that bin)
+         =>  sigma = sqrt(2·nlow + 0.5·nnyq)
+```
+
+the last term halved because the transform keeps only the real part of that bin.
+That is `sqrt(nbins)` times `sqrt(1 − 3/(4H))`.
+
+**Two details that are not optional.**
+
+1. **The `sqrt(1 − 3/(4H))` factor.** 0.6% at `H = 60`, **3.8% at the `H = 10`
+   of a `k = 6` fold**. Dropping it biases the shallow folds against the deep
+   ones, which is exactly the cross-decimation bias §3.4's metric exists to
+   remove — it would have quietly reintroduced it one rung at a time.
+2. **The fill count, not the stack length.** Harmonics past Nyquist are zero rows
+   and carry no noise. `fill_harmonic_row_direct!` now returns whether it filled
+   the row, `fill_chunk_profiles!` records that in `ws.filled`, and
+   `_analytic_sigma` counts what is there. Using `H` at the top of the band
+   overestimates sigma and silently suppresses fast candidates — the failure
+   would look like a sensitivity limit, not a bug.
+
+**It is faster.** Laptop, PM0063 0.1–33.3 Hz, 7 interleaved reps, read by
+metric-phase *share* (the wall clock scattered 8.6–12.0 s across reps while the
+share held to ±0.2%, and one absolute phase table showed every phase dropping
+24–31%, including ones that cannot have changed — the drift trap again):
+
+| | measured | analytic | |
+|---|---|---|---|
+| metric share, `-t 1` | 27.00% | 22.86% | −15.3% |
+| wall clock, `-t 1` | 8.91 s | 8.29 s | 1.075x |
+| metric share, `-t 4` | 26.99% | 23.09% | −14.5% |
+| wall clock, `-t 4` | 4.14 s | 3.94 s | 1.053x |
+
+**And it is more accurate, which is the better half.** Against the *exact*
+all-bins pooled MAD on PM0063, over four frequency windows and all six fold
+depths (`bench/toy_vs_production.jl`):
+
+| | vs exact sigma-hat | spread |
+|---|---|---|
+| analytic closed form | 0.9918–1.0217 | **3.0%** |
+| production's 8192-sample subsample | 0.9806–1.0335 | 5.4% |
+
+**The closed form is closer to the truth than the estimator it replaced.**
+Reported S/N is exactly `1/sigma-hat`, so the subsample's ~1% sampling error was
+landing on every candidate — the term §3.2 was going to have to model or avoid.
+It is gone, and §3.2's injection Monte Carlo can now compare S/N at the percent
+level directly.
+
+**The one residual bias is predicted, constant, and left uncorrected.** The
+`m`-bin kernel keeps `S_m ≈ 1 − 0.203/m` of the *noise* power along with the
+signal, so the analytic scale runs `0.203/(2m)` high. Measured on synthetic
+normalised white noise: 1.0086 / 1.0053 / 1.0035 at `m = 16 / 32 / 64` against
+1.0064 / 1.0032 / 1.0016 predicted. Smaller than the error it replaces, so
+correcting it would be false precision.
+
+**The assumption fails silently and in the dangerous direction.** The measured
+scale tracks whatever the amplitudes are; the analytic one keeps insisting on
+unit variance. So a normalisation error *inflates* every S/N and fills the
+candidate list with noise, rather than emptying it — the failure mode that looks
+like success. `_sigma_sanity_check` therefore scores three chunks both ways
+before the detection pass and warns above 10% disagreement, naming both numbers,
+for ~0.1% of the runtime. On the un-normalised `harmonics_hi.fft` it fires at a
+factor of ~1000. It **warns** rather than switching estimator, because changing
+the statistic behind the user's back would be worse than the problem.
+
+**`--sigma measured` is still right for some data**, and this is not a hedge: if
+the noise level varies with Fourier frequency — residual red noise, an RFI comb,
+a `rednoise` pass that did not take — the MAD adapts and the closed form cannot.
+That trades a ~1% estimation error against an unmodelled bias, and on a
+badly-behaved observation the bias wins.
+
+**Consequences to know about.** Candidates move ~1–2% and near-threshold ones
+churn (PM0063 at threshold 6: the pulsar 12.30 → 12.11, the 0.2603 Hz candidate
+7.32 → 7.37, 7 candidates either way with one swap at 6.0–6.1), so a `.cohout`
+diff across this change is *not* expected to be empty. `chunk_metrics` still
+forces `_block_sigma`, since its job is to equal `block_metrics`, so every
+equivalence pin is untouched; `test_search.jl`'s decimation-vs-native-fold pin
+had to say `sigma=:measured` explicitly for the same reason, and was off by
+~900x until it did.
+
+**Where this came from.** It was worked out and validated in
+`bin/toy_coherent_search.jl` — the simple reference implementation written for
+the paper's pseudo-code figure — before being brought into production. That is
+the second time the toy has paid for itself in the same session.
+
 ## 4. Summary
 
 Phase 1 delivered a correct, parallel, well-tested foundation whose numerical
