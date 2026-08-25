@@ -9,8 +9,13 @@
 /test/Manifest.toml
 /crossval/Manifest.toml
 
+# Python bytecode, from anywhere: crossval/, compare/compare_riptide.py and
+# bin/sift_candidates.py are all importable, so make this a general rule rather
+# than one directory at a time.
+__pycache__/
+*.py[cod]
+
 # Cross-validation scratch
-/crossval/__pycache__/
 *.bin
 oracle.json
 
