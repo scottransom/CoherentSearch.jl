@@ -346,12 +346,12 @@ metric scaled by bandwidth (bandwidth-bound):
 
 | | transforms | interp* | metric* | total* | vs CPU `-t 20` |
 |---|---|---|---|---|---|
-| GTX 1080 | 0.275 | 0.135 | 0.080 | 0.490 s | 2.1x |
-| **RTX 2080 Super** | 0.100 | **0.054** | **0.044** | **0.198 s** | **5.1x** |
+| GTX 1080 | 0.275 | **0.136** | 0.080 | 0.491 s | 2.1x |
+| **RTX 2080 Super** | 0.100 | **0.056** | 0.044 | **0.200 s** | **5.1x** |
 | **RTX 4000 SFF Ada** | **0.071** | 0.063 | 0.079 | 0.213 s | 4.7x |
 
-`*` **interp and metric are projections from the 1080 measurement, not
-measurements.** They are the next thing to check (see below).
+`*` The GTX 1080 and RTX 2080 Super interp columns are now **measured**
+(§0.45); the Ada's is projected and the metric column is projected throughout.
 
 **A 2019 consumer card ties a current workstation card on this workload, despite
 having 56% of its FP32.** They win different phases: the Ada takes the transforms
@@ -367,13 +367,50 @@ the *fastest* FP32 part is not the fastest card, and the ranking follows
 SMs x clock and GB/s instead. §0.1 already measured the interpolator at 4.8% of
 peak FLOPs; this is the same fact seen from the hardware side.
 
-**Next measurement, and it is now the highest-value one:** run
-`bench/gpu_interp_bench.jl` on both cards (it needs the repo plus an env with
-CoherentSearch and CUDA, not just the two probe files). It tests the `interp*`
-column directly, and the two cards make a sharp discriminator — **SMs x clock
-predicts the 2080 Super is 1.16x FASTER than the Ada at interpolation, while FP32
-predicts the Ada is 1.78x faster.** Those cannot both be right, and §4.1's
-"issue/latency-bound, not FLOP-bound" verdict rests on the first.
+**Done — see §0.45.** The 2080 Super measured 2.42x the 1080 against SMs x clock's
+2.51x and FP32's 1.29x, confirming §4.1's verdict to 3.5%. What remains is the
+Ada and A4000 arm, which should tie each other at ~0.1248 ns.
+
+### 0.45 Interpolation measured on a second card — §4.1's verdict CONFIRMED
+
+`bench/gpu_interp_bench.jl` on the RTX 2080 Super (real PM0063 `.fft`), against
+the GTX 1080, ns per (harmonic, trial) at `Nprof = 65536`:
+
+| | GTX 1080 | RTX 2080 Super | speedup |
+|---|---|---|---|
+| **measured** | 0.2695 | **0.1112** | **2.42x** |
+| SMs x clock predicts | 34.7 | 87.1 | **2.51x** — off by **3.5%** |
+| FP32 predicts | 7323 | 9438 | 1.29x — off by **88%** |
+
+**That is as clean a confirmation as this project has produced.** §4.1 concluded
+from a single-card probe that the interpolation kernel is issue- and
+latency-bound rather than FLOP-bound; a completely independent cross-card test
+now agrees to 3.5%, while the FLOP-based model is wrong by a factor of two. The
+interp stage for the reference workload is **0.0558 s measured against 0.054 s
+projected — 3.3%.**
+
+Combined with §0.4's finding that DRAM-bound *transform* efficiency also tracks
+SM count (33% at 20 SMs, 46–51% at 48), **both of the pipeline's compute phases
+scale with SMs x clock and neither scales with FP32.** That is now a measured
+property of the workload on two architectures, not an inference.
+
+It also sharpens §0.5's test: the Ada should do interpolation in **0.1248 ns
+(0.0626 s)** — identical SMs x clock to the A4000 — so **the 2080 Super should be
+1.12x faster than either**, and **the Ada and the A4000 should tie to within a
+few percent despite their very different bandwidth and cache.**
+
+**`test/test_gpu.jl` is 117/117 on sm_75**, so the kernel — including the
+bit-exact batch invariance — is now pinned on two architectures.
+
+**A trap this run exposes: the "x one core" column is host-specific and must not
+be carried across machines.** The 2080 Super host's CPU is much faster than
+fitzroy's Xeon Silver 4114 — 3.70 vs 4.85 ns at `Nprof = 2048` (1.31x) and 4.16
+vs 9.88 at 65536 (**2.38x**, its cache holding the larger plane buffers where the
+Xeon's does not). So the headline "33.2x one core" there and "18.5x one core" on
+fitzroy describe *different denominators*, and neither may be multiplied by 20 to
+get a socket comparison for a machine it was not measured on. **Every end-to-end
+ratio in this document is against fitzroy's 20-core Xeon at 1.01 s**; keep the
+GPU's absolute ns and compare that.
 
 ### 0.5 Pre-registered prediction for the RTX A4000 (sm_86)
 
@@ -422,8 +459,8 @@ interp and metric projected throughout):
 
 | | transforms | interp* | metric* | total* | vs CPU `-t 20` |
 |---|---|---|---|---|---|
-| GTX 1080 | 0.275 | 0.135 | 0.080 | 0.490 s | 2.1x |
-| RTX 2080 Super | 0.100 | 0.054 | 0.044 | **0.198 s** | **5.1x** |
+| GTX 1080 | 0.275 | 0.136 | 0.080 | 0.491 s | 2.1x |
+| RTX 2080 Super | 0.100 | **0.056** | 0.044 | **0.200 s** | **5.1x** |
 | RTX 4000 SFF Ada | 0.071 | 0.063 | 0.079 | 0.213 s | 4.7x |
 | RTX A4000 (predicted) | 0.112 | 0.063 | 0.049 | 0.224 s | 4.5x |
 
