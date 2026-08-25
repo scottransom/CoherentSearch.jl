@@ -145,6 +145,90 @@ this repo's standing lesson is that two hosts invert each other's conclusions.
 
 ---
 
+## 0.3 Second card: RTX 4000 SFF Ada — and the `Nprof` guidance INVERTS
+
+Measured 2026-08-25 by Scott on a two-card host (the probe uses device 0 only;
+nothing below involves both).
+
+| | GTX 1080 (sm_61) | RTX 4000 SFF Ada (sm_89) | ratio |
+|---|---|---|---|
+| SMs / clock | 20 @ 1.734 GHz | **48 @ 1.560 GHz** | 2.16x |
+| FP32 achievable | 7323 GFLOP/s (82%) | **16813 (88%)** | **2.30x** |
+| bandwidth achievable | 237 GB/s (74%) | **238 GB/s (85%)** | **1.00x** |
+| memory | 7.0 GiB | **19.5 GiB** | 2.8x |
+| bus | 256-bit | **160-bit** | — |
+| L2 | **2.0 MB** | large (see below) | — |
+
+**This card is compute-rich and bandwidth-starved**: 2.3x the FLOPs of a 2016
+consumer card and *exactly the same* memory bandwidth, because the SFF part has a
+160-bit bus. Anything bandwidth-bound will not improve on it at all; anything
+compute- or latency-bound will improve by ~2.2x. That is a sharper split than the
+two CPU hosts ever showed, and it is the lens for every number below.
+
+### The impossible column was the finding
+
+The probe's "% of achievable bandwidth" read **184%, 147%, 190%, 185%** for
+`k = 3…6` at `Nprof = 65536` — physically impossible for a streaming transform,
+and therefore informative. The working sets bracket it exactly:
+
+| `Nprof` = 65536 | k=1 | k=2 | k=3 | k=4 | k=5 | k=6 |
+|---|---|---|---|---|---|---|
+| src+dst | 60.5 MB | 30.5 MB | **20.5 MB** | 15.5 MB | 12.5 MB | 10.5 MB |
+| % of DRAM copy | 53% | 84% | **184%** | 147% | 190% | 185% |
+
+Everything at or below ~20 MB **never touches DRAM** — it is L2-resident, so the
+denominator (a 256 MB device copy) is the wrong yardstick. The knee sits between
+20.5 and 30.5 MB. The GTX 1080 is the control: **2.0 MB of L2, no knee anywhere,
+and no row above 100%.**
+
+**The probe now prints L2 size and sweeps `Nprof`** (`bench/gpu_probe.jl`),
+because this is not a curiosity — it is a tuning knob worth 1.56x:
+
+| whole six-rung transform stage, reference workload | `Nprof` = 65536 | 262144 |
+|---|---|---|
+| GTX 1080 | 0.285 s | **0.273 s** |
+| RTX 4000 SFF Ada | **0.103 s** | 0.161 s |
+
+**The `Nprof` choice inverts between the two cards.** The 1080 wants the largest
+chunk that fits (§3.2's reasoning: amortise launch overhead); the Ada wants the
+largest chunk that stays in **L2**, which is *smaller*. So **`Nprof` is a
+per-device tuning parameter, not a constant** — and §3.2's "~10^5 trials"
+guidance is a 1080 result that must not be carried across. `Nprof = 32768` is
+worth testing on the Ada: the `k=1` rung needs `Nprof × 968 B`, so ~34,600 trials
+is where even the deepest fold fits in a 32 MB L2, and the sweep will find it.
+
+### What it does to the projection
+
+- **Transform stage: 0.103 s, i.e. 4.95x the CPU's ~0.51 s at `-t 20`** — against
+  the 1080's 1.9x. This is the phase §2 called irreducible and transform-
+  dominated, and a bigger L2 reduced it by 2.77x with no code change at all.
+- **Interpolation** is issue/latency-bound (§4.1), so it should scale with
+  SMs x clock = 2.16x: ~0.125 ns per (harmonic, trial), ~2.0x the socket.
+- **The metric** is bandwidth-bound and this card has no more bandwidth, so
+  expect no improvement there.
+- Putting those together, a staged port on the Ada projects **~4x the 20-core
+  Xeon** (~0.25 s), against ~1.3–1.5x on the 1080. **And the host has two cards**,
+  which in §7.2's throughput mode is ~8x aggregate for a part costing a fraction
+  of the server.
+
+### Two verdicts that survived, and one caution
+
+- **The direct-DFT is still beaten**, 3.09x / 2.87x against cuFFT (the 1080 said
+  3.78x). Narrowed, as a different shared-memory-to-FLOP balance should, but the
+  ranking held. §0.1's verdict stands on both cards.
+- **19.5 GiB free** removes the §3.2 memory worry entirely: the 1.4 GB
+  `NGC6624` file fits with room for any workspace.
+- **NFS does not affect any number here** — every timing is device-side, on data
+  already resident. But it *will* affect start-up (the 5.9 s `using CUDA` of
+  §3.4) and, more seriously, **throughput mode**: at ~4x, a 32 MB file searches in
+  ~0.25 s, which is the same order as reading 32 MB over NFS. **In throughput
+  mode on a networked filesystem the limit may be I/O, not the GPU.** That raises
+  the priority of §7.2's prefetch/overlap — it now has to hide *disk* latency, not
+  just PCIe — and makes a bulk read worth measuring against `FFTFile`'s mmap,
+  whose page faults go over the network one fault at a time.
+
+---
+
 ## 1. Why this search is a good GPU fit — and the one place it is not
 
 **Good:**

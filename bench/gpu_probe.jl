@@ -77,8 +77,11 @@ function capabilities()
     cps = cores_per_sm(cap)
     peak_gflops = cps == 0 ? NaN : 2 * cps * sms * clk
     peak_gbs = 2 * memclk * buswidth / 8         # DDR: 2 transfers per clock
+    l2 = CUDA.attribute(dev, CUDA.DEVICE_ATTRIBUTE_L2_CACHE_SIZE)
     println("device: ", name(dev), "  sm_", cap, "  SMs=", sms,
             @sprintf("  clock=%.3f GHz  cores/SM=%d", clk, cps))
+    @printf("L2    : %.1f MB   <- the knee in the cuFFT sweep below should sit here\n",
+            l2 / 2^20)
     free, tot = CUDA.memory_info()
     @printf("memory: %.2f GiB free of %.2f GiB   bus %d-bit @ %.3f GHz\n",
             free / 2^30, tot / 2^30, buswidth, memclk)
@@ -98,39 +101,64 @@ function capabilities()
     @printf("device copy     : %7.3f ms -> %6.0f GB/s     (%.0f%% of peak)\n",
             t * 1e3, gbs, 100 * gbs / peak_gbs)
     CUDA.unsafe_free!(out); CUDA.unsafe_free!(a); CUDA.unsafe_free!(b)
-    return gflops, gbs
+    return gflops, gbs, l2
 end
 
 # --------------------------------------------------------------------------
-# 2. cuFFT at the search's sizes.  The FFTW reference is 2.048 ns per output bin
-#    for the contiguous base pass on one Xeon Silver 4114 core (:f64), from
-#    `bench/decim_brfft_bench.jl`.
+# 2. cuFFT at the search's sizes, swept over `Nprof`.
+#
+# The FFTW reference is 2.048 ns per output bin for the contiguous base pass on
+# one Xeon Silver 4114 core (:f64), from `bench/decim_brfft_bench.jl`.
+#
+# **The "eff GB/s" column is measured against the DRAM copy above, so a value
+# over 100% is not an error -- it means the transform's working set fits in L2
+# and never touched DRAM.**  That is the single most useful thing this table
+# says, because it locates the `Nprof` at which the whole transform stage stays
+# in cache, and on a large-L2 card (Ada, Hopper) that is worth more than any
+# kernel tuning.  It also inverts the GTX 1080's guidance, where bigger `Nprof`
+# was uniformly better -- so **do not carry an `Nprof` choice between cards.**
+#
+# The last column is the decision-relevant one: the whole six-rung transform
+# stage for the reference workload (PM0063 at the riptide bench config,
+# 8,363,442 trial fundamentals x 294 output bins each), derived from that row's
+# per-bin costs.  Compare it against the CPU's ~0.51 s at -t 20.
 # --------------------------------------------------------------------------
 const FFTW_NS_PER_BIN = 2.048
+const BENCH_TRIALS = 8_363_442          # PM0063, 0.1-33.333 Hz, hidr/nharms grid
+const LADDER = ((1, 60), (2, 30), (3, 20), (4, 15), (5, 12), (6, 10))
 
-# `achievable_gbs` comes from `capabilities()`.  The effective-bandwidth column is
-# the diagnostic that says WHY cuFFT costs what it costs: at these tiny transform
-# sizes it can be bandwidth-bound (then a card's GB/s is what to shop for) or
-# latency/occupancy-bound (then SM count is).  On a GTX 1080 it is the latter --
-# 32% of achievable bandwidth -- which is why the transform stage should improve
-# on a newer card even when that card's bandwidth barely moves.
-function cufft_ladder(achievable_gbs; Nprofs = (65536, 262144))
-    println("\ncuFFT batched C2R at the search's fold depths")
-    println("  Nprof    k  nbins       ms   ns/out-bin   vs 1 FFTW core   eff GB/s  % of achievable")
-    for Nprof in Nprofs, (k, Hk) in ((1, 60), (2, 30), (3, 20), (4, 15), (5, 12), (6, 10))
-        nb = 2Hk
-        src = CUDA.zeros(ComplexF32, Hk + 1, Nprof)
-        dst = CUDA.zeros(Float32, nb, Nprof)
-        plan = plan_brfft(src, nb, 1)          # OUTSIDE the timing closure
-        t = bestof(() -> mul!(dst, plan, src))
-        ns = t * 1e9 / (nb * Nprof)
-        bytes = Nprof * ((Hk + 1) * 8 + nb * 4)          # read spectrum + write profile
-        gbs = bytes / t / 1e9
-        @printf("  %7d  %d  %5d  %7.3f    %7.4f     %6.1fx        %6.0f      %3.0f%%\n",
-                Nprof, k, nb, t * 1e3, ns, FFTW_NS_PER_BIN / ns, gbs,
-                100 * gbs / achievable_gbs)
-        CUDA.unsafe_free!(src); CUDA.unsafe_free!(dst)
+function cufft_ladder(achievable_gbs, l2;
+                      Nprofs = (16384, 32768, 65536, 131072, 262144))
+    println("\ncuFFT batched C2R, swept over Nprof   (L2 = ",
+            @sprintf("%.1f MB", l2 / 2^20), ")")
+    println("  Nprof    k  nbins   workset       ms   ns/out-bin   vs FFTW   eff GB/s   %DRAM")
+    best_t, best_n = Inf, 0
+    for Nprof in Nprofs
+        stage_ns = 0.0
+        for (k, Hk) in LADDER
+            nb = 2Hk
+            src = CUDA.zeros(ComplexF32, Hk + 1, Nprof)
+            dst = CUDA.zeros(Float32, nb, Nprof)
+            plan = plan_brfft(src, nb, 1)      # OUTSIDE the timing closure
+            t = bestof(() -> mul!(dst, plan, src))
+            ns = t * 1e9 / (nb * Nprof)
+            stage_ns += nb * ns                # ns per trial fundamental, this rung
+            bytes = Nprof * ((Hk + 1) * 8 + nb * 4)
+            gbs = bytes / t / 1e9
+            @printf("  %7d  %d  %5d  %6.1f MB  %7.3f    %8.5f  %6.1fx     %6.0f    %4.0f%%%s\n",
+                    Nprof, k, nb, bytes / 2^20, t * 1e3, ns, FFTW_NS_PER_BIN / ns,
+                    gbs, 100 * gbs / achievable_gbs,
+                    gbs > achievable_gbs ? "  <- L2-resident" : "")
+            CUDA.unsafe_free!(src); CUDA.unsafe_free!(dst)
+        end
+        stage_s = stage_ns * BENCH_TRIALS / 1e9
+        stage_s < best_t && ((best_t, best_n) = (stage_s, Nprof))
+        @printf("  %7d  ---> whole six-rung transform stage for the reference workload: %.3f s\n\n",
+                Nprof, stage_s)
     end
+    @printf("BEST Nprof for the transform stage: %d at %.3f s", best_n, best_t)
+    @printf("  (CPU -t 20 spends ~0.51 s here, so %.1fx)\n", 0.51 / best_t)
+    return best_n
 end
 
 # --------------------------------------------------------------------------
@@ -214,12 +242,12 @@ end
 
 CUDA.functional() || error("no functional CUDA device")
 CUDA.versioninfo()
-const GFLOPS, GBS = capabilities()
-cufft_ladder(GBS)
+const GFLOPS, GBS, L2 = capabilities()
+cufft_ladder(GBS, L2)
 dft_vs_cufft()
 
 println("\n" * "="^78)
 println("Paste this line back with the card's name -- it is the whole classification:")
-@printf("  %s | sm_%s | %.0f GFLOP/s | %.0f GB/s | cuFFT k=1 @262144: see table\n",
-        name(device()), string(CUDA.capability(device())), GFLOPS, GBS)
+@printf("  %s | sm_%s | %.0f GFLOP/s | %.0f GB/s | L2 %.0f MB\n",
+        name(device()), string(CUDA.capability(device())), GFLOPS, GBS, L2 / 2^20)
 println("="^78)
