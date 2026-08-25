@@ -181,35 +181,78 @@ denominator (a 256 MB device copy) is the wrong yardstick. The knee sits between
 20.5 and 30.5 MB. The GTX 1080 is the control: **2.0 MB of L2, no knee anywhere,
 and no row above 100%.**
 
-**The probe now prints L2 size and sweeps `Nprof`** (`bench/gpu_probe.jl`),
-because this is not a curiosity — it is a tuning knob worth 1.56x:
+**The probe now prints L2 size and sweeps `Nprof`** (`bench/gpu_probe.jl`), and
+the re-run **confirms L2 = 40.0 MB** and the predicted optimum:
 
-| whole six-rung transform stage, reference workload | `Nprof` = 65536 | 262144 |
-|---|---|---|
-| GTX 1080 | 0.285 s | **0.273 s** |
-| RTX 4000 SFF Ada | **0.103 s** | 0.161 s |
+| whole six-rung transform stage | 16384 | **32768** | 65536 | 131072 | 262144 |
+|---|---|---|---|---|---|
+| RTX 4000 SFF Ada | 0.071 s | **0.071 s** | 0.101 s | 0.133 s | 0.161 s |
+| GTX 1080 | 0.316 s | 0.299 s | 0.286 s | 0.280 s | **0.275 s** |
 
-**The `Nprof` choice inverts between the two cards.** The 1080 wants the largest
-chunk that fits (§3.2's reasoning: amortise launch overhead); the Ada wants the
-largest chunk that stays in **L2**, which is *smaller*. So **`Nprof` is a
-per-device tuning parameter, not a constant** — and §3.2's "~10^5 trials"
-guidance is a 1080 result that must not be carried across. `Nprof = 32768` is
-worth testing on the Ada: the `k=1` rung needs `Nprof × 968 B`, so ~34,600 trials
-is where even the deepest fold fits in a 32 MB L2, and the sweep will find it.
+**`Nprof = 32768` gives 0.071 s — 7.2x the CPU socket's ~0.51 s**, against
+`262144`'s 0.161 s. The two cards want opposite ends of the sweep, and the
+spread within a single card is **2.3x**, so **`Nprof` is a per-device tuning
+parameter and §3.2's "~10^5 trials" is a 1080 result.** The probe now derives
+this number directly, so a new card answers it in one command.
 
-### What it does to the projection
+**Read the small-`Nprof` rows carefully — `%DRAM` there measures occupancy, not
+cache.** At `Nprof = 16384` the `k = 4,5,6` rungs sit at 85–93% despite working
+sets of only 2.6–3.9 MB, which cannot be a cache effect: 16384 batches of a
+20-bin transform is too little parallelism to fill 48 SMs. So the column means
+"L2-resident" only when it is *above* 100%; below it, it conflates cache misses
+with underutilisation. The optimum balances the two, which is exactly why it
+needs measuring rather than deriving.
 
-- **Transform stage: 0.103 s, i.e. 4.95x the CPU's ~0.51 s at `-t 20`** — against
-  the 1080's 1.9x. This is the phase §2 called irreducible and transform-
-  dominated, and a bigger L2 reduced it by 2.77x with no code change at all.
-- **Interpolation** is issue/latency-bound (§4.1), so it should scale with
-  SMs x clock = 2.16x: ~0.125 ns per (harmonic, trial), ~2.0x the socket.
-- **The metric** is bandwidth-bound and this card has no more bandwidth, so
-  expect no improvement there.
-- Putting those together, a staged port on the Ada projects **~4x the 20-core
-  Xeon** (~0.25 s), against ~1.3–1.5x on the 1080. **And the host has two cards**,
-  which in §7.2's throughput mode is ~8x aggregate for a part costing a fraction
-  of the server.
+### The rungs want DIFFERENT `Nprof`, and that is worth another 1.40x
+
+The per-rung optima are spread across the whole sweep:
+
+| | k=1 (120) | k=2 (60) | k=3 (40) | k=4 (30) | k=5 (24) | k=6 (20) |
+|---|---|---|---|---|---|---|
+| best ns/bin | 0.02155 | 0.02246 | 0.01853 | 0.02349 | **0.01509** | **0.01484** |
+| at `Nprof` | 16384 | 32768 | 65536 | 65536 | **131072** | **131072** |
+| at the single optimum 32768 | 0.03493 | 0.02246 | 0.02277 | 0.02889 | 0.02486 | 0.02656 |
+
+The deep fold wants a *small* batch (its 968 B per trial fills L2 fastest) and
+the shallow folds want a *large* one (their 168 B per trial needs many trials
+before there is enough work). One `Nprof` cannot satisfy both.
+
+**But it does not have to.** The six rungs read the same `ftprofs`, yet nothing
+forces them to be transformed in one call: each is a batched transform over
+*columns*, so a rung can be run in **column sub-batches sized to its own L2
+footprint** while the chunk stays whatever the interpolator wants. Taking each
+rung at its own optimum gives **6.038 ns per trial against 8.445 — 1.40x — i.e.
+0.051 s, or 10.1x the CPU socket.**
+
+**This decouples the two competing pressures on `Nprof`**: the interpolator and
+the launch-overhead argument want a large chunk, the transforms want L2-sized
+batches. Sub-batching lets each have what it wants. It is a stage-2 design item,
+not a stage-3 optimisation, because it changes how the pipeline is structured
+rather than how a kernel is written.
+
+### What it does to the projection — and the phase ranking INVERTS
+
+| phase | GTX 1080 | RTX 4000 SFF Ada | why |
+|---|---|---|---|
+| transforms | 0.275 s | **0.071 s** (0.051 sub-batched) | 40 MB L2 |
+| interpolation | 0.135 s | ~0.063 s | issue/latency-bound, scales with SMs x clock (2.16x) |
+| metric | ~0.080 s | ~0.080 s | bandwidth-bound, and this card has **no more bandwidth** |
+| **total** | ~0.49 s | **~0.21 s** (0.19 sub-batched) | |
+| **vs CPU `-t 20` (1.01 s)** | ~2.1x | **~4.7x** (5.2x sub-batched) | |
+
+**§2's "expect ~65% of GPU time in cuFFT" is a 1080 statement. On the Ada the
+transform is 33% — or 26% sub-batched — and interpolation becomes the largest
+single phase.** The two cards disagree about what to optimise, exactly as
+`foops` and `fitzroy` have done throughout this project. Two consequences:
+
+- **The interp register-reuse idea (§4.1) is now the highest-value kernel work**,
+  not a footnote: 1.73x on ~30% of GPU time. It was worth ~0.9x of a phase on the
+  1080 and is worth ~0.024 s here.
+- **Nothing bandwidth-bound will improve on this card.** The metric is the phase
+  to watch, and it is the one stage 2 has not written yet.
+
+**And the host has two cards**, which in §7.2's throughput mode is **~9-10x the
+20-core Xeon aggregate** — from a pair of small workstation GPUs.
 
 ### Two verdicts that survived, and one caution
 
@@ -219,13 +262,21 @@ is where even the deepest fold fits in a 32 MB L2, and the sweep will find it.
 - **19.5 GiB free** removes the §3.2 memory worry entirely: the 1.4 GB
   `NGC6624` file fits with room for any workspace.
 - **NFS does not affect any number here** — every timing is device-side, on data
-  already resident. But it *will* affect start-up (the 5.9 s `using CUDA` of
-  §3.4) and, more seriously, **throughput mode**: at ~4x, a 32 MB file searches in
-  ~0.25 s, which is the same order as reading 32 MB over NFS. **In throughput
-  mode on a networked filesystem the limit may be I/O, not the GPU.** That raises
-  the priority of §7.2's prefetch/overlap — it now has to hide *disk* latency, not
-  just PCIe — and makes a bulk read worth measuring against `FFTFile`'s mmap,
-  whose page faults go over the network one fault at a time.
+  already resident. Where it *does* bite:
+  - **Start-up.** The depot must live on NFS on these machines; `/tmp` is the only
+    fast local disk and is not durable. This costs package load, not compute, and
+    §7.2's throughput mode amortises it across hundreds of files, so it is
+    acceptable. If it ever stops being acceptable, the answer is the existing
+    `sysimage/` machinery staged to `/tmp` — a sysimage is a single file, so it
+    is exactly the thing a scratch disk is good for.
+  - **Reading `.fft` files, which is the real risk.** At ~5x, a 32 MB file
+    searches in ~0.2 s — the same order as reading 32 MB over NFS. **In
+    throughput mode the limit becomes I/O, not the GPU.** Scott can stage `.fft`
+    files on local disk, which settles it; where that is not possible, §7.2's
+    prefetch/overlap has to hide *disk* latency rather than just PCIe, and
+    `FFTFile`'s mmap is worth measuring against a bulk read — mmap page-faults
+    over the network one fault at a time, which is the worst possible access
+    pattern for NFS.
 
 ---
 
