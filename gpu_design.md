@@ -292,11 +292,96 @@ the interpolation kernel really is issue/latency-bound (§4.1) rather than
 FLOP-bound, it should scale with *SM count* and clock — i.e. land much closer to
 the Ada than the 2.3x FP32 ratio between them would suggest.
 
+### 0.4 RTX 2080 Super: prediction scored — 2 of 3, and the miss is the useful part
+
+| | GTX 1080 | **RTX 2080 Super** | RTX 4000 SFF Ada |
+|---|---|---|---|
+| arch / SMs x cores | Pascal, 20 x 128 | **Turing, 48 x 64** | Ada, 48 x 128 |
+| SMs x clock | 34.7 | **87.1** | 74.9 |
+| FP32 achieved | 7323 (82%) | **9438 (85%)** | 16807 (88%) |
+| bandwidth achieved | 237 (74%) | **431 GB/s (87%)** | 239 (85%) |
+| L2 | 2 MB | **4 MB** | 40 MB |
+| transform stage | 0.275 s @262144 | **0.100 s @262144** | 0.071 s @32768 |
+
+**Confirmed:** (1) no row above 100% — the maximum is 48%, nothing is ever
+L2-resident. (2) `Nprof` prefers the **large** end, monotonically
+(0.123 → 0.113 → 0.106 → 0.102 → **0.100**), exactly like the 1080 and opposite
+to the Ada.
+
+**Missed:** the stage landed at **0.100 s against a predicted 0.12–0.16 s** —
+1.41x better than the bandwidth-scaling argument said. The prediction assumed the
+1080's 0.275 s would scale by bandwidth alone (431/237 = 1.82x → 0.151 s). It
+scaled by **2.75x**, because the 2080 Super also has **2.4x the SMs**.
+
+**That miss identifies the mechanism, and the three cards now pin it down.**
+cuFFT's efficiency, as a fraction of each card's own measured DRAM copy, at the
+DRAM-bound end of the sweep:
+
+| | GTX 1080 (20 SMs) | RTX 2080 Super (48) | RTX 4000 Ada (48) |
+|---|---|---|---|
+| cuFFT % of own DRAM copy | ~33% | **~46%** | **~51%** |
+
+**The two 48-SM cards reach nearly the same fraction, and the 20-SM card reaches
+far less** — with those cards differing in bandwidth by 1.8x and in L2 by 10x.
+So the DRAM-bound transform efficiency is set by **SM count** (concurrent memory
+requests hiding latency), not by bandwidth or cache; bandwidth then sets the
+scale of what that fraction is a fraction *of*. This is the same conclusion
+§4.1's probe reached for the interpolation kernel by a completely different
+route: **at these transform sizes the GPU is latency- and occupancy-bound, and
+raw FLOPs are nearly irrelevant.**
+
+**The pre-registered discriminator resolved cleanly in favour of the cache
+story.** Per-rung sub-batching (§0.3) is worth **1.40x on the Ada and exactly
+1.00x on the 2080 Super** — every 2080 Super rung has its optimum at the same
+`Nprof = 262144`, because with 4 MB of L2 there is no residency to arrange. So
+sub-batching is confirmed as **specifically a big-L2 optimisation**, not a
+general one, and it should be implemented as a per-device policy rather than
+unconditionally.
+
+### The two modern cards are a TIE, and it is not close to the FLOPs ratio
+
+Combining the measured transform stage with projections for the other two phases
+— interpolation scaled by SMs x clock (§4.1 says issue/latency-bound) and the
+metric scaled by bandwidth (bandwidth-bound):
+
+| | transforms | interp* | metric* | total* | vs CPU `-t 20` |
+|---|---|---|---|---|---|
+| GTX 1080 | 0.275 | 0.135 | 0.080 | 0.490 s | 2.1x |
+| **RTX 2080 Super** | 0.100 | **0.054** | **0.044** | **0.198 s** | **5.1x** |
+| **RTX 4000 SFF Ada** | **0.071** | 0.063 | 0.079 | 0.213 s | 4.7x |
+
+`*` **interp and metric are projections from the 1080 measurement, not
+measurements.** They are the next thing to check (see below).
+
+**A 2019 consumer card ties a current workstation card on this workload, despite
+having 56% of its FP32.** They win different phases: the Ada takes the transforms
+on its 40 MB L2, the 2080 Super takes interpolation (2.4x the SMs x clock at 1.16x
+the Ada's) and the metric (1.8x the bandwidth). Sub-batching would put the Ada
+back ahead (0.193 s, 5.2x), and the Ada's 20 GB against 8 GB matters for large
+files — but on raw throughput per card they are level.
+
+**The hardware lesson for the paper, and for buying: this workload wants SMs and
+bandwidth, not FLOPs.** FP32 peak across these three spans 8.9 → 11.2 → 19.2
+TFLOP/s while the projected end-to-end time spans 0.49 → 0.198 → 0.213 s — i.e.
+the *fastest* FP32 part is not the fastest card, and the ranking follows
+SMs x clock and GB/s instead. §0.1 already measured the interpolator at 4.8% of
+peak FLOPs; this is the same fact seen from the hardware side.
+
+**Next measurement, and it is now the highest-value one:** run
+`bench/gpu_interp_bench.jl` on both cards (it needs the repo plus an env with
+CoherentSearch and CUDA, not just the two probe files). It tests the `interp*`
+column directly, and the two cards make a sharp discriminator — **SMs x clock
+predicts the 2080 Super is 1.16x FASTER than the Ada at interpolation, while FP32
+predicts the Ada is 1.78x faster.** Those cannot both be right, and §4.1's
+"issue/latency-bound, not FLOP-bound" verdict rests on the first.
+
 ### Two verdicts that survived, and one caution
 
-- **The direct-DFT is still beaten**, 3.09x / 2.87x against cuFFT (the 1080 said
-  3.78x). Narrowed, as a different shared-memory-to-FLOP balance should, but the
-  ranking held. §0.1's verdict stands on both cards.
+- **The direct-DFT is beaten on all three cards, and by MORE on the newer ones**:
+  3.78x (GTX 1080), 3.09x/2.87x (RTX 4000 Ada), and **7.36x/7.69x (RTX 2080
+  Super)** — the widest margin yet, since the DFT gains nothing from bandwidth it
+  cannot use while cuFFT does. Accuracy held at 2.4e-7 to 2.7e-7 on every card.
+  **§0.1's verdict is now tested across three microarchitectures and is closed.**
 - **19.5 GiB free** removes the §3.2 memory worry entirely: the 1.4 GB
   `NGC6624` file fits with room for any workspace.
 - **NFS does not affect any number here** — every timing is device-side, on data
