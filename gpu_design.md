@@ -978,6 +978,9 @@ even more wrong here.
 | 65536 | 0.125 | 0.092 | 0.282 | 0.162 | 0.661 s | 1.53x |
 | **131072** | **0.112** | **0.089** | **0.279** | **0.138** | **0.619 s** | **1.63x** |
 
+(Superseded by §4.4 after the boxcar work; kept because §4.2's projection
+accounting is written against it.)
+
 **Against §0.46's projection of 0.490 s this is 26% optimistic, and the
 accounting says exactly where.** Transform 0.279 vs 0.275 projected and interp
 0.112 vs 0.135 were both right; the metric came in at **0.138 against 0.080** (1.7x
@@ -986,11 +989,53 @@ exist as a concept until cuFFT's stride limitation forced it. Every end-to-end
 number in §0.3–§0.46 that carries a projected metric column should be read as
 ~25% optimistic until the metric is re-measured per card.
 
-**Two things the boxcar kernel has not had yet**, and it is now the largest phase
-after the transform: a block size sweep (`_GPU_BC_B = 32` is a first guess, and
-32 threads per block is poor occupancy), and the observation that at 0.138 s it
-is running ~3x off this card's bandwidth for the profile traffic it moves — so
-it is shared-memory/compute bound, not bandwidth bound, and there is headroom.
+### 4.3 Boxcar tuning — one idea worked, two hypotheses died
+
+`bench/gpu_boxcar_bench.jl`, on genuine chunk profiles in the production device
+buffers, summed over all six rungs and scaled to the reference workload:
+
+| variant | B=32 | B=64 | shared/block |
+|---|---|---|---|
+| 1 — shared prefix, per-width scan | 0.1621 | 0.1649 | 16 KB |
+| 2 — no shared, register sliding window | **1.871** | **3.116** | 0 |
+| **3 — width-fused scan** | **0.1282** | 0.1305 | 16 KB |
+
+**Variant 3 is 1.26x and bit-identical to variant 1** (0.0e+00, not a tolerance).
+The scan is `max_p (psum[p+w] - psum[p])`, two shared loads per (phase, width) —
+but `psum[p]` does not depend on `w`. Putting phase outside and width inside
+loads it once for every width, cutting shared traffic from `2*nw` to `nw+1` per
+phase (10 → 6 at the `k=1` bank). Predicted 1.67x on the scan; delivered 1.26x on
+the phase, the difference being the prefix-sum pass, which is untouched. The
+per-width running maxima have to be an `NTuple` with `NW` a `Val` — indexed by a
+runtime `wi` they spill to local memory and the win vanishes, the same trap
+`DIRECT_GROUP_V` and `_BC_BATCH` document on the CPU.
+
+**Both of §4.2's stated hypotheses were wrong.**
+
+1. *"32 threads per block is poor occupancy"* — B is **flat**: 0.1621 vs 0.1649
+   at B=64, and 128 does not fit in 48 KB of shared. Occupancy is not the limit.
+2. *"~3x off bandwidth, so there is headroom"* — there is, but not where I said.
+   Variant 2 removed shared memory entirely to raise occupancy, betting the extra
+   profile re-reads would be L1 hits. It is **12–19x SLOWER** (1.87 s at B=32,
+   3.12 s at B=64 — and it gets *worse* with more threads, which is the opposite
+   of an occupancy story). Shared memory was earning its keep: the sliding sum is
+   a serial dependency on a *global* load, and ~400-cycle latency in a dependent
+   chain is not something occupancy can hide at these trip counts. **Do not
+   re-guess this one.**
+
+### 4.4 Stage-2 pipeline, measured
+
+| `Nprof` | interp | transpose | transform | boxcar | total | vs CPU `-t 20` |
+|---|---|---|---|---|---|---|
+| 16384 | 0.139 | 0.103 | 0.309 | 0.181 | 0.731 s | 1.38x |
+| 65536 | 0.124 | 0.093 | 0.290 | 0.135 | 0.642 s | 1.57x |
+| **131072** | **0.113** | **0.092** | **0.281** | **0.126** | **0.611 s** | **1.65x** |
+
+**The transform is now 46% of GPU time and the clear next target**; interp and
+the boxcar are 18% and 21%. Note this ordering is a GTX 1080 statement — §0.3
+measured the Ada doing the transform stage 3.9x faster on its 40 MB L2, which
+would leave the *boxcar* as that card's largest phase. Re-measure per card before
+optimising, as always.
 
 ---
 

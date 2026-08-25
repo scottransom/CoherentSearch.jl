@@ -428,17 +428,147 @@ function _boxcar_kernel!(out, profs, n::Int32, nbins::Int32, wmax::Int32,
     return nothing
 end
 
-const _GPU_BC_B = 32          # trials per block; shared use is (nbins+wmax+1)*B floats
+# Variant 2: no prefix sum and no shared memory.  Per width, slide the window
+# directly, keeping the running sum in a register:
+#
+#     S = sum(prof[1..w]);  for p in 2:nbins:  S += prof[p+w-1] - prof[p-1]
+#
+# It re-reads the profile ~2*nwidths times instead of ~once, which looks worse and
+# may not be: the block's working set is B*nbins*4 bytes (15 KB at B=32,
+# nbins=120), so the re-reads are L1 hits, and in exchange the kernel uses **no
+# shared memory at all** -- which is what caps occupancy in variant 1, where
+# (nbins+wmax+1)*B floats allows only ~192 threads per SM.
+#
+# Same arithmetic and same operation order per profile as `_boxcar_scan`.
+function _boxcar_slide_kernel!(out, profs, n::Int32, nbins::Int32,
+                               widths, nw::Int32, invsigma::Float32)
+    j = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j <= n || return nothing
+    @inbounds begin
+        stot = 0.0f0
+        for i in Int32(1):nbins
+            stot += profs[i, j]
+        end
+        best = -Inf32
+        for wi in Int32(1):nw
+            w = widths[wi]
+            duty = Float32(w) / Float32(nbins)
+            invsw = invsigma / sqrt(Float32(w) * (1.0f0 - duty))
+            S = 0.0f0
+            for i in Int32(1):w
+                S += profs[i, j]
+            end
+            m = S                                   # finite seed, as on the CPU
+            for p in Int32(2):nbins
+                a = p + w - Int32(1)
+                a > nbins && (a -= nbins)           # wrap: a boxcar may straddle phase 0
+                S += profs[a, j] - profs[p - Int32(1), j]
+                m = ifelse(S > m, S, m)
+            end
+            c = (m - duty * stot) * invsw
+            best = ifelse(c > best, c, best)
+        end
+        out[j] = best
+    end
+    return nothing
+end
+
+# Variant 3: hoist the subtracted prefix term out of the width loop.
+#
+# The scan is `max_p (psum[p+w] - psum[p])` per width, i.e. TWO shared loads per
+# (phase, width).  But `psum[p]` does not depend on `w` -- so putting phase
+# outside and width inside loads it once and serves every width, cutting shared
+# traffic from `2*nw` to `nw+1` loads per phase (10 -> 6 at the k=1 bank).
+#
+# The per-width running maxima must be an `NTuple`, not an array: indexed by a
+# runtime `wi` they spill to local memory and the whole point is lost.  Same trap
+# `DIRECT_GROUP_V` and `_BC_BATCH` document -- and the reason `NW` is a `Val`.
+@inline _bc_upd(m::NTuple{NW,Float32}, ps, o::Int32, base::Float32, ws,
+                ::Val{NW}) where {NW} =
+    ntuple(i -> (@inbounds d = ps[o + ws[i]] - base; ifelse(d > m[i], d, m[i])), Val(NW))
+
+function _boxcar_fused_kernel!(out, profs, n::Int32, nbins::Int32, wmax::Int32,
+                               widths, invsigma::Float32, ::Val{B},
+                               ::Val{NW}) where {B,NW}
+    tid = threadIdx().x
+    j = (blockIdx().x - Int32(1)) * Int32(B) + tid
+    ps = CuDynamicSharedArray(Float32, (Int(nbins) + Int(wmax) + 1) * B)
+    live = j <= n
+    @inbounds begin
+        ps[tid] = 0.0f0
+        acc = 0.0f0
+        for i in Int32(1):(nbins + wmax)
+            idx = i > nbins ? i - nbins : i
+            acc += live ? profs[idx, j] : 0.0f0
+            ps[i * B + tid] = acc
+        end
+        live || return nothing
+        # width offsets in shared-array units, hoisted out of the phase loop
+        ws = ntuple(i -> widths[i] * Int32(B), Val(NW))
+        stot = ps[nbins * B + tid] - ps[tid]
+        m = ntuple(i -> ps[ws[i] + tid] - ps[tid], Val(NW))   # finite seed, as on the CPU
+        for p in Int32(2):nbins
+            o = (p - Int32(1)) * Int32(B) + tid
+            m = _bc_upd(m, ps, o, ps[o], ws, Val(NW))
+        end
+        best = -Inf32
+        for i in Int32(1):NW
+            w = widths[i]
+            duty = Float32(w) / Float32(nbins)
+            invsw = invsigma / sqrt(Float32(w) * (1.0f0 - duty))
+            c = (m[i] - duty * stot) * invsw
+            best = ifelse(c > best, c, best)
+        end
+        out[j] = best
+    end
+    return nothing
+end
+
+const _GPU_BC_B = 32          # trials per block; see bench/gpu_boxcar_bench.jl
+const _GPU_BC_VARIANT = 3     # 1 = per-width scan, 2 = register sliding, 3 = width-fused
 
 function gpu_boxcar!(out::CuVector{Float32}, profs::CuMatrix, n::Integer,
                      nbins::Integer, widths::CuVector{Int32}, wmax::Integer,
-                     invsigma::Real)
-    B = _GPU_BC_B
-    shmem = (Int(nbins) + Int(wmax) + 1) * B * sizeof(Float32)
+                     invsigma::Real; B::Integer = _GPU_BC_B,
+                     variant::Integer = _GPU_BC_VARIANT)
+    if variant == 2
+        @cuda threads = B blocks = cld(n, B) _boxcar_slide_kernel!(
+            out, profs, Int32(n), Int32(nbins), widths,
+            Int32(length(widths)), Float32(invsigma))
+        return out
+    end
+    shmem = (Int(nbins) + Int(wmax) + 1) * Int(B) * sizeof(Float32)
+    if variant == 3
+        nw = length(widths)
+        nw <= 8 || return gpu_boxcar!(out, profs, n, nbins, widths, wmax, invsigma;
+                                      B = B, variant = 1)
+        _bcf_launch!(out, profs, n, nbins, wmax, widths, invsigma, shmem,
+                     Val(Int(B)), Val(nw))
+        return out
+    end
+    B == 32 ? _bc_launch!(out, profs, n, nbins, wmax, widths, invsigma, shmem, Val(32)) :
+    B == 64 ? _bc_launch!(out, profs, n, nbins, wmax, widths, invsigma, shmem, Val(64)) :
+    B == 128 ? _bc_launch!(out, profs, n, nbins, wmax, widths, invsigma, shmem, Val(128)) :
+    B == 256 ? _bc_launch!(out, profs, n, nbins, wmax, widths, invsigma, shmem, Val(256)) :
+    throw(ArgumentError("unsupported boxcar block size $B"))
+    return out
+end
+
+# `B` must reach the kernel as a `Val`: the shared-array offsets are computed
+# from it in the inner loop, and with a runtime `Int` they are not folded.  Same
+# trap `_BC_BATCH` and `DIRECT_GROUP_V` document on the CPU side.
+@inline function _bcf_launch!(out, profs, n, nbins, wmax, widths, invsigma, shmem,
+                              ::Val{B}, ::Val{NW}) where {B,NW}
+    @cuda threads = B blocks = cld(n, B) shmem = shmem _boxcar_fused_kernel!(
+        out, profs, Int32(n), Int32(nbins), Int32(wmax), widths,
+        Float32(invsigma), Val(B), Val(NW))
+end
+
+@inline function _bc_launch!(out, profs, n, nbins, wmax, widths, invsigma, shmem,
+                             ::Val{B}) where {B}
     @cuda threads = B blocks = cld(n, B) shmem = shmem _boxcar_kernel!(
         out, profs, Int32(n), Int32(nbins), Int32(wmax), widths,
         Int32(length(widths)), Float32(invsigma), Val(B))
-    return out
 end
 
 # --- stage-2 equivalence entry points --------------------------------------
