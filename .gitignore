@@ -34,3 +34,23 @@ oracle.json
 # thread_scaling.jl output (regenerate with `julia --project=bench bench/thread_scaling.jl`)
 /bench/thread_scaling.csv
 /bench/thread_scaling.png
+
+# Test/benchmark observations, synced between hosts by hand and NEVER committed:
+# one .fft/.dat pair is 32 MB each, and a single `git add -A` without a pathspec
+# put 64 MB of them into the history (recovered by amending the tip, 2026-08-24).
+*.fft
+*.dat
+*.inf
+*.cohout
+*_ACCEL_*
+# Per-run search output: candidate profile plots and the --metricstats tables.
+# (docs/thread_scaling.png is tracked, so there is deliberately no bare *.png.)
+*_profiles_*.png
+*_metricstats.txt
+*_metricfap.txt
+*_metrichist.txt
+# The test observations themselves, by name, so every derived artifact of them
+# (candidate lists, PRESTO ACCEL output, .txt reports) is covered too.  These
+# are synced between foops and fitzroy by hand.
+PM0063_034C1*
+NGC6624_*

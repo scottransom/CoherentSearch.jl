@@ -2057,6 +2057,20 @@ equivalence pin is untouched; `test_search.jl`'s decimation-vs-native-fold pin
 had to say `sigma=:measured` explicitly for the same reason, and was off by
 ~900x until it did.
 
+**Confirmed on both hosts (2026-08-24), which is not the usual outcome here.**
+fitzroy (Xeon Silver 4114) gives a metric share of 26.92% → 23.08% at `-t 1`
+(14.3% off the metric, 1.067x wall) and 25.92% → 22.34% at `-t 20` (13.8%),
+against the laptop's 15.3% and 14.5%. 747/747 tests and crossval at 3.885e-16 /
+1.435e-16 / 1.416e-16 there. The `-t 20` wall clock is *not* usable — a ~1 s run
+on a desktop carrying Chrome and Zoom scattered 0.93–1.36 s — but the share held
+to ±0.2% across seven reps.
+
+Better still, the **accuracy** table came out digit-for-digit identical on the
+two hosts, given the same input file: every `(k, window)` ratio, both summary
+rows, all of it. That is the expected result — σ is a property of the data and
+of deterministic code, not of the CPU — which is precisely why it was worth
+checking. A host-dependent number there would have been a bug, not a measurement.
+
 **Where this came from.** It was worked out and validated in
 `bin/toy_coherent_search.jl` — the simple reference implementation written for
 the paper's pseudo-code figure — before being brought into production. That is

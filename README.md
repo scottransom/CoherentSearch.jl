@@ -493,10 +493,11 @@ It takes the options that set the search itself (`--threshold`, `--nharms`,
 collapsing and output code unchanged, because that is bookkeeping rather than
 search.
 
-**Expect roughly 100–200× slower**, so give it a narrow band. How much depends
-on the machine and the band; on the laptop at `-t 1` over 0.1–0.4 Hz of
-`PM0063_034C1_DM445.0_red.fft`, two runs of the same command gave 190.8× and
-177.1× (~243 µs per trial fundamental against production's ~1.27 µs).
+**Expect roughly 150–250× slower**, so give it a narrow band. How much depends
+on the machine and the band; measured at `-t 1` over 0.1–0.4 Hz of
+`PM0063_034C1_DM445.0_red.fft`, two runs of the same command on the laptop gave
+190.8× and 177.1×, and the 20-core Xeon gave 200.4× (~243 and ~359 µs per trial
+fundamental against production's ~1.27 and ~1.79 µs).
 
 It differs from the production search in exactly two ways, both deliberate and
 both documented in the file: it scans the full geometric width bank rather than

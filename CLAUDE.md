@@ -70,10 +70,10 @@ repeatedly — now with a known mechanism (see the AVX-512 entry below).
   removed**, written to be read: brute-force per-point interpolation, one
   `irfft` per fold, the boxcar filter straight from its definition, plain nested
   loops. It is what the paper's pseudo-code figure describes, and its functions
-  carry that figure's line numbers. Roughly **100–200x** slower than production
-  and machine-dependent — two runs of the same command on the laptop gave 190.8x
-  and 177.1x (~243 vs ~1.27 µs per trial fundamental) — so quote it as a range
-  and give it a narrow band. It reuses the
+  carry that figure's line numbers. Roughly **150–250x** slower than production
+  and machine-dependent — the same command gave 177.1x and 190.8x on the laptop
+  and 200.4x on fitzroy (~243 and ~359 vs ~1.27 and ~1.79 µs per trial
+  fundamental) — so quote it as a range and give it a narrow band. It reuses the
   production candidate collapsing and output verbatim, and differs deliberately
   in two ways: the full geometric width bank rather than the ladder-pruned one,
   and it was where the analytic σ was worked out and validated first.
@@ -832,6 +832,24 @@ re-deriving them.
     threshold 6: the 7.1185 Hz pulsar 12.30 → 12.11, the 0.2603 Hz candidate
     7.32 → 7.37; 7 candidates either way, with one swap at 6.0–6.1. Do not
     expect a `.cohout` diff to be empty across this change.
+  - **CONFIRMED ON BOTH HOSTS, 2026-08-24 — and for once they agree.** fitzroy
+    (Xeon Silver 4114, idle-ish, load 1.2): metric share **26.92% → 23.08%** at
+    `-t 1` (14.3% off the metric, 1.067x wall) and **25.92% → 22.34%** at `-t 20`
+    (13.8%), against the laptop's 15.3% / 14.5%. 747/747 tests and crossval at
+    3.885e-16 / 1.435e-16 / 1.416e-16 there. Given how often these two machines
+    have inverted each other, agreeing to ~1% is worth recording.
+  - **The accuracy table is HOST-INDEPENDENT, and was verified to be so.** With
+    the same `.fft` (md5 `e303f5b5…` on both), `bench/toy_vs_production.jl`
+    printed the σ scan **digit-for-digit identical** on the two hosts — every
+    (k, window) ratio, `analytic/exact` 0.99180 / 1.00436 / 1.02170 and
+    `sub/exact` 0.98060–1.03349 alike. That is the expected result (σ is a
+    property of the data and deterministic code, not the CPU), which is exactly
+    why it is worth checking: a host-dependent number there would have meant a
+    bug, not a measurement.
+  - **The `-t 20` WALL CLOCK is not a usable number on fitzroy** — a ~1 s run on
+    a desktop carrying Chrome and Zoom scattered 0.93–1.36 s, giving 1.034x
+    median against 1.061x min. The metric *share* held to ±0.2% over the same
+    seven reps. Read the share.
   - **`chunk_metrics` still forces `_block_sigma`**, because its job is to equal
     `block_metrics`, which measures. The equivalence pins are therefore
     untouched; `test_search.jl`'s decimation-vs-native-fold pin had to say
