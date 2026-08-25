@@ -375,6 +375,64 @@ predicts the 2080 Super is 1.16x FASTER than the Ada at interpolation, while FP3
 predicts the Ada is 1.78x faster.** Those cannot both be right, and §4.1's
 "issue/latency-bound, not FLOP-bound" verdict rests on the first.
 
+### 0.5 Pre-registered prediction for the RTX A4000 (sm_86)
+
+**The A4000 against the RTX 4000 SFF Ada is very nearly a controlled experiment,
+and that is rare enough to be worth exploiting.** GA104 and AD104 in these two
+parts have the *same* SM count (48), the *same* cores/SM (128), the *same* boost
+clock (1.56 GHz) and therefore the **same FP32 peak — 19169 GFLOP/s, to four
+digits**. They differ in exactly two things:
+
+| | RTX 4000 SFF Ada | **RTX A4000** |
+|---|---|---|
+| FP32 peak | 19169 GFLOP/s | **19169 GFLOP/s** (identical) |
+| SMs x clock | 74.9 | **74.9** (identical) |
+| L2 | **40 MB** | **4 MB** |
+| bandwidth peak | **280 GB/s** | **448 GB/s** |
+| memory | 20 GB | 16 GB |
+
+So it isolates **big cache versus more bandwidth at fixed compute** — the one
+question the first three cards left entangled, since they varied SM count,
+bandwidth and L2 all at once.
+
+**Predictions, recorded before the run:**
+
+1. **Achieved bandwidth ~385 GB/s** (86% of peak; the three measured cards came
+   in at 74%, 85%, 87%).
+2. **No row above 100%** and **`Nprof` preferring the large end**, exactly like
+   the 2080 Super — 4 MB of L2 cannot hold any rung's working set.
+3. **Per-rung sub-batching worth 1.00x**, as on the 2080 Super. If it is worth
+   more than ~1.05x with only 4 MB of L2, §0.3's mechanism is wrong.
+4. **Transform stage ~0.112 s**, from the 2080 Super's measured 0.100 s scaled by
+   bandwidth at equal SM count (431/385).
+5. **Interpolation should match the Ada's, not beat it** — identical SMs x clock —
+   which combined with §0.4's test makes a three-way discriminator: if interp is
+   issue/latency-bound, A4000 ≈ Ada < 2080 Super; if FLOP-bound, A4000 ≈ Ada >
+   2080 Super by 1.78x.
+
+**What outcome 4 decides.** The Ada does the transform stage in **0.071 s** on
+40 MB of L2 with 239 GB/s. If the A4000 needs ~0.112 s with 1.6x that bandwidth
+and a tenth of the cache, then **for this stage a large L2 is worth more than
+1.6x the DRAM bandwidth**, and the per-rung sub-batching item (§0.3) is the right
+thing to build. If the A4000 comes in at or below 0.071 s, bandwidth substitutes
+for residency after all and sub-batching should be dropped.
+
+**Projected end-to-end, all four** (transform stage measured except the A4000;
+interp and metric projected throughout):
+
+| | transforms | interp* | metric* | total* | vs CPU `-t 20` |
+|---|---|---|---|---|---|
+| GTX 1080 | 0.275 | 0.135 | 0.080 | 0.490 s | 2.1x |
+| RTX 2080 Super | 0.100 | 0.054 | 0.044 | **0.198 s** | **5.1x** |
+| RTX 4000 SFF Ada | 0.071 | 0.063 | 0.079 | 0.213 s | 4.7x |
+| RTX A4000 (predicted) | 0.112 | 0.063 | 0.049 | 0.224 s | 4.5x |
+
+**The three modern cards are predicted to land within 13% of each other while
+spanning 11.2–19.2 TFLOP/s of FP32 and 280–496 GB/s of bandwidth.** That is the
+sharpest form of §0.4's hardware lesson, and if it holds it is a genuinely useful
+statement for the paper: **on this workload the card barely matters above a
+threshold of ~48 SMs — buy on SM count and price, not on FLOPs.**
+
 ### Two verdicts that survived, and one caution
 
 - **The direct-DFT is beaten on all three cards, and by MORE on the newer ones**:

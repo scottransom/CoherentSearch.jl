@@ -18,6 +18,19 @@
 # artifacts, so `nvcc` and a module-loaded CUDA are irrelevant (and a
 # module-loaded CUDA will NOT be used).
 #
+# Precompilation is the slow part: CUDA.jl and its stack are ~4-6 min the first
+# time (216 s of it measured on fitzroy), and more over NFS.  It is ONE-TIME per
+# environment, so:
+#   - do NOT delete PREFIX between runs; re-running reuses everything;
+#   - if several GPU hosts share a home directory, give them the same PREFIX and
+#     JULIA_DEPOT_PATH.  Julia keys its precompile caches by CPU as well as by
+#     package version, so different host CPUs store separate copies side by side
+#     in the one depot rather than fighting over it -- sharing is safe, it just
+#     will not save the second host's compile unless the CPUs match.  Setting
+#     JULIA_CPU_TARGET to a common baseline would make them share, at the cost of
+#     the CPU-side benchmark arm being compiled for that baseline -- not worth it
+#     when the GPU column is what you are after.
+#
 # Disk: the CUDA artifacts are ~2.2 GB and land in the Julia depot.  On a cluster
 # whose $HOME is small or on slow NFS, set JULIA_DEPOT_PATH to local scratch --
 # this is the single most common way this goes wrong.
@@ -89,11 +102,11 @@ mkdir -p "$ENVDIR"
 echo "== depot: ${JULIA_DEPOT_PATH:-$HOME/.julia}  (CUDA artifacts are ~2.2 GB)"
 if [ "$HAVE_REPO" = 1 ]; then
     echo "== repo detected at $REPO; adding CUDA + CoherentSearch (dev) to $ENVDIR"
-    echo "== (first run precompiles for several minutes)"
+    echo "== (ONE-TIME: ~4-6 min of precompilation, more on NFS.  It is not hung.)"
     "$JULIA" --project="$ENVDIR" -e "using Pkg; Pkg.add(\"CUDA\"); Pkg.develop(path=\"$REPO\"); Pkg.precompile()"
 else
     echo "== no repo checkout alongside; adding CUDA only (gpu_probe.jl needs nothing else)"
-    echo "== (first run precompiles for several minutes)"
+    echo "== (ONE-TIME: ~4-6 min of precompilation, more on NFS.  It is not hung.)"
     "$JULIA" --project="$ENVDIR" -e 'using Pkg; Pkg.add("CUDA"); Pkg.precompile()'
 fi
 
