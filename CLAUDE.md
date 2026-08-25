@@ -361,7 +361,12 @@ candidates (§4.8); the workload wants **SMs, not FLOPs and not bandwidth** — 
 two 48-SM cards tie to 3.9% while differing 1.8x in FP32, 1.8x in bandwidth and
 10x in L2; `--blocksize` is a per-device parameter worth 1.2-2.3x and the cards
 want opposite ends of the range. The **transform is the largest phase on every
-card measured** (31-38.5%) — the predicted drop to ~18% did not happen. `bench/gpu_probe_setup.sh` classifies a new host in
+card measured** (31-38.5%) — the predicted drop to ~18% did not happen, which is
+why **per-rung transform sub-batching** (§4.9, `gpu_subbatch!`) is the live item:
+bit-exact, self-disabling on a small-L2 card, and predicted at **1.25x on the
+Ada**, unscored until that card is re-run. The GPU report now labels phases
+`:device`/`:transfer`/`:host` — **`scan` is host-CPU work and moved 1.75x between
+two hosts**, so classify a card on the device column only. `bench/gpu_probe_setup.sh` classifies a new host in
 one command. **fitzroy's GPU drives Scott's desktop — prefer another host for
 anything large.**
 

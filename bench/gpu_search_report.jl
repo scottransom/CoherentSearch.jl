@@ -18,9 +18,17 @@
 #    synchronise around it).  So the sweep reports both: a clean total with timing
 #    OFF, and the phase breakdown from a separate pass with it on.  Read the
 #    shares from the second and the total from the first.
-#  - **The best `--blocksize` is per-device and the two known cards want opposite
-#    ends** (GTX 1080: 262144; RTX 4000 Ada: 32768, because its 40 MB L2 holds the
-#    whole transform working set).  That is why this sweeps rather than assuming.
+#  - **The best `--blocksize` is per-device and the known cards want opposite
+#    ends** (GTX 1080 and RTX 2080 Super: 262144; RTX 4000 Ada: 16384, because its
+#    40 MB L2 holds the whole transform working set).  That is why this sweeps
+#    rather than assuming.  The sweep starts at 4096 because the Ada's in-search
+#    optimum turned out to sit BELOW the standalone probe's knee -- when cuFFT
+#    shares that L2 with the rest of the pipeline the effective knee moves down,
+#    so a sweep that bottoms out at 16384 can miss it (`gpu_design.md` §4.8).
+#  - **`scan` is HOST work and `download` is PCIe; only the five `:device` phases
+#    describe the card.**  The `scan` share moved 1.75x between two hosts purely
+#    because one had a faster CPU, so the breakdown below reports device-only
+#    shares alongside the raw ones.  Classify a card on the device column.
 
 using CoherentSearch, CUDA, Printf
 const CS = CoherentSearch
@@ -73,7 +81,7 @@ end
 println("\nblocksize sweep (timing OFF -- these are the honest totals):")
 println("  blocksize    wall (s)    ns/trial   cands")
 results = Tuple{Int,Float64}[]
-for bs in (16384, 32768, 65536, 131072, 262144)
+for bs in (4096, 8192, 16384, 32768, 65536, 131072, 262144)
     # Three searches per row: one warm-up plus two timed.  The candidate count
     # comes from the warm-up rather than a fourth call -- on a big file each
     # search is seconds, and a redundant one per row is minutes over the sweep.
@@ -97,11 +105,21 @@ CS.gpu_timing!(true); CS.gpu_phase_reset!()
 go(B, best[1])
 CS.gpu_timing!(false)
 pt = CS.gpu_phase_times()
+kind = CS.GPU_PHASE_KIND
 acc = sum(last.(pt))
-for (name, secs) in pt
-    @printf("  %-10s %8.4f s   %5.1f%%\n", name, secs, 100 * secs / acc)
+dev = sum(s for (i, (_, s)) in enumerate(pt) if kind[i] === :device)
+println("                                  share of  share of")
+println("  phase       where      time (s)     total    device")
+for (i, (name, secs)) in enumerate(pt)
+    devshare = kind[i] === :device ? @sprintf("%7.1f%%", 100 * secs / dev) : "       -"
+    @printf("  %-10s %-9s %8.4f  %7.1f%%  %s\n",
+            name, string(kind[i]), secs, 100 * secs / acc, devshare)
 end
-@printf("  %-10s %8.4f s   (instrumented; clean total was %.3f s)\n", "TOTAL", acc, best[2])
+@printf("  %-10s %-9s %8.4f  %7.1f%%\n", "= device", "", dev, 100 * dev / acc)
+@printf("  %-10s %-9s %8.4f  %7.1f%%\n", "= host+pcie", "", acc - dev, 100 * (acc - dev) / acc)
+@printf("  %-10s %-9s %8.4f   (instrumented; clean total was %.3f s)\n", "TOTAL", "", acc, best[2])
+println("  NOTE: `scan` is this HOST's CPU and `download` is PCIe -- neither is a")
+println("        property of the card.  Compare cards on the device column.")
 
 if docpu
     println("\nCPU arm (this host's CPU, NOT fitzroy's Xeon -- quote the host):")
@@ -116,5 +134,10 @@ println("PASTE THIS BLOCK BACK:")
         CUDA.name(dev), string(cap), sms, clk, l2 / 2^20, tot / 2^30)
 @printf("  %s | %d trials | best blocksize %d | %.3f s | %.1f ns/trial | %d cands\n",
         basename(fftfile), total, best[1], best[2], best[2] * 1e9 / total, length(cands))
-@printf("  phases: %s\n", join((@sprintf("%s %.1f%%", n, 100 * s / acc) for (n, s) in pt), "  "))
+@printf("  phases (of total):  %s\n",
+        join((@sprintf("%s %.1f%%", n, 100 * s / acc) for (n, s) in pt), "  "))
+@printf("  phases (of device): %s   [device %.1f%% of instrumented]\n",
+        join((@sprintf("%s %.1f%%", n, 100 * s / dev)
+              for (i, (n, s)) in enumerate(pt) if kind[i] === :device), "  "),
+        100 * dev / acc)
 println("="^78)

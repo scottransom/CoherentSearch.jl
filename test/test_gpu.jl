@@ -107,6 +107,57 @@ else
         @test maximum(abs.(b .- 2.5 .* a)) / maximum(abs, b) < 1e-6
     end
 
+    # ------------------------------------------------------------------
+    # Transform sub-batching (gpu_design.md 4.9).  Splitting a rung's batched
+    # transform into column blocks is a SCHEDULING change: every column's
+    # transform is independent, so the profiles must come back bit-identical,
+    # not merely within the 1e-5 pin the rest of this file uses.  Anything less
+    # than exact equality here means cuFFT changed algorithm with batch size,
+    # which is exactly what a per-device policy must not do silently.
+    #
+    # The explicit byte targets bypass the residency gate on purpose -- on a
+    # small-L2 card `:auto` correctly declines to split at all, so without the
+    # override this testset would pass by doing nothing.  Hence the assertion
+    # that a real split actually happened.
+    # ------------------------------------------------------------------
+    @testset "transform sub-batching is bit-exact, k=$k" for k in 1:4
+        E = Base.get_extension(CoherentSearch, :CoherentSearchCUDAExt)
+        for n in (1024, 999)                       # 999: a ragged final block
+            CS.gpu_subbatch!(:off)
+            ref = chunk_profiles(CS.require_gpu(), ft, params, r_lo, n; k = k)
+            for target in (1 << 16, 1 << 14)
+                CS.gpu_subbatch!(target)
+                gc = E.GPUChunk(Float32, params, n; subbatch = target)
+                @test any(>(1), gc.nblocks)        # a split really happened
+                @test sum(gc.sub[i] * (gc.nblocks[i] - 1) + gc.tail[i]
+                          for i in eachindex(gc.ks)) == n * length(gc.ks)
+                @test chunk_profiles(CS.require_gpu(), ft, params, r_lo, n; k = k) == ref
+            end
+            CS.gpu_subbatch!(:auto)
+        end
+    end
+
+    # The policy itself, with no device involved: it must decline to split on a
+    # small-L2 card (measured 1.00x on the 4 MB RTX 2080 Super, so splitting
+    # there could only cost launches) and must reproduce the per-rung optima
+    # measured on the 40 MB Ada.
+    @testset "sub-batch policy is per-device" begin
+        E = Base.get_extension(CoherentSearch, :CoherentSearchCUDAExt)
+        cols(l2) = [E._sub_cols(Float32, fld(60, k), 262144, l2 ÷ 2) for k in 1:6]
+        @test all(==(262144), cols(2 * 2^20))      # GTX 1080: off
+        @test all(==(262144), cols(4 * 2^20))      # RTX 2080 Super: off
+        ada = cols(40 * 2^20)
+        @test all(<(262144), ada)                  # RTX 4000 Ada: on at every rung
+        @test issorted(ada)                        # deep folds want SMALLER batches
+        # Within 1.35x of gpu_design.md 0.3's independently measured optima.
+        for (d, m) in zip(ada, (16384, 32768, 65536, 65536, 131072, 131072))
+            @test 1/1.35 < d / m < 1.35
+        end
+        # An explicit target bypasses the guards; :off is always one batch.
+        @test E._sub_cols(Float32, 60, 262144, 1 << 20; policy = false) == 1083
+        @test E._sub_cols(Float32, 60, 262144, 0) == 262144
+    end
+
     @testset "backend registry" begin
         @test CoherentSearch.has_gpu()
         @test CoherentSearch.require_gpu() === CoherentSearch.gpu_backend()

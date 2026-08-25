@@ -1397,6 +1397,126 @@ and the 2080 Super's cache (4 MB) with 448 GB/s:
 5. **Sub-batching worth 1.00x**, as on the 2080 Super.
 
 
+### 4.9 Per-rung transform sub-batching — implemented 2026-08-25, and the Ada is the test
+
+§0.3 proposed this and §4.8 quantified it; it is now in `ext/CoherentSearchCUDAExt.jl`
+(`transform!`, `_sub_cols`, `GPUChunk`'s `sub`/`tail`/`nblocks`). **The Ada has
+not been re-run yet — the 1.25x below is still a prediction, and this section
+exists so that run scores it rather than explains it.**
+
+**What it does.** Each rung's inverse transform runs in contiguous column
+sub-batches sized to its own L2 footprint, instead of one batch over the whole
+chunk. cuFFT accepts a contiguous column range of a column-major array — that is
+dense memory, not the *strided* view that §4.2 found it refuses — so this needs
+no copy, no extra buffer and no kernel. Two plan sizes per rung at most (the
+blocks are balanced, so the tail is within one block of `sub`).
+
+**Why it is worth doing at all** is §4.8's decomposition, not a kernel argument:
+with one batch per rung the transform and everything else fight over
+`--blocksize`, and on the Ada the transform wins — dragging the chunk to 16384,
+where the interpolator, transpose, boxcar and scan together pay **1.42x** what
+they pay at 262144. Sub-batching lets each side have what it wants.
+
+#### The policy is derived from L2, and it reproduces §0.3's measured optima
+
+`_sub_cols` targets `_SUB_L2_FRACTION = 0.5` of the device's L2 per rung, from
+each rung's own bytes per column (`8(H_k+1) + 8H_k` in `Float32` — 968 B at
+`k=1`, 168 B at `k=6`, which are §0.3's own figures). Derived against measured,
+at `Nprof = 262144`:
+
+| | k=1 | k=2 | k=3 | k=4 | k=5 | k=6 |
+|---|---|---|---|---|---|---|
+| derived, 40 MB L2 | 21664 | 42974 | 63937 | 84562 | 104857 | 124830 |
+| §0.3 measured optimum | 16384 | 32768 | 65536 | 65536 | 131072 | 131072 |
+
+**Monotone in the same direction and within ~1.3x at every rung, from a formula
+fitted to none of them.** That is why the constant is a fraction of L2 rather
+than a table: the same expression that reproduces the Ada also turns itself off
+on the other two cards, with no device list to maintain.
+
+**Two guards, and they are what make `:auto` safe to ship.** A rung is split only
+if `_SUB_MIN_COLS = 16384` of its columns fit in the target (the residency gate),
+and never into blocks below that floor. §0.3 is the source of both: at
+`Nprof = 16384` the `k = 4,5,6` rungs sat at 85–93% of the DRAM copy on working
+sets of 2.6–3.9 MB, which cannot be cache and must be too little work for 48 SMs.
+The gate means **a 2 MB or 4 MB card declines to split at all** — measured: the
+policy returns `Nprof` at every rung for both the GTX 1080 and the RTX 2080
+Super, and splits at every rung on the Ada. §0.4 asked for a per-device policy;
+this is one, and it derives itself.
+
+**An explicit byte target (`gpu_subbatch!(n)`) bypasses both guards**, on
+purpose. Without that, a bench could not sweep past the knee and a small-L2 card
+could not exercise the split in a test — the testset would pass by doing nothing.
+`:auto` and `:off` are the only two things a search ever uses.
+
+#### Correctness: bit-exact, which is stronger than the rest of the GPU pins
+
+Every column's transform is independent, so splitting the batch is a scheduling
+change and must not move a single bit. It does not: **`chunk_profiles` is exactly
+equal** (`==`, not a tolerance) between split and unsplit at `k = 1…4`, at
+`n = 1024` and a deliberately ragged `n = 999`, at two targets each.
+`test/test_gpu.jl` is **226 tests**, up from 166 — the new ones pin the bit-exactness,
+that a split really happened, that the blocks tile the chunk exactly, and the
+policy's per-device behaviour including the two guards. CPU suite 747/747.
+
+Whole-search A/B on PM0063, GTX 1080, forced split vs unsplit at blocksize
+262144: **7 candidates either way and identical to the last bit of S/N.** The
+only differences anywhere in this work came from changing *blocksize* (a ragged
+50001), and they are two candidates whose `r` differs in the last bits of a
+`Float64` with identical S/N and `nharm` — the chunk-origin accumulation order,
+pre-existing and unrelated.
+
+#### Measured so far: the GTX 1080 control behaved as predicted
+
+`bench/gpu_subbatch_bench.jl`. `:auto` declines to split, as designed, so the
+shipped path is unchanged there. Forcing a split anyway, interleaved, 7 reps:
+
+| blocksize 262144 | min | median |
+|---|---|---|
+| `:off` (unsplit) | 1.147 s | 1.170 s |
+| forced, 2 MB target | 1.120 s | 1.136 s |
+| forced, 1 MB target | 1.134 s | 1.169 s |
+
+i.e. **1.02–1.03x at best, against 7–49% run-to-run scatter on a machine that is
+also Scott's desktop.** Not resolvable, and consistent with the predicted 1.00x.
+**A single-shot sweep first read 1.035x and a clean-looking minimum**; the
+interleaved repeat cut it to ~1.02x. That is this file's standing rule about
+absolute wall clocks landing again — the target *sweep* shape (204 / 145 / 134 /
+131 / 138 ns/trial over 0.125–2.0x L2) is real and useful, the difference between
+its floor and the unsplit arm is not.
+
+The useful negative result: **a forced split is not HARMFUL on a small-L2 card**,
+merely useless. So the gate is protecting against nothing measurable, and if the
+Ada result argues for widening it, that can be done without fear.
+
+#### Pre-registered, for the RTX 4000 SFF Ada
+
+Recorded before the run. `bench/gpu_subbatch_bench.jl` on `NGC6624`, so it is
+directly comparable to §4.8's 40.7 ns/trial:
+
+1. **`:auto` splits at every rung** into the columns tabulated above. If it
+   declines, `_sub_target_bytes` is reading L2 wrongly.
+2. **Blocksize 262144 with `:auto` beats blocksize 16384 with `:off`** — this is
+   the whole point, and the direction is the claim. §4.8's decomposition puts it
+   at **~32.7 ns/trial, 1.25x**; anything from 1.10x up confirms the mechanism.
+3. **Near 1.00x means the mechanism is contended away, and the item should be
+   dropped, not tuned.** §4.8 already showed the Ada's isolated 3.9x transform
+   win measuring 3.07x in the pipeline because cuFFT there shares its 40 MB with
+   the interpolator, the transpose and the boxcar. If residency cannot be
+   arranged in situ at all, that is the same finding one step further, and it is
+   a real answer rather than a failure.
+4. **The target sweep's minimum should sit near 0.5x L2.** If it is far off,
+   `_SUB_L2_FRACTION` is the constant to change — and note the 1080's own sweep
+   put its floor at **1.0x** L2, not 0.5x, so this is genuinely open.
+5. **The 2080 Super stays a 1.00x control**, since `:auto` will not split it.
+
+**The honest status of the 1.25x**: it is a model built by anchoring the
+standalone transform sweep's *shape* on the measured in-search transform and
+subtracting. §4.8 established that the probe's *magnitude* does not carry into
+the pipeline. So 1.25x is an upper bound to be tested, and 1.10x would still be
+the largest single GPU win found since stage 2.
+
+
 ---
 
 ## 5. Correctness — the fourth pin

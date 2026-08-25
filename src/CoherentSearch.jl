@@ -29,7 +29,8 @@ include("fourierinterp.jl")
 
 # --- Compute-backend TYPES (the methods come after `search.jl`; see below) ---
 export SearchBackend, CPUBackend, gpu_backend, has_gpu, require_gpu,
-       gpu_timing!, gpu_phase_reset!, gpu_phase_times, GPU_PHASE_NAMES
+       gpu_timing!, gpu_phase_reset!, gpu_phase_times, GPU_PHASE_NAMES,
+       GPU_PHASE_KIND, gpu_subbatch!, gpu_subbatch
 include("backendtypes.jl")
 
 # --- Search ---

@@ -13,7 +13,7 @@ module CoherentSearchCUDAExt
 
 using CoherentSearch, CUDA
 using CoherentSearch: SearchBackend, SearchParams, FFTFile, DirectPlan, Candidate,
-                      _GPU_PHASE_NS, _GPU_TIMING,
+                      _GPU_PHASE_NS, _GPU_TIMING, _GPU_SUBBATCH,
                       build_direct_plans, DIRECT_GROUP_V, ladder_boxcar_widths,
                       _analytic_sigma, _render_progress
 using LinearAlgebra: mul!
@@ -333,6 +333,79 @@ end
 # one more verdict that does not travel between the two.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Per-rung transform SUB-BATCHING -- the one place the six rungs are allowed to
+# disagree about the chunk size.
+#
+# The rungs read the same `ftprofs`, but they want very different batch widths.
+# A rung-`k` column is `(Hk+1)` complex in and `2Hk` real out, so the deep fold
+# carries 968 B per trial and the shallowest 168 B: the deep fold fills L2 with
+# few columns and the shallow ones need many before there is enough parallelism
+# to fill the SMs.  `gpu_design.md` §0.3 measured the per-rung optima spread
+# across the whole `Nprof` sweep on a 40 MB-L2 card, worth 1.40x on the stage.
+#
+# Nothing forces one batch, though: each rung is a batched transform over
+# COLUMNS of a column-major array, so a contiguous column range is contiguous
+# memory and can be transformed on its own.  That **decouples the two competing
+# pressures on `--blocksize`** -- the interpolator, the transpose and the boxcar
+# all want the largest chunk available (§4.8 measured 1.24x and 1.42x from 16384
+# to 262144 on two cards, with the transform subtracted out), while the
+# transforms want L2-sized batches.
+#
+# **The policy is per-device and derived, not hardcoded**, because §0.4 measured
+# sub-batching at 1.40x on the 40 MB Ada and exactly 1.00x on the 4 MB RTX 2080
+# Super: with no residency to arrange there is nothing to gain, and splitting the
+# batch would only add launches.  So a rung is sub-batched only when the split
+# actually achieves residency -- when `_SUB_MIN_COLS` columns of it fit in the
+# target -- which turns itself off on a small-L2 card without a device list.
+#
+# **The formula reproduces §0.3's measured per-rung optima**, which is why it is
+# a fraction of L2 rather than a table.  At `_SUB_L2_FRACTION = 0.5` on the Ada
+# it derives 20661 / 40983 / 60975 / 80645 / 100000 / 119047 columns for
+# `k = 1…6` against the measured 16384 / 32768 / 65536 / 65536 / 131072 / 131072
+# -- monotone in the same direction and within ~1.3x at every rung, from a
+# formula fitted to none of them.
+#
+# `_SUB_MIN_COLS` is the parallelism floor, and it is §0.3's other reading: at
+# `Nprof = 16384` the `k = 4,5,6` rungs sat at 85-93% of the DRAM copy despite
+# working sets of only 2.6-3.9 MB, which cannot be a cache effect -- 16384
+# batches of a 20-bin transform is simply too little work for 48 SMs.
+# ---------------------------------------------------------------------------
+
+const _SUB_L2_FRACTION = 0.5      # of device L2; see above
+const _SUB_MIN_COLS    = 16384    # parallelism floor, and the residency gate
+
+"""Bytes of L2 to aim a single rung's transform working set at."""
+_sub_target_bytes() =
+    floor(Int, _SUB_L2_FRACTION *
+          CUDA.attribute(CUDA.device(), CUDA.DEVICE_ATTRIBUTE_L2_CACHE_SIZE))
+
+"""
+    _sub_cols(WT, Hk, Nprof, target; policy = true) -> Int
+
+Columns per transform sub-batch for a rung summing `Hk` harmonics, or `Nprof`
+(i.e. do not sub-batch) when the split would not achieve L2 residency anyway.
+
+`policy = true` is the `:auto` path and applies both guards -- the residency
+gate and the `_SUB_MIN_COLS` parallelism floor.  An explicit byte target
+(`gpu_subbatch!(n)`) sets `policy = false` and means exactly what it says, with
+no guards: that is what lets a bench sweep past the knee in both directions and
+a small-L2 card exercise the split in a test, neither of which the shipped
+default should ever do on its own.
+"""
+function _sub_cols(::Type{WT}, Hk::Integer, Nprof::Integer, target::Integer;
+                   policy::Bool = true) where {WT}
+    bytes = sizeof(Complex{WT}) * (Hk + 1) + sizeof(WT) * 2Hk
+    target <= 0 && return Int(Nprof)
+    if policy
+        # The gate: if even the parallelism floor does not fit, there is no
+        # residency to arrange and sub-batching can only cost launches.
+        bytes * _SUB_MIN_COLS > target && return Int(Nprof)
+        return min(Int(Nprof), max(_SUB_MIN_COLS, fld(target, bytes)))
+    end
+    return clamp(fld(target, bytes), 1, Int(Nprof))
+end
+
 """
     GPUChunk{WT}
 
@@ -340,6 +413,11 @@ Device-side scratch for one chunk: the harmonic stack, one dense decimated stack
 per rung `k > 1`, the real profiles per rung, and their cuFFT plans.  Built once
 per `(params, Nprof)` and reused across chunks and files, exactly as the CPU's
 `SearchCache` reuses `Workspace`s.
+
+Each rung's transform is run in column sub-batches of `sub[i]` (`nblocks[i]`
+of them, the last of `tail[i]` columns) -- see the note above.  On a small-L2
+card `sub[i] == Nprof` and `nblocks[i] == 1`, which is exactly the single
+un-split `mul!` this had before.
 """
 struct GPUChunk{WT,P}
     Nprof::Int
@@ -348,20 +426,31 @@ struct GPUChunk{WT,P}
     ftprofs::CuMatrix{Complex{WT}}        # (Nprof, nharms+1), what the interpolator writes
     cpulayout::Vector{CuMatrix{Complex{WT}}} # per rung: (Hk+1, Nprof), DENSE, what cuFFT reads
     profs::Vector{CuMatrix{WT}}           # per rung: (2Hk, Nprof)
-    plans::Vector{P}
+    plans::Vector{P}                      # per rung, for a full `sub[i]`-column batch
+    tailplans::Vector{P}                  # per rung, for the last (short) batch
+    sub::Vector{Int}                      # columns per transform sub-batch
+    tail::Vector{Int}                     # columns in the last sub-batch
+    nblocks::Vector{Int}                  # 1 == not sub-batched
     widths::Vector{CuVector{Int32}}       # per rung, the ladder-pruned boxcar bank
     hwidths::Vector{Vector{Int}}          # host copies
 end
 
-function GPUChunk(::Type{WT}, params::SearchParams, Nprof::Integer) where {WT}
+function GPUChunk(::Type{WT}, params::SearchParams, Nprof::Integer;
+                  subbatch = :auto) where {WT}
     nh = params.nharms
     ks = sort!(unique(params.decimations))
     ks[1] == 1 || throw(ArgumentError("decimations must include 1"))
     Hk = [fld(nh, k) for k in ks]
+    # `:auto` derives the target from this device's L2; `:off` disables
+    # sub-batching outright; an Integer is a target in bytes, which is what the
+    # bench sweeps and what lets a small-L2 card exercise the split in a test.
+    auto = subbatch === :auto
+    target = auto ? _sub_target_bytes() : subbatch === :off ? 0 : Int(subbatch)
     ftprofs = CUDA.zeros(Complex{WT}, Nprof, nh + 1)
     cpulayout = CuMatrix{Complex{WT}}[]
     profs = CuMatrix{WT}[]
-    plans = []
+    plans = []; tailplans = []
+    subs = Int[]; tails = Int[]; nblocks = Int[]
     hwidths = Vector{Int}[]
     widths = CuVector{Int32}[]
     for (i, k) in enumerate(ks)
@@ -369,14 +458,67 @@ function GPUChunk(::Type{WT}, params::SearchParams, Nprof::Integer) where {WT}
         push!(cpulayout, src)
         dst = CUDA.zeros(WT, 2Hk[i], Nprof)
         push!(profs, dst)
-        push!(plans, plan_brfft(src, 2Hk[i], 1))     # dim 1: 1.75-1.88x faster
+        # Balance the blocks rather than leaving a ragged remainder: `nb` blocks
+        # of `sub`, the last one absorbing what is left.  `tail` is in
+        # `[1, sub]`, so at most two plan sizes per rung.
+        sub0 = _sub_cols(WT, Hk[i], Nprof, target; policy = auto)
+        nb = max(1, cld(Int(Nprof), sub0))
+        sub = cld(Int(Nprof), nb)
+        tail = Int(Nprof) - (nb - 1) * sub
+        push!(subs, sub); push!(tails, tail); push!(nblocks, nb)
+        # dim 1: 1.75-1.88x faster than the transposed layout (see above).
+        p = plan_brfft(nb == 1 ? src : view(src, :, 1:sub), 2Hk[i], 1)
+        push!(plans, p)
+        push!(tailplans, (nb == 1 || tail == sub) ? p :
+                         plan_brfft(view(src, :, 1:tail), 2Hk[i], 1))
         w = ladder_boxcar_widths(2Hk[i], k, params)
         push!(hwidths, w)
         push!(widths, CuArray(Int32.(w)))
     end
-    pl = [p for p in plans]
+    pl = [p for p in plans]; tpl = eltype(pl)[p for p in tailplans]
     return GPUChunk{WT,eltype(pl)}(Int(Nprof), ks, Hk, ftprofs, cpulayout, profs,
-                                   pl, widths, hwidths)
+                                   pl, tpl, subs, tails, nblocks, widths, hwidths)
+end
+
+"""
+    transform!(gc, i)
+
+The rung-`i` inverse transform, in `gc.nblocks[i]` column sub-batches.  Each
+`view` is a contiguous column range of a column-major array, so it is dense
+memory and cuFFT accepts it -- unlike the STRIDED view of the CPU's decimation
+trick, which is what `Illegal conversion of a DeviceMemory to a Ptr` refers to
+above.  Every column's transform is independent of the others, so splitting the
+batch is a scheduling change and not a numerical one.
+"""
+@inline function transform!(gc::GPUChunk, i::Integer)
+    nb = gc.nblocks[i]
+    if nb == 1
+        mul!(gc.profs[i], gc.plans[i], gc.cpulayout[i])
+        return nothing
+    end
+    sub = gc.sub[i]; src = gc.cpulayout[i]; dst = gc.profs[i]
+    @inbounds for b in 1:nb
+        j0 = (b - 1) * sub + 1
+        j1 = b == nb ? gc.Nprof : b * sub
+        p = b == nb ? gc.tailplans[i] : gc.plans[i]
+        mul!(view(dst, :, j0:j1), p, view(src, :, j0:j1))
+    end
+    return nothing
+end
+
+"""Human-readable sub-batch policy, for the bench scripts."""
+function subbatch_report(gc::GPUChunk)
+    io = IOBuffer()
+    any(>(1), gc.nblocks) || return "transform sub-batching: off (no rung achieves L2 residency)"
+    println(io, "transform sub-batching (Nprof = $(gc.Nprof)):")
+    for i in eachindex(gc.ks)
+        bytes = (sizeof(eltype(gc.cpulayout[i])) * (gc.Hk[i] + 1) +
+                 sizeof(eltype(gc.profs[i])) * 2gc.Hk[i])
+        println(io, "  k=$(gc.ks[i]) H=$(gc.Hk[i]): $(gc.nblocks[i]) x $(gc.sub[i])" *
+                    (gc.tail[i] == gc.sub[i] ? "" : " (+ tail $(gc.tail[i]))") *
+                    "  working set $(round(bytes * gc.sub[i] / 2^20, digits = 1)) MB")
+    end
+    return String(take!(io))
 end
 
 # ---------------------------------------------------------------------------
@@ -586,7 +728,7 @@ function chunk_profiles(::CUDABackend, ft::FFTFile, params::SearchParams,
     i = findfirst(==(k), gc.ks)
     i === nothing && throw(ArgumentError("k=$k not in decimations $(gc.ks)"))
     fill_stacks!(gc, n)
-    mul!(gc.profs[i], gc.plans[i], gc.cpulayout[i])
+    transform!(gc, i)
     return Array(gc.profs[i])[:, 1:n]               # already (nbins, n)
 end
 
@@ -602,7 +744,7 @@ function chunk_boxcar(::CUDABackend, ft::FFTFile, params::SearchParams,
     i = findfirst(==(k), gc.ks)
     i === nothing && throw(ArgumentError("k=$k not in decimations $(gc.ks)"))
     fill_stacks!(gc, n)
-    mul!(gc.profs[i], gc.plans[i], gc.cpulayout[i])
+    transform!(gc, i)
     out = CUDA.zeros(Float32, n)
     gpu_boxcar!(out, gc.profs[i], n, 2gc.Hk[i], gc.widths[i],
                 gc.hwidths[i][end], invsigma)
@@ -781,7 +923,7 @@ function _region!(::CUDABackend, ft::FFTFile, params::SearchParams,
 
     WT = eltype(dplans[1].W)
     _check_device_memory(ft, params, Nprof, WT)
-    gc = GPUChunk(WT, params, Nprof)
+    gc = GPUChunk(WT, params, Nprof; subbatch = _GPU_SUBBATCH[])
     gp = GPUInterpPlan(dplans)
     d_amps = CuArray(ft.amps)
     # One column per rung, so the whole chunk's metrics come back in ONE D2H
@@ -807,7 +949,7 @@ function _region!(::CUDABackend, ft::FFTFile, params::SearchParams,
         _gpt(() -> fill_stacks!(gc, n), 3)
         _gpt(4) do
             for i in eachindex(gc.ks)
-                mul!(gc.profs[i], gc.plans[i], gc.cpulayout[i])
+                transform!(gc, i)
             end
         end
         _gpt(5) do
