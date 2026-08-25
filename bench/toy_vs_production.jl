@@ -34,13 +34,14 @@
 #      `--prodsigma` sets which estimator the production arm uses (default
 #      `measured`, so the comparison keeps its meaning).
 #
-# Note the toy is ~190x slower, so pick a NARROW band: the defaults search
-# 0.1-0.4 Hz — 75k trial fundamentals, which is ~18 s for the toy and ~0.1 s for
-# production.
+# Note the toy runs roughly 100-200x slower (machine- and band-dependent), so
+# pick a NARROW band: the defaults search 0.1-0.4 Hz — 75k trial fundamentals,
+# which is ~18 s for the toy and ~0.1 s for production.
 #
 # Measured 2026-08-24, i7-10510U, `-t 1`, PM0063 0.1-0.4 Hz, `--nband 4`:
 #   * timing: toy 18.34 s (243 us/trial) vs production 0.096 s (1.27 us/trial),
-#     i.e. **190.8x**.
+#     i.e. **190.8x** — a second run of the same command gave 177.1x, which is
+#     the scatter to read this against.
 #   * candidates: the 0.2603 Hz candidate at 7.37 (toy) vs 7.32 (production),
 #     a ratio of 1.0059 — the interpolation-truncation bias, and nothing else.
 #   * sigma: analytic/exact has median 1.00436 and spans 0.9918-1.0217 (3.02%),

@@ -70,8 +70,10 @@ repeatedly — now with a known mechanism (see the AVX-512 entry below).
   removed**, written to be read: brute-force per-point interpolation, one
   `irfft` per fold, the boxcar filter straight from its definition, plain nested
   loops. It is what the paper's pseudo-code figure describes, and its functions
-  carry that figure's line numbers. ~190x slower than production (243 vs
-  1.27 µs per trial fundamental), so give it a narrow band. It reuses the
+  carry that figure's line numbers. Roughly **100–200x** slower than production
+  and machine-dependent — two runs of the same command on the laptop gave 190.8x
+  and 177.1x (~243 vs ~1.27 µs per trial fundamental) — so quote it as a range
+  and give it a narrow band. It reuses the
   production candidate collapsing and output verbatim, and differs deliberately
   in two ways: the full geometric width bank rather than the ladder-pruned one,
   and it was where the analytic σ was worked out and validated first.

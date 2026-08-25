@@ -15,11 +15,14 @@
 # single-threaded nested loops.  It is the code the paper's pseudo-code figure
 # describes, line for line.
 #
-# It is ~190x slower than the production search (measured 2026-08-24, i7-10510U,
-# `-t 1`, PM0063 over 0.1-0.4 Hz: 243 us per trial fundamental against 1.27) and
-# is not meant for real work.  What it *is* meant for: reading, and being the
-# independent implementation the production path can be checked against
-# (`test/test_toy.jl`, `bench/toy_vs_production.jl`).
+# Expect it to run roughly 100-200x slower than the production search, and treat
+# that as a range rather than a number: it depends on the machine, on the band,
+# and on how much of the profile the boxcar bank covers.  Two runs on the same
+# host and band gave 190.8x and 177.1x (2026-08-24, i7-10510U, `-t 1`, PM0063
+# over 0.1-0.4 Hz: ~243 us per trial fundamental against ~1.27).  It is not meant
+# for real work.  What it *is* meant for: reading, and being the independent
+# implementation the production path can be checked against (`test/test_toy.jl`,
+# `bench/toy_vs_production.jl`).
 #
 # THE ALGORITHM, as the pseudo-code figure states it.  `F` is the (normalised,
 # barycentred) Fourier amplitude array of the observation, `T` its duration.
@@ -403,7 +406,8 @@ Usage: julia --project=. bin/toy_coherent_search.jl FILE.fft [options]
 
   A deliberately simple, single-threaded reference implementation of the
   coherent harmonic-summing search.  Candidates are written to stdout.
-  20-50x slower than bin/coherent_search.jl; use a narrow band.
+  Roughly 100-200x slower than bin/coherent_search.jl, depending on the
+  machine and the band -- use a narrow one.
 
 Options (defaults match bin/coherent_search.jl):
   --threshold X   S/N cutoff for reporting candidates          [8.0]
