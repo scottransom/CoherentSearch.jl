@@ -84,6 +84,16 @@ frequency — past the 716 Hz of the fastest known pulsar, with headroom — fol
 120 profile bins at the low end down to 20 at the high end. Plotting is off;
 pass `--plot` for it.
 
+The profile stage runs in `Float32` by default (`--precision f32`): the
+interpolated harmonic amplitudes, the batched inverse FFT and the folded
+profiles the metric reads. Everything reported — candidate frequencies, the S/N
+metric, the normalisation — stays `Float64`. This is worth ~1.2× at every thread
+count on both development machines and costs ~1e-7 in the profiles, five orders
+of magnitude under the ~1.3% of signal power the `m = 16` interpolation
+truncation already discards. Pass `--precision f64` to reproduce a run made
+before 2026-08-24, or when a candidate's S/N must be bit-comparable with the
+reference path.
+
 Or from Julia — the same search the CLI runs by default, spelled out. The
 library primitives keep their own minimal defaults (`SearchParams()` is
 `nharms = 32`, no decimation); the survey policy above lives in the CLI, so
@@ -443,13 +453,26 @@ interpolation kernels, an allocation-free hot loop, a batched inverse FFT, and
 exact per-trial Fourier interpolation.
 
 The detection metric is the **peak boxcar matched filter**: each profile is
-correlated with a geometric bank of top-hat widths and scored
-`max_{w,phase} (boxcar sum over the median-subtracted profile) / (σ̂ √w)`, with
-one robust per-bin `σ̂` per block. Because the widths are fixed a priori, every
-(phase, width) trial is `N(0,1)` under noise, so the pure-noise distribution is
-analytic and — unlike the older on-pulse sums — flat across harmonic
-decimations: one `--threshold` means one false-alarm rate at every `k`. It is a
-port of the Python `snr_metric`, oracle-pinned to machine precision.
+correlated with a geometric bank of top-hat widths, each made *zero-mean and
+unit-L2*, and scored
+
+```
+max_{w,phase} (S_w − δ·S_tot) / (σ̂ · sqrt(w·(1−δ))),      δ = w / nbins
+```
+
+with one robust per-bin `σ̂` per block. Because the widths are fixed a priori,
+every (phase, width) trial is `N(0,1)` under noise, so the pure-noise
+distribution is analytic and — unlike the older on-pulse sums — flat across
+harmonic decimations: one `--threshold` means one false-alarm rate at every `k`.
+
+This is **exactly riptide's `snr1`** (`cpp/snr.hpp`), verified against the
+`rseek` binary itself to 1.4e-7 on real folds, which is riptide's own `Float32`
+accumulation; the two codes' S/N columns are therefore the same quantity. It is
+also a port of the Python `snr_metric` and is oracle-pinned to machine
+precision (1.4e-16). It replaced an earlier form that subtracted each profile's
+*median* and divided by `σ̂√w`: that normalisation drifted with source
+brightness, so it had no calculable false-alarm rate, and at matched FAP the
+zero-mean template detects strictly better at every duty cycle.
 
 > The earlier width-penalised on-pulse metrics (`--metric non` = `N_on^p`,
 > `--metric sd2` = `Σd²^p`) were retired here and upstream. On real data `non`
