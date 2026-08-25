@@ -84,3 +84,44 @@ end
 # explanation rather than a `MethodError` when no GPU backend is loaded.
 # ---------------------------------------------------------------------------
 
+
+
+# ---------------------------------------------------------------------------
+# GPU phase timers.
+#
+# The CPU's `phase_times` costs one `time_ns` pair per phase per chunk (~0.03% of
+# runtime) and is always on.  The GPU equivalent cannot be: a wall-clock timer
+# around a CUDA launch measures the launch, not the work, so timing a phase means
+# `CUDA.synchronize()` around it -- which SERIALISES the queue and slightly
+# changes what it is measuring.  So this is opt-in, and a run with it on is
+# a diagnostic, not a benchmark: read the SHARES, and take the total from a run
+# with timing off.
+# ---------------------------------------------------------------------------
+
+"""GPU pipeline phases, in the order `_region!` runs them."""
+const GPU_PHASE_NAMES = ("zero", "interp", "transpose", "transform",
+                         "boxcar", "download", "scan")
+
+const _GPU_PHASE_NS = zeros(Int64, length(GPU_PHASE_NAMES))
+const _GPU_TIMING = Ref(false)
+
+"""
+    gpu_timing!(on::Bool)
+
+Turn GPU phase timing on or off.  Off by default; see the note above on why it
+is not free.
+"""
+gpu_timing!(on::Bool) = (_GPU_TIMING[] = on)
+gpu_timing() = _GPU_TIMING[]
+
+"""    gpu_phase_reset!()  — zero the GPU phase accumulators."""
+gpu_phase_reset!() = (fill!(_GPU_PHASE_NS, 0); nothing)
+
+"""
+    gpu_phase_times() -> Vector{Pair{String,Float64}}
+
+Accumulated seconds per GPU phase since the last [`gpu_phase_reset!`](@ref).
+Empty numbers unless [`gpu_timing!`](@ref)`(true)` was set.
+"""
+gpu_phase_times() = [GPU_PHASE_NAMES[i] => _GPU_PHASE_NS[i] / 1e9
+                     for i in eachindex(GPU_PHASE_NAMES)]

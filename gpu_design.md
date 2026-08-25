@@ -1132,6 +1132,50 @@ a multi-file run rather than rebuilt and freed per call. Only the amplitude
 upload is genuinely per-file, and §7.2's prefetch would overlap that with the
 previous file's search.
 
+### 4.7 Classifying a new card in one command
+
+```sh
+git pull
+./bench/gpu_probe_setup.sh bench/gpu_search_report.jl     # first time on a host
+# then, directly:
+julia --project=$PREFIX/env bench/gpu_search_report.jl FILE.fft [--cpu] [--band lo hi]
+```
+
+Prints device identity, a `--blocksize` sweep, per-phase GPU timings, the
+candidates, and a pasteable summary block.
+
+**Two things about the numbers, both built into the output.**
+
+- **Per-phase timing serialises the GPU queue.** A wall-clock timer around a CUDA
+  launch measures the launch, not the work, so each phase needs a
+  `CUDA.synchronize()` around it — which changes what is being measured. So
+  `gpu_timing!` is **opt-in**, off in normal runs, and the report gives a clean
+  total from a pass with it *off* and the shares from a separate pass with it
+  *on*. On the GTX 1080 the instrumented total reads 0.736 s against a clean
+  0.896 s, so the inflation is ~20%: **read the shares, take the total from the
+  sweep.** This is the GPU form of the rule the CPU's `phase_times` already
+  follows, but stricter, because there the timers are ~0.03% and always on.
+- **The `--cpu` arm is optional and off by default.** A CPU run on an unfamiliar
+  host is not comparable to fitzroy's Xeon — three hosts have already differed by
+  up to 2.4x per core (§0.45) — so it is there for a same-host ratio only, and the
+  host must be quoted with it.
+
+**Reference output, GTX 1080, PM0063:**
+
+```
+  best blocksize 131072 | 0.896 s | 107.1 ns/trial | 7 cands
+  phases: zero 2.5%  interp 15.4%  transpose 12.9%  transform 38.5%
+          boxcar 16.5%  download 6.5%  scan 7.6%
+```
+
+**What to look for on a new card.** The transform is 38.5% here and is the phase
+the two other cards should change most — §0.3 measured the Ada doing that stage
+2.8x faster than the 1080 on its 40 MB L2 and the 2080 Super 2.75x on bandwidth,
+which would drop it to ~18% and make the *boxcar* the largest phase. The
+blocksize row is the other one to watch: the 1080 wants the largest chunk and the
+Ada should want a much smaller one, and this report finds each card's own answer
+rather than assuming.
+
 ---
 
 ## 5. Correctness — the fourth pin

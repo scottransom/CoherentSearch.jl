@@ -13,6 +13,7 @@ module CoherentSearchCUDAExt
 
 using CoherentSearch, CUDA
 using CoherentSearch: SearchBackend, SearchParams, FFTFile, DirectPlan, Candidate,
+                      _GPU_PHASE_NS, _GPU_TIMING,
                       build_direct_plans, DIRECT_GROUP_V, ladder_boxcar_widths,
                       _analytic_sigma, _render_progress
 using LinearAlgebra: mul!
@@ -754,6 +755,18 @@ end
 # magnitude inside the 0.01 gate margin, so it cannot move which trials become
 # candidates, only the seventh digit of their reported S/N.
 # ---------------------------------------------------------------------------
+# Time phase `i` if timing is on.  `CUDA.synchronize()` is what makes the number
+# meaningful and also what makes it not free -- see `gpu_timing!`.
+@inline function _gpt(f, i::Int)
+    if _GPU_TIMING[]
+        CUDA.synchronize(); t = time_ns()
+        r = f()
+        CUDA.synchronize(); @inbounds _GPU_PHASE_NS[i] += time_ns() - t
+        return r
+    end
+    return f()
+end
+
 function _region!(::CUDABackend, ft::FFTFile, params::SearchParams,
                   workspaces::Vector, nbins::Integer,
                   r_lo::Real, r_hi::Real, lodr::Real, total::Integer,
@@ -789,12 +802,15 @@ function _region!(::CUDABackend, ft::FFTFile, params::SearchParams,
         # Zeroed every chunk: the interpolator writes only the harmonics that
         # carry data, and a harmonic that gives up must leave a ZERO row -- which
         # is also what the DC row (never written) has to be.
-        fill!(gc.ftprofs, 0)
-        filled = gpu_fill_ftprofs!(gc.ftprofs, gp, d_amps, ft, i0, n)
-        fill_stacks!(gc, n)
-        for i in eachindex(gc.ks)
-            mul!(gc.profs[i], gc.plans[i], gc.cpulayout[i])
+        _gpt(() -> fill!(gc.ftprofs, 0), 1)
+        filled = _gpt(() -> gpu_fill_ftprofs!(gc.ftprofs, gp, d_amps, ft, i0, n), 2)
+        _gpt(() -> fill_stacks!(gc, n), 3)
+        _gpt(4) do
+            for i in eachindex(gc.ks)
+                mul!(gc.profs[i], gc.plans[i], gc.cpulayout[i])
+            end
         end
+        _gpt(5) do
         for i in eachindex(gc.ks)
             k = gc.ks[i]
             Hk = gc.Hk[i]
@@ -815,10 +831,12 @@ function _region!(::CUDABackend, ft::FFTFile, params::SearchParams,
             gpu_boxcar!(view(out, :, i), gc.profs[i], nvalid, 2Hk, gc.widths[i],
                         gc.hwidths[i][end], invsig)
         end
+        end
         # One copy for the whole chunk, after every rung has been queued.  The
         # offset form, not `copyto!(view(...), view(...))`: a SubArray of a
         # CuArray falls back to scalar indexing, which CUDA.jl refuses outright.
-        copyto!(hostm, 1, out, 1, Nprof * nk)
+        _gpt(() -> copyto!(hostm, 1, out, 1, Nprof * nk), 6)
+        tscan = time_ns()
         thr = Float32(threshold)
         @inbounds for i in 1:nk
             k = gc.ks[i]
@@ -829,6 +847,7 @@ function _region!(::CUDABackend, ft::FFTFile, params::SearchParams,
                 push!(cands, Candidate(rf / ft.T, Float64(hostm[j, i]), rf, Hk))
             end
         end
+        _GPU_TIMING[] && (@inbounds _GPU_PHASE_NS[7] += time_ns() - tscan)
         _render_progress(progress, c, nchunks)
     end
     if progress !== :none

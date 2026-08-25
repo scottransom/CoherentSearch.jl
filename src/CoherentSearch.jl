@@ -28,7 +28,8 @@ export finterp_coeffs, fourier_interp, fourier_interpolate, finterp_multi,
 include("fourierinterp.jl")
 
 # --- Compute-backend TYPES (the methods come after `search.jl`; see below) ---
-export SearchBackend, CPUBackend, gpu_backend, has_gpu, require_gpu
+export SearchBackend, CPUBackend, gpu_backend, has_gpu, require_gpu,
+       gpu_timing!, gpu_phase_reset!, gpu_phase_times, GPU_PHASE_NAMES
 include("backendtypes.jl")
 
 # --- Search ---

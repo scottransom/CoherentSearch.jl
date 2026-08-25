@@ -1,0 +1,120 @@
+# One-command GPU search report, for classifying a new card (`gpu_design.md`).
+#
+#   julia --project=<env with CoherentSearch + CUDA> bench/gpu_search_report.jl FILE.fft [--cpu] [--band lo hi]
+#
+# Prints device identity, a `--blocksize` sweep with per-phase GPU timings, the
+# candidates found, and a pasteable summary block.  Everything a new card needs,
+# in one output.
+#
+# `--cpu` adds a CPU arm for comparison.  It is OPTIONAL and off by default
+# because a CPU run on an unfamiliar host is not comparable to fitzroy's 20-core
+# Xeon anyway (three hosts have already differed by 2.4x per core), and it can
+# double the runtime.  When you do use it, quote the host.
+#
+# Two things to know about the numbers:
+#
+#  - **Per-phase timing SERIALISES the GPU queue** (a wall-clock timer around a
+#    CUDA launch measures the launch, not the work, so each phase needs a
+#    synchronise around it).  So the sweep reports both: a clean total with timing
+#    OFF, and the phase breakdown from a separate pass with it on.  Read the
+#    shares from the second and the total from the first.
+#  - **The best `--blocksize` is per-device and the two known cards want opposite
+#    ends** (GTX 1080: 262144; RTX 4000 Ada: 32768, because its 40 MB L2 holds the
+#    whole transform working set).  That is why this sweeps rather than assuming.
+
+using CoherentSearch, CUDA, Printf
+const CS = CoherentSearch
+
+args = copy(ARGS)
+docpu = "--cpu" in args; filter!(!=("--cpu"), args)
+lo, hi = 0.1, 33.3333
+if (i = findfirst(==("--band"), args)) !== nothing
+    lo = parse(Float64, args[i+1]); hi = parse(Float64, args[i+2])
+    deleteat!(args, i:i+2)
+end
+isempty(args) && error("usage: gpu_search_report.jl FILE.fft [--cpu] [--band lo hi]")
+fftfile = args[1]
+
+CUDA.functional() || error("no functional CUDA device")
+dev = CUDA.device()
+cap = CUDA.capability(dev)
+sms = CUDA.attribute(dev, CUDA.DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+clk = CUDA.attribute(dev, CUDA.DEVICE_ATTRIBUTE_CLOCK_RATE) / 1e6
+l2 = CUDA.attribute(dev, CUDA.DEVICE_ATTRIBUTE_L2_CACHE_SIZE)
+free, tot = CUDA.memory_info()
+
+ft = FFTFile(fftfile)
+params = SearchParams(nharms = 60, m = 16, decimations = collect(1:6))
+lodr = params.hidr / params.nharms
+total = max(0, floor(Int, (hi * ft.T - lo * ft.T) / lodr) + 1)
+
+println("="^78)
+@printf("device : %s  sm_%s  SMs=%d  clock=%.3f GHz  L2=%.1f MB  mem %.2f/%.2f GiB free\n",
+        CUDA.name(dev), string(cap), sms, clk, l2 / 2^20, free / 2^30, tot / 2^30)
+@printf("host   : %s   julia %s   %d thread(s)\n", gethostname(), VERSION, Threads.nthreads())
+@printf("file   : %s   N=%d  T=%.1f s  amps=%.2f GiB\n",
+        basename(fftfile), ft.N, ft.T, length(ft.amps) * 8 / 2^30)
+@printf("search : %.4f-%.4f Hz  nharms=%d maxdecim=%d  ->  %d trial fundamentals\n",
+        lo, hi, params.nharms, maximum(params.decimations), total)
+println("="^78)
+
+B = CS.require_gpu()
+go(bk, bs) = search(ft, params; lofreq = lo, hifreq = hi, blocksize = bs,
+                    threshold = 6.0, progress = :none, wisdom = false, backend = bk)
+
+# candidate sanity, once
+CS.gpu_timing!(false)
+cands = go(B, 65536)
+@printf("\ncandidates above S/N 6: %d\n", length(cands))
+for c in first(cands, min(5, length(cands)))
+    @printf("   %12.7f Hz   S/N %7.3f   nharm %3d\n", c.freq, c.metric, c.nharm)
+end
+
+println("\nblocksize sweep (timing OFF -- these are the honest totals):")
+println("  blocksize    wall (s)    ns/trial   cands")
+results = Tuple{Int,Float64}[]
+for bs in (16384, 32768, 65536, 131072, 262144)
+    # Three searches per row: one warm-up plus two timed.  The candidate count
+    # comes from the warm-up rather than a fourth call -- on a big file each
+    # search is seconds, and a redundant one per row is minutes over the sweep.
+    local t, nc
+    try
+        nc = length(go(B, bs))                        # warm, and gives the count
+        t = minimum(begin s = time_ns(); go(B, bs); (time_ns() - s) / 1e9 end for _ in 1:2)
+    catch e
+        @printf("  %9d    SKIPPED: %s\n", bs, first(split(sprint(showerror, e), "\n")))
+        continue
+    end
+    push!(results, (bs, t))
+    @printf("  %9d   %9.3f   %9.1f   %5d\n", bs, t, t * 1e9 / total, nc)
+end
+best = isempty(results) ? (65536, NaN) : results[argmin(last.(results))]
+@printf("  best: blocksize %d at %.3f s\n", best[1], best[2])
+
+println("\nper-phase breakdown at blocksize $(best[1]) (timing ON -- read the SHARES;")
+println("the synchronisation this needs inflates the total, so take that from above):")
+CS.gpu_timing!(true); CS.gpu_phase_reset!()
+go(B, best[1])
+CS.gpu_timing!(false)
+pt = CS.gpu_phase_times()
+acc = sum(last.(pt))
+for (name, secs) in pt
+    @printf("  %-10s %8.4f s   %5.1f%%\n", name, secs, 100 * secs / acc)
+end
+@printf("  %-10s %8.4f s   (instrumented; clean total was %.3f s)\n", "TOTAL", acc, best[2])
+
+if docpu
+    println("\nCPU arm (this host's CPU, NOT fitzroy's Xeon -- quote the host):")
+    go(CPUBackend(), 2048)
+    tc = minimum(begin s = time_ns(); go(CPUBackend(), 2048); (time_ns() - s) / 1e9 end for _ in 1:2)
+    @printf("  CPU -t %-2d  %8.3f s   ->  GPU is %.2fx\n", Threads.nthreads(), tc, tc / best[2])
+end
+
+println("\n" * "="^78)
+println("PASTE THIS BLOCK BACK:")
+@printf("  %s | sm_%s | %d SMs | %.2f GHz | L2 %.0f MB | %.1f GiB\n",
+        CUDA.name(dev), string(cap), sms, clk, l2 / 2^20, tot / 2^30)
+@printf("  %s | %d trials | best blocksize %d | %.3f s | %.1f ns/trial | %d cands\n",
+        basename(fftfile), total, best[1], best[2], best[2] * 1e9 / total, length(cands))
+@printf("  phases: %s\n", join((@sprintf("%s %.1f%%", n, 100 * s / acc) for (n, s) in pt), "  "))
+println("="^78)
