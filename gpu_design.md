@@ -477,6 +477,17 @@ With the Ada's interp column now measured:
 `*` metric is the one remaining projection; it is the phase stage 2 has not
 written.
 
+**SUPERSEDED 2026-08-25 — the metric column is now measured on all three cards
+and the bandwidth model behind it is WRONG. See §4.8.** In-search, scaled to this
+same reference workload: metric **0.1478 / 0.0655 / 0.0797 s**. The tie survives
+(measured totals 0.354 s and 0.341 s, the Ada 1.04x ahead against a predicted
+0.00x), but the *level* is 1.7-1.8x optimistic on every row, and the mechanism
+splits cleanly: ~26-38% of it is phases this table never had (transpose, zero,
+download, host scan), the rest is the Ada's isolated L2 transform win not
+surviving the pipeline. **The Ada's 0.079 metric figure is right for the wrong
+reason** — the bandwidth model predicted a 1.00x speedup over the 1080 while the
+baseline it scaled was itself 1.85x too low, and the two errors cancelled.
+
 **0.1998 s each, to four digits** — a coincidence, but a telling one. They get
 there completely differently: the Ada wins transforms (40 MB L2) *and* now
 interpolation, while the 2080 Super wins the metric on 1.8x the bandwidth. A 2019
@@ -1170,11 +1181,221 @@ candidates, and a pasteable summary block.
 
 **What to look for on a new card.** The transform is 38.5% here and is the phase
 the two other cards should change most — §0.3 measured the Ada doing that stage
-2.8x faster than the 1080 on its 40 MB L2 and the 2080 Super 2.75x on bandwidth,
-which would drop it to ~18% and make the *boxcar* the largest phase. The
-blocksize row is the other one to watch: the 1080 wants the largest chunk and the
-Ada should want a much smaller one, and this report finds each card's own answer
-rather than assuming.
+**3.9x** faster than the 1080 on its 40 MB L2 and the 2080 Super 2.75x on
+bandwidth, which would drop it to ~14-18% and make the *boxcar* the largest
+phase. The blocksize row is the other one to watch: the 1080 wants the largest
+chunk and the Ada should want a much smaller one, and this report finds each
+card's own answer rather than assuming.
+
+**Both of those were run on 2026-08-25 and the transform-share prediction was
+WRONG — it stayed the largest phase on both cards (31.0% and 33.0%). The
+blocksize prediction was right on both. See §4.8.** (The "2.8x" this paragraph
+originally quoted for the Ada was a misreading of §0.3's own table, which says
+0.275 -> 0.071 s = 3.9x; corrected above. It did not change the verdict — the
+prediction was wrong for a structural reason, not an arithmetic one.)
+
+### 4.8 Two more cards, end to end — and four pre-registered predictions scored
+
+`bench/gpu_search_report.jl` on **`NGC6624_16L_DM87.40_red.fft`** (1.29 GiB,
+T = 26459 s, **105,519,959 trial fundamentals**, 0.1-33.3 Hz, nharms 60,
+maxdecim 6), run 2026-08-25 by Scott on two hosts. This is §4.6's large file, so
+the GTX 1080's 9.53 s warm search is the same-file baseline.
+
+| | GTX 1080 | **RTX 2080 Super** | **RTX 4000 SFF Ada** |
+|---|---|---|---|
+| host | fitzroy | `spare2` | `hypatia` |
+| arch / SMs x cores | Pascal, 20 x 128 | Turing, **48 x 64** | Ada, **48 x 128** |
+| SMs x clock | 34.7 | 87.1 | 74.9 |
+| bandwidth achieved | 237 GB/s | **431** | 239 |
+| L2 | 2 MB | 4 MB | **40 MB** |
+| **best `--blocksize`** | 131072 | **262144** | **16384** |
+| clean total | 9.53 s (warm) | **4.459 s** | **4.292 s** |
+| ns per trial | 90 (warm) / 107.1 (report) | **42.3** | **40.7** |
+| candidates | 135 | **135** | **135** |
+
+**Correctness first: 135 candidates on both, and the printed top five agree with
+each other and with the CPU digit for digit** (0.1699323 Hz at 7.057, 0.2160158
+at 6.343, 0.2235954 at 7.806, 0.2360172 at 8.746, 0.2450950 at 6.289). That is
+**sm_61, sm_75 and sm_89 all agreeing with fitzroy's 20-core CPU** on a 105.5M
+trial blind search, and the candidate count is stable across a 16x span of
+`--blocksize` on both cards. §5's batch-invariance pin is doing its job on three
+microarchitectures.
+
+**End to end the two 48-SM cards are 2.5-2.6x the GTX 1080 and ~2.7x fitzroy's
+20-core Xeon** (11.82 s on this file, §4.6). Read the 1080 comparison as ±10-20%:
+its phase shares come from a PM0063 report run and its 9.53 s from a warm
+in-process search, and the report's clean total runs ~1.2x the warm number
+(0.896 vs 0.739 s on PM0063). **The two new cards are exactly comparable to each
+other** — same file, same harness, same day.
+
+#### The four predictions, scored
+
+**1. "The two modern cards are a DEAD TIE" (§0.4, §0.46) — HIT, and it is the
+best-supported claim in this file.** Predicted equal to four digits (0.1998 s
+each); measured **4.459 vs 4.292 s, the Ada 1.039x ahead.** A 2019 consumer card
+and a current workstation card, differing by 1.78x in FP32, 1.8x in bandwidth and
+**10x in L2**, land within 3.9% of each other on a real 105M-trial search. They
+still get there differently, and now by *measured* phases rather than projected
+ones: the Ada wins the transpose (1.83x) and the host scan; the 2080 Super wins
+interpolation (1.30x) and the boxcar (1.22x); the **transforms are a dead heat**
+(13.11 vs 13.43 ns/trial) despite the 10x cache. §0.4's hardware lesson stands and
+is now end-to-end rather than a phase model: **above ~48 SMs this workload does
+not care much what you buy.**
+
+**2. "The transform drops from 38.5% to ~18% and the boxcar becomes the largest
+phase" (§4.7) — MISS, and the construction of the prediction was the error.**
+
+| phase | GTX 1080 (PM0063) | RTX 2080 Super | RTX 4000 SFF Ada |
+|---|---|---|---|
+| zero | 2.5% | 3.1% | 3.5% |
+| interp | 15.4% | 12.6% | **17.0%** |
+| transpose | 12.9% | **16.2%** | 9.2% |
+| **transform** | **38.5%** | **31.0%** | **33.0%** |
+| boxcar | 16.5% | 18.5% | **23.4%** |
+| download | 6.5% | 6.2% | 6.5% |
+| scan (host) | 7.6% | **12.3%** | 7.3% |
+
+The transform is **still the largest phase on both cards**, and the boxcar is
+second. The shares barely moved at all. The prediction divided the transform by
+2.8x (itself a misread of §0.3's 3.9x) and implicitly held **every other phase at
+1080 speed** — but the whole pipeline sped up by 2.5-2.6x, so the shares are
+nearly invariant. **A share can only move if the phases scale *differently*, and
+here they scale within a factor of ~1.6 of each other.** Per-phase speedup over
+the 1080, in ns/trial:
+
+| | zero | interp | transpose | transform | boxcar | download | scan | **total** |
+|---|---|---|---|---|---|---|---|---|
+| RTX 2080 Super | 2.04x | **3.09x** | 2.02x | **3.14x** | 2.26x | 2.65x | 1.56x | **2.53x** |
+| RTX 4000 SFF Ada | 1.88x | 2.38x | **3.69x** | **3.07x** | 1.86x | 2.63x | 2.74x | **2.63x** |
+
+So the answer to "does this change what is worth optimising next" is **no: the
+transform is still the target on every card measured.** Excluding the host-side
+scan, the transform is 1.4-1.7x the next-largest device phase on both.
+
+**3. "`--blocksize` should split 262144 / 16384-32768" (§0.3, §0.4) — HIT on both
+cards, and the L2 story carries from isolated cuFFT into the real pipeline.**
+The search-level sweeps are monotone in opposite directions, exactly as the
+standalone probe said:
+
+| ns/trial | 16384 | 32768 | 65536 | 131072 | 262144 |
+|---|---|---|---|---|---|
+| RTX 2080 Super | 52.4 | 47.4 | 45.5 | 43.4 | **42.3** |
+| RTX 4000 SFF Ada | **40.7** | 43.7 | 47.2 | 48.4 | 49.7 |
+
+`--blocksize` is worth **1.24x on the 2080 Super and 1.22x on the Ada** end to
+end, and the two cards want opposite ends of the range. **It is a per-device
+parameter, confirmed at the search level on three cards.**
+
+**But the *magnitude* of the Ada's L2 win does NOT carry, only its direction.**
+Isolated, §0.3 measured the Ada's transform stage **3.9x** the 1080's; in-search
+it is **3.07x**, while the 2080 Super's isolated 2.75x became **3.14x**. The two
+48-SM cards converge to ~3.1x whatever their cache. The likely reason is that the
+probe gave cuFFT the whole 40 MB L2 to itself, while in the pipeline it shares
+that cache with the interpolator's amplitude windows, the transpose tile traffic
+and the boxcar's profile reads. Supporting evidence from the sweep: the probe put
+the Ada's knee between 32768 and 65536, but in-search 16384 already beats 32768 —
+**the effective knee has moved below the bottom of the sweep, and the sweep should
+be extended to 8192 and 4096 on that card.**
+
+**4. §0.46's projected metric column, replaced by measurement** (scaled to the
+PM0063 reference workload, 8.366M trials, so it is directly comparable to
+§0.3-§0.5):
+
+| reference workload (s) | transform | interp | metric | absent from the projection | total |
+|---|---|---|---|---|---|
+| GTX 1080 projected | 0.275 | 0.135 | 0.080 | — | 0.490 |
+| GTX 1080 **measured** | 0.345 | 0.138 | **0.148** | 0.264 | **0.896** |
+| 2080 Super projected | 0.100 | 0.056 | 0.044 | — | 0.200 |
+| 2080 Super **measured** | 0.110 | **0.045** | **0.066** | 0.134 | **0.354** |
+| Ada projected | 0.071 | 0.050 | 0.079 | — | 0.200 |
+| Ada **measured** | 0.112 | 0.058 | **0.080** | 0.090 | **0.341** |
+
+**The bandwidth model for the metric is dead.** It predicted the boxcar would
+scale with GB/s: 1.82x for the 2080 Super and **1.01x** for the Ada, which has the
+1080's bandwidth exactly. Measured: **2.26x and 1.86x** — the Ada gains 1.86x on
+*no extra bandwidth at all*. SMs x clock (2.51x / 2.16x) over-predicts by 10-14%
+but is far closer, and is consistent with §4.3's finding that the boxcar's cost is
+a serial dependency chain through **shared memory**, which is per-SM and has
+nothing to do with DRAM. **Every "metric scaled by bandwidth" row in §0.3-§0.5 is
+wrong; the boxcar tracks SMs x clock like the other two compute phases.**
+
+**And the Ada's 0.079 s projection was right for the wrong reason** — the model
+predicted a 1.00x speedup against a 1080 baseline that was itself 1.85x too low,
+and the errors cancelled to 1%. Two compensating mistakes are not a validated
+model, and this is why the column had to be measured rather than spot-checked.
+
+**Totals are 1.70-1.83x optimistic on every card**, and it decomposes cleanly:
+**26% (Ada) to 38% (2080 Super) of the measured total is phases the projection
+never contained** — transpose, zero, download and the host scan — which is §4.2's
+recorded "26% optimistic" warning landing almost exactly on the number it
+predicted. The remainder is the transform, and it is entirely the Ada's
+(1.58x over projection against the 2080 Super's 1.10x). **Interpolation is the one
+phase the projections got right on all three cards** (1.02x, 0.80x, 1.16x).
+
+#### Three findings the run produced that were not predicted
+
+**(a) The host-side scan is host-CPU-bound, and it is polluting the GPU shares.**
+Candidate extraction downloads and scans on the CPU (§4.5), so its cost belongs
+to the host, not the card: `spare2` 5.20 ns/trial against `hypatia` 2.97 —
+**1.75x**, against those hosts' CPU search arms at **1.71x** (105.6 vs 61.9 s
+`-t 1`). That match is close enough to call it settled. Consequences: the 2080
+Super's 12.3% scan share says nothing about the 2080 Super, and **12.3% of a GPU
+phase table being a property of the host CPU is a trap for anyone classifying a
+card.** The report should split device from host phases, or at least label the
+scan.
+
+**(b) §0.46's interpolation ranking REVERSES at each card's own blocksize.**
+Isolated at `Nprof = 65536`, the Ada beat the 2080 Super 1.12x (0.0992 vs
+0.1112 ns, §0.46). In-search, at each card's own optimum, **the 2080 Super is
+1.30x faster** (5.33 vs 6.92 ns/trial). This is not a contradiction of §0.46 — it
+is blocksize. The interpolator improves monotonically with chunk size (§4.4: 0.139
+-> 0.124 -> 0.113 across 16384/65536/131072 on the 1080, 1.23x), and the Ada is
+being forced down to 16384 by its transform. **The Ada is paying for its
+transform-optimal blocksize in every other phase**, which is precisely the
+tension §0.3 predicted and named.
+
+**(c) That tension is now quantified from the search sweep itself, and it makes
+per-rung sub-batching (§0.3) the highest-value GPU work.** Anchoring the standalone
+transform-sweep *shape* on each card's measured in-search transform and
+subtracting it from the sweep totals:
+
+| non-transform ns/trial | 16384 | 262144 | |
+|---|---|---|---|
+| RTX 2080 Super | 36.3 | **29.2** | 1.24x better at the large end |
+| RTX 4000 SFF Ada | 27.3 | **19.2** | **1.42x** better at the large end |
+
+**Everything except the transform wants the biggest chunk available, on both
+cards.** Sub-batching gives each rung its own L2-sized batch while the chunk stays
+large, so the Ada could have 19.2 + 13.4 = **32.7 ns/trial -> ~3.45 s, a 1.25x
+end-to-end win** — well above the ~1.10x that §0.3's "1.40x on the transform
+stage" alone would buy, because the real cost is the blocksize being dragged down
+for everyone else. **The 2080 Super is the control and comes out at exactly
+1.00x**, as §0.4 predicted, since it already runs at 262144.
+
+*This is a model, not a measurement:* it assumes the standalone sweep's shape
+carries into the search, and finding (3) above says the *magnitude* does not.
+Treat 1.25x as an upper bound to be tested, not a result.
+
+#### Refined pre-registration for the RTX A4000 (sm_86)
+
+§0.5's predictions stand; these are the search-level ones the two runs above now
+make testable. The A4000 has the Ada's compute (48 SMs, 1.56 GHz, 128 cores/SM)
+and the 2080 Super's cache (4 MB) with 448 GB/s:
+
+1. **`--blocksize` prefers the large end, 262144**, monotonically, like the 2080
+   Super. If it prefers the small end with 4 MB of L2, §0.3's mechanism is wrong.
+2. **Transform ~3.1x the 1080 in-search**, i.e. ~13.2 ns/trial — both 48-SM cards
+   landed there regardless of a 10x cache difference, so this tests whether
+   in-pipeline transform speed really is set by SM count alone.
+3. **Boxcar ~2.2x the 1080** (SMs x clock 2.16x less the ~12% both cards missed
+   it by), i.e. ~8.0 ns/trial — *not* the 1.90x that its 448 GB/s would give under
+   the now-dead bandwidth model. This is the cleanest available test of finding
+   (4): the A4000 and the Ada have identical SMs x clock and 1.9x different
+   bandwidth.
+4. **Total ~42-44 ns/trial, ~4.4-4.6 s** — i.e. a **three-way tie** with the
+   other two modern cards, spanning 11.2-19.2 TFLOP/s and 239-431 GB/s.
+5. **Sub-batching worth 1.00x**, as on the 2080 Super.
+
 
 ---
 

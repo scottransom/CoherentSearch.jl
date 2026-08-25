@@ -355,9 +355,13 @@ optimisation below (1.84x vs 1.26x on the same code and the same data).
 downloads nothing and `src/search.jl` is untouched. **`gpu_design.md` is the
 running log — read it before touching any of this**; it keeps the wrong turns in
 on purpose. Headlines: GTX 1080 is 1.24-1.30x fitzroy's 20-core Xeon with
-byte-identical candidates on PM0063; the workload wants **SMs and bandwidth, not
-FLOPs**; `--blocksize` is a per-device parameter worth 2.3x and the cards want
-opposite ends of the range. `bench/gpu_probe_setup.sh` classifies a new host in
+byte-identical candidates on PM0063, and an RTX 2080 Super and an RTX 4000 SFF
+Ada are both **~2.7x** it on the 105M-trial NGC6624 file with identical
+candidates (§4.8); the workload wants **SMs, not FLOPs and not bandwidth** — the
+two 48-SM cards tie to 3.9% while differing 1.8x in FP32, 1.8x in bandwidth and
+10x in L2; `--blocksize` is a per-device parameter worth 1.2-2.3x and the cards
+want opposite ends of the range. The **transform is the largest phase on every
+card measured** (31-38.5%) — the predicted drop to ~18% did not happen. `bench/gpu_probe_setup.sh` classifies a new host in
 one command. **fitzroy's GPU drives Scott's desktop — prefer another host for
 anything large.**
 
