@@ -624,8 +624,14 @@ if isfile(EXAMPLE_FFT)
         for k in (2, 3, 4)
             nharms = 60
             Hk = fld(nharms, k)
+            # `sigma=:measured` explicitly, for the same reason as `precision`
+            # and the Float64 weights below: this pin is about the harmonic
+            # gather and the transform, and the reference `block_metrics` always
+            # measures sigma.  Left at the `:analytic` default the two sides
+            # would divide by different scales — and on this un-normalised
+            # fixture, by a factor of ~900.
             params = SearchParams(nharms=nharms, m=32, decimations=[1, k],
-                                  precision=PIN_PRECISION)
+                                  precision=PIN_PRECISION, sigma=:measured)
             lodr = params.hidr / nharms
             rstart = 5000.0
             n = 64
@@ -926,4 +932,120 @@ end
     # De-duplication and harmonic collapse must not disturb it.
     kept = remove_duplicates([c2]; dr_tol=1.0)
     @test kept[1].ducy == 0.125
+end
+
+# ---------------------------------------------------------------------------
+# `SearchParams.sigma = :analytic` — the noise scale computed from the input
+# FFT's normalisation instead of measured from the folded profiles.
+#
+# The claim being pinned is that the two agree: if the closed form drifted away
+# from the estimator it replaces, every reported S/N would drift with it, and
+# the drift would be invisible (the candidate list would still look plausible).
+# ---------------------------------------------------------------------------
+
+@testset "analytic sigma: closed form, and the fill count it depends on" begin
+    CS = CoherentSearch
+    # sqrt(2*nlow + 0.5*nnyq), in the hot loop's UNNORMALISED brfft units.
+    allfilled = fill(true, 60)
+    for k in (1, 2, 3, 4, 5, 6)
+        Hk = 60 ÷ k
+        @test CS._analytic_sigma(allfilled, k, Hk) ≈ sqrt(2 * (Hk - 1) + 0.5)
+        # ...which is sqrt(nbins) times sqrt(1 - 3/(4H)): 0.6% at H=60, 3.8% at
+        # H=10.  Dropping that correction would bias the shallow folds against
+        # the deep ones, which is the cross-decimation bias the metric avoids.
+        @test CS._analytic_sigma(allfilled, k, Hk) / sqrt(2Hk) ≈ sqrt(1 - 3 / (4Hk))
+    end
+    # Only harmonics that carry data count.  A stack whose top rows are past
+    # Nyquist is quieter, and using the stack length there would overestimate
+    # sigma and suppress fast candidates.
+    part = fill(false, 60); part[1:30] .= true
+    @test CS._analytic_sigma(part, 1, 60) ≈ sqrt(2 * 30)          # no Nyquist bin filled
+    # k=2 holds base rows 2,4,...,60; only j<=15 are filled, so the stack's own
+    # Nyquist entry (j=30, base row 60) is NOT among them and gets no 0.5 term.
+    @test CS._analytic_sigma(part, 2, 30) ≈ sqrt(2 * 15)
+    @test CS._analytic_sigma(fill(false, 60), 1, 60) == 0.0
+    @test_throws ArgumentError CS._check_sigma(SearchParams(sigma = :nope))
+    @test_throws ArgumentError search(FFTFile(EXAMPLE_FFT), SearchParams(sigma = :nope))
+end
+
+# The analytic scale is a statement about a NORMALISED FFT, so it must be tested
+# on the dereddened fixture; `EXAMPLE_FFT` is the raw one, whose amplitudes are
+# ~1000x larger (see the "requires a normalised FFT" testset below).
+const EXAMPLE_FFT_RED = joinpath(@__DIR__, "..", "..", "coherent_search",
+                                 "examples", "harmonics_hi_red.fft")
+
+@testset "analytic sigma tracks the measured one on real data" begin
+    ft = FFTFile(EXAMPLE_FFT_RED)
+    nharms = 60
+    params = SearchParams(nharms = nharms, m = 16, precision = :f64,
+                          decimations = decimation_set(nharms, 6))
+    Nprof = 512
+    r_lo = 3000.0                        # r*nharms = 180000 < N/2 = 500000
+    ws = CoherentSearch.Workspace(params, Nprof)
+    dplans = build_direct_plans(params, r_lo)
+    CoherentSearch.fill_chunk_profiles!(ws, dplans, ft, params, r_lo,
+                                        params.hidr / nharms, Nprof; t0 = 0)
+    # Well below Nyquist: every harmonic filled, which is what `fill_chunk_profiles!`
+    # must now report through `ws.filled`.
+    @test all(ws.filled)
+
+    for k in vcat(1, [db.k for db in ws.decims])
+        Hk = nharms ÷ k
+        nbins = 2Hk
+        prof = k == 1 ? ws.profs :
+               (db = ws.decims[findfirst(d -> d.k == k, ws.decims)];
+                CoherentSearch.mul!(db.dprofs, db.brfftplan, db.src); db.dprofs)
+        # Exact pooled MAD over every bin, so the comparison is against the
+        # estimator's target and not against its ~1% subsampling error.
+        exact = CoherentSearch._block_sigma(prof, nbins, Nprof,
+                                            similar(prof, nbins * Nprof))
+        ana = CoherentSearch._analytic_sigma(ws.filled, k, Hk)
+        # The residual is dominated by the interpolation truncation (0.203/(2m)
+        # = 0.64% at m=16, in the direction of the analytic value being HIGH),
+        # plus whatever the real data's normalisation does not deliver.  3% is
+        # the budget; a broken formula misses by sqrt(nbins)-sized factors.
+        @test isapprox(ana, exact; rtol = 0.03)
+    end
+end
+
+@testset "analytic sigma finds the same signal as the measured one" begin
+    ft = FFTFile(EXAMPLE_FFT_RED)
+    mk(sig) = SearchParams(nharms = 60, m = 16, precision = :f64,
+                           decimations = decimation_set(60, 6), sigma = sig)
+    kw = (; lofreq = 9.98, hifreq = 10.05, threshold = 8.0,
+            progress = :none, wisdom = false)
+    meas = search(ft, mk(:measured); kw...)
+    ana  = search(ft, mk(:analytic);  kw...)
+    @test !isempty(meas) && !isempty(ana)
+    bm, ba = argmax(c -> c.metric, meas), argmax(c -> c.metric, ana)
+    @test isapprox(bm.freq, ba.freq; atol = 1e-6)
+    @test bm.nharm == ba.nharm
+    @test isapprox(bm.metric, ba.metric; rtol = 0.05)
+    # `:analytic` is the DEFAULT, so a params object that does not mention sigma
+    # must reproduce the analytic arm exactly.
+    @test search(ft, SearchParams(nharms = 60, m = 16, precision = :f64,
+                                  decimations = decimation_set(60, 6)); kw...) == ana
+end
+
+@testset "analytic sigma REQUIRES a normalised FFT (its one real assumption)" begin
+    # This is the failure mode worth pinning, because it is silent: on an
+    # un-normalised FFT the measured scale simply tracks whatever the amplitudes
+    # are, while the analytic one keeps insisting the Fourier powers have mean 1
+    # — so every reported S/N is inflated by the normalisation error.  On the raw
+    # fixture, whose amplitudes are ~1000x the dereddened file's, that is three
+    # orders of magnitude.  It is why `search` sanity-checks the two before
+    # trusting the analytic scale.
+    kw = (; lofreq = 9.98, hifreq = 10.05, threshold = 8.0,
+            progress = :none, wisdom = false)
+    mk(sig) = SearchParams(nharms = 60, m = 16, precision = :f64,
+                           decimations = decimation_set(60, 6), sigma = sig)
+    raw = FFTFile(EXAMPLE_FFT)
+    m_raw = argmax(c -> c.metric, search(raw, mk(:measured); kw...)).metric
+    a_raw = argmax(c -> c.metric, search(raw, mk(:analytic);  kw...)).metric
+    @test a_raw / m_raw > 100                    # wildly inflated, as it must be
+    # ...and on the dereddened file the same comparison is within a few percent.
+    red = FFTFile(EXAMPLE_FFT_RED)
+    m_red = argmax(c -> c.metric, search(red, mk(:measured); kw...)).metric
+    a_red = argmax(c -> c.metric, search(red, mk(:analytic);  kw...)).metric
+    @test isapprox(a_red, m_red; rtol = 0.05)
 end

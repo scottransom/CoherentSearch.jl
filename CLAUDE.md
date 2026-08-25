@@ -66,6 +66,17 @@ repeatedly — now with a known mechanism (see the AVX-512 entry below).
     inverse FFT, and harmonic decimation for cheap multi-frequency search.
 - `src/candidate.jl`, `bin/plotting.jl` — per-candidate profile reconstruction
   and CairoMakie plots (loaded lazily; ordinary runs/tests never pay for it).
+- `bin/toy_coherent_search.jl` — **the algorithm with every optimisation
+  removed**, written to be read: brute-force per-point interpolation, one
+  `irfft` per fold, the boxcar filter straight from its definition, plain nested
+  loops. It is what the paper's pseudo-code figure describes, and its functions
+  carry that figure's line numbers. ~190x slower than production (243 vs
+  1.27 µs per trial fundamental), so give it a narrow band. It reuses the
+  production candidate collapsing and output verbatim, and differs deliberately
+  in two ways: the full geometric width bank rather than the ladder-pruned one,
+  and it was where the analytic σ was worked out and validated first.
+  `bench/toy_vs_production.jl` A/Bs the two and scans the σ comparison across
+  the band; `test/test_toy.jl` pins the toy against the reference path.
 - `bin/sift_candidates.py` — cross-observation/cross-DM candidate sifter (a
   PRESTO `ACCEL_sift` analogue; pure stdlib, no numpy). Reads the `.cohout`/`.txt`
   candidate files, parses DM from the filename, and learns everything else from
@@ -769,6 +780,61 @@ re-deriving them.
     a different objective, needing a max-density/normalised-segment algorithm
     whose serial dependency chain vectorises *worse* than the present scan, which
     is already SIMD across `_BC_BATCH = 128` profiles.
+- **Done (2026-08-24): the noise scale is COMPUTED, not measured — `--sigma
+  analytic` is the default. 15% off the metric phases, 1.075x end-to-end at
+  `-t 1`, and it is *more* accurate than the estimator it replaced.** The search
+  is only meaningful on a normalised `.fft`, and that assumption already fixes
+  the fold's noise: mean power 1 means Re and Im each have variance 1/2, so the
+  hot loop's unnormalised `brfft` of `H` harmonics with DC at zero gives
+  `σ = sqrt(2·nlow + 0.5·nnyq)` — `sqrt(nbins)` times `sqrt(1 − 3/(4H))`.
+  - **That correction is not decoration: 0.6% at `H=60` but 3.8% at the `H=10`
+    of a `k=6` fold.** Dropping it would bias the shallow folds against the deep
+    ones — precisely the cross-decimation bias the boxcar metric exists to fix.
+  - **The fill count, not the stack length, is what enters.** Harmonics past
+    Nyquist are zero rows and carry no noise. `fill_harmonic_row_direct!` now
+    returns a `Bool` and `fill_chunk_profiles!` records it in `ws.filled`, so
+    `_analytic_sigma` counts what is actually there. Using `Hk` instead would
+    overestimate σ at the top of the band and silently suppress fast candidates.
+  - **Measured, laptop, PM0063 0.1–33.3 Hz, 7 interleaved reps:** metric share
+    27.00% → 22.86% at `-t 1` (1.075x wall) and 26.99% → 23.09% at `-t 4`
+    (1.053x). **Read the shares, not the seconds** — the wall clock scattered
+    8.6–11.98 s across reps while the share held to ±0.2%, and one phase table
+    showed *every* phase dropping 24–31% including ones that cannot have changed.
+  - **It is closer to the truth than the estimator it replaced.** Against the
+    exact all-bins pooled MAD on PM0063 (`bench/toy_vs_production.jl`, four
+    frequency windows × six fold depths): analytic/exact spans **0.9918–1.0217
+    (3.0%)**, while production's own 8192-sample subsampling spans
+    **0.9806–1.0335 (5.4%)**. Reported S/N is exactly `1/σ̂`, so that ~1%
+    sampling error was landing on every candidate — the term CLAUDE.md already
+    flagged as something §3.2's Monte Carlo would have to model. It is gone.
+  - **The one bias is the interpolation truncation, and it is predicted:** the
+    `m`-bin kernel keeps `S_m ≈ 1 − 0.203/m` of the noise power along with the
+    signal, so analytic runs `0.203/(2m)` high — 0.64% at `m=16`. Measured on
+    synthetic normalised noise: 1.0086 / 1.0053 / 1.0035 at `m = 16/32/64`
+    against 1.0064 / 1.0032 / 1.0016 predicted. Constant, and smaller than the
+    error it replaced, so it is left uncorrected.
+  - **Its one assumption fails SILENTLY and in the dangerous direction**, which
+    is why `_sigma_sanity_check` exists: measured σ̂ tracks whatever the
+    amplitudes are, while analytic keeps insisting on unit variance, so a
+    normalisation error *inflates* every S/N and fills the candidate list with
+    noise. `search` scores three chunks both ways and warns above 10%
+    disagreement (~0.1% of runtime). On the un-normalised `harmonics_hi.fft` it
+    fires at a factor of ~1000. **It warns rather than switching** — silently
+    changing estimator would be a surprise.
+  - **`--sigma measured` is still the right answer when the noise level varies
+    with Fourier frequency** (residual red noise, an RFI comb, a `rednoise` pass
+    that did not take): the MAD adapts and the closed form cannot. That trades a
+    ~1% estimation error against an unmodelled bias, and on a badly-behaved
+    observation the bias wins.
+  - **Candidates move by ~1–2%, and near-threshold ones churn.** PM0063 at
+    threshold 6: the 7.1185 Hz pulsar 12.30 → 12.11, the 0.2603 Hz candidate
+    7.32 → 7.37; 7 candidates either way, with one swap at 6.0–6.1. Do not
+    expect a `.cohout` diff to be empty across this change.
+  - **`chunk_metrics` still forces `_block_sigma`**, because its job is to equal
+    `block_metrics`, which measures. The equivalence pins are therefore
+    untouched; `test_search.jl`'s decimation-vs-native-fold pin had to say
+    `sigma=:measured` explicitly for the same reason (and was off by ~900x until
+    it did, on the un-normalised fixture).
 - **In-situ phase timers are now permanent** (`phase_reset!` / `phase_times`,
   `PHASE_NAMES`; ~0.03% of runtime, one `time_ns` pair per phase per chunk).
   `bench/precision_ab.jl` prints them alongside a wall-clock A/B. Use them

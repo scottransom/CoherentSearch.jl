@@ -197,6 +197,58 @@ See `decimation_design.md` for the derivation that decimation stays correctly
 sampled (each `k`'s top harmonic still steps by ≤ `hidr`, and the base input-FFT
 read depth already covers every `k`) and the full bookkeeping.
 
+### The noise scale: analytic by default
+
+The S/N metric divides by a per-bin noise scale `σ`, and as of 2026-08-24 that
+scale is **computed rather than measured** (`--sigma analytic`, the default).
+
+The search is only meaningful on a normalised `.fft` — Fourier powers with mean
+1 — and that assumption already fixes the fold's noise. Mean power 1 means the
+real and imaginary part of every amplitude have variance ½, so the hot loop's
+unnormalised `brfft` of a stack of `H` harmonics with DC held at zero gives
+
+```
+σ = sqrt(2·nlow + 0.5·nnyq)
+```
+
+where `nlow` counts the stacked harmonics below the profile's own Nyquist bin
+and `nnyq` is 1 if that bin carries data (halved because the transform keeps only
+its real part). That is `sqrt(nbins)` times a `sqrt(1 − 3/(4H))` correction — 0.6%
+at `H = 60` but **3.8% at the `H = 10` of a `k = 6` fold**, so it is not
+decoration: omitting it would bias the shallow folds against the deep ones.
+Harmonics past Nyquist are zero rows and carry no noise, so the *fill count*, not
+the stack length, is what enters.
+
+This replaced a robust MAD estimated per chunk, and it is both faster and more
+accurate:
+
+| | `--sigma measured` | `--sigma analytic` |
+|---|---|---|
+| metric-phase share of runtime | 27.0% | 22.9% |
+| wall clock, `-t 1` | 8.91 s | **8.29 s** (1.075×) |
+| wall clock, `-t 4` | 4.14 s | **3.94 s** (1.053×) |
+| agreement with the exact pooled MAD | 0.981–1.033 (5.4%) | **0.992–1.022 (3.0%)** |
+
+(PM0063, 0.1–33.3 Hz, laptop, median of 7 interleaved reps; the agreement row is
+from `bench/toy_vs_production.jl` over four frequency windows and all six fold
+depths.) The last row is the one that matters: **the closed form is closer to the
+exact noise scale than the subsampled estimator it replaces**, which carries ~1%
+sampling error straight into every reported S/N — reported S/N is exactly `1/σ`.
+
+**When to pass `--sigma measured` instead.** The closed form has exactly one
+assumption, and cannot see it fail. If the noise level varies with Fourier
+frequency — residual red noise, an RFI comb, a `rednoise` pass that did not take
+— the measured estimate adapts and the analytic one does not, so the analytic S/N
+is inflated wherever the real variance is higher. That trade is a real estimation
+error (~1%) against an unmodelled bias, and on a badly-behaved observation the
+bias wins.
+
+Because that failure is silent and inflates S/N (a candidate list full of noise
+rather than an empty one), `search` **checks it**: three chunks spread across the
+band are scored both ways, and a disagreement over 10% produces a warning naming
+both numbers. It costs ~0.1% of the runtime. On an un-normalised input the check
+fires immediately — the raw test fixture is out by a factor of ~1000.
+
 ### Candidate de-duplication
 
 Two collapses run on the candidate list, both on by default:

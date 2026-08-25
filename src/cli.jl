@@ -118,6 +118,11 @@ function parse_cmdline(argv)
             arg_type = String
             default = "f32"
             range_tester = x -> x in ("f64", "f32")
+        "--sigma"
+            help = "Noise scale for the S/N metric: 'analytic' (default) computes it in closed form from the input FFT being normalised -- sqrt(2*nlow + 0.5*nnyq), counting only the harmonics that carry data -- which is free where measuring it costs ~15% of the metric phases, and has no sampling error. 'measured' estimates it per chunk with a robust MAD instead: use it when the noise level varies with Fourier frequency (bad RFI, or a rednoise pass that did not take), which the closed form cannot see. A sanity check compares the two on a few chunks and warns if they disagree"
+            arg_type = String
+            default = "analytic"
+            range_tester = x -> x in ("measured", "analytic")
         "--blocksize"
             help = "Trial fundamentals per parallel chunk (Nprof)"
             arg_type = Int
@@ -227,6 +232,7 @@ function main(argv)
         threshold = a["threshold"],
         decimations = decimations,
         precision = Symbol(a["precision"]),
+        sigma = Symbol(a["sigma"]),
     )
 
     cache = SearchCache()

@@ -105,8 +105,14 @@ using PrecompileTools: @setup_workload, @compile_workload
         # `search` directly, then the CLI below, so both entry points are cached.
         _p = SearchParams(nharms = 8)
         _cache = SearchCache()
-        search(_ft, _p; lobin = 200, hifreq = 210 / _ft.T, blocksize = 64,
-               threshold = 1e9, progress = :none, wisdom = false, cache = _cache)
+        # Silenced like the `main` call below: the workload's amplitudes are a
+        # constant, not noise, so the analytic-sigma sanity check legitimately
+        # fires — and a warning from inside precompilation would be alarming
+        # noise.  Running it here is deliberate: it caches that path too.
+        with_logger(NullLogger()) do
+            search(_ft, _p; lobin = 200, hifreq = 210 / _ft.T, blocksize = 64,
+                   threshold = 1e9, progress = :none, wisdom = false, cache = _cache)
+        end
         # …then the whole CLI, so ArgParse's table and `main` are cached too.
         # Silenced: the workload's @info output would otherwise be echoed as
         # package-precompilation noise.

@@ -469,7 +469,7 @@ run there.
 """
 function fill_harmonic_row_direct!(ws::Workspace, dp::DirectPlan{WT}, ft::FFTFile,
                                    params::SearchParams, t0::Integer, n::Integer) where {WT}
-    n >= 1 || return
+    n >= 1 || return false
     h = dp.h
     m = dp.m
     m2 = m ÷ 2
@@ -493,7 +493,7 @@ function fill_harmonic_row_direct!(ws::Workspace, dp::DirectPlan{WT}, ft::FFTFil
     resl, qintl = direct_chunk_state(dp, t0 + n - 1)
     pl = dp.row[resl + 1]
     hi_trial = dp.rfloor0 + qintl + dp.carry[pl] + 1 + m2
-    (lo_trial >= 1 && hi_trial <= namps && (dp.rfloor0 + qintl) < Nhalf) || return
+    (lo_trial >= 1 && hi_trial <= namps && (dp.rfloor0 + qintl) < Nhalf) || return false
 
     # --- group grid, anchored to the GLOBAL trial index ----------------------
     # Groups of `V` trials start at global trials 0, V, 2V, …, so which group a
@@ -568,7 +568,7 @@ function fill_harmonic_row_direct!(ws::Workspace, dp::DirectPlan{WT}, ft::FFTFil
         res = mod(tot, q)
         T += V
     end
-    return
+    return true
 end
 
 # One group: the (V, nj) weight block times the nj-long slice of the bin planes.
@@ -634,7 +634,7 @@ function _fill_row_direct_slow!(ws::Workspace, dp::DirectPlan, ft::FFTFile,
     rlast = hr_lo + (t0 + n - 1) * dh
     lo = floor(Int, rfirst + 1e-15) + 2 - m2
     hi = floor(Int, rlast + 1e-15) + 1 + m2
-    (lo >= 1 && hi <= namps && floor(Int, rlast) < Nhalf) || return
+    (lo >= 1 && hi <= namps && floor(Int, rlast) < Nhalf) || return false
     amps = ft.amps
     ftprofs = ws.ftprofs
     hrow = h + 1
@@ -657,7 +657,7 @@ function _fill_row_direct_slow!(ws::Workspace, dp::DirectPlan, ft::FFTFile,
         end
         ftprofs[hrow, k] = conj(sinpi(dr) * cispi(dr) / pi) * complex(sre, sim)
     end
-    return
+    return true
 end
 
 """

@@ -141,6 +141,7 @@ Base.@kwdef struct SearchParams
                                        # `threshold` (see `boxcar_metrics!`)
     decimations::Vector{Int} = [1]  # harmonic-decimation factors k (see decimation_design.md)
     precision::Symbol = :f32   # profile-stage element type — :f32 or :f64 (see `proftype`)
+    sigma::Symbol = :analytic  # noise scale: :analytic (closed form) or :measured (MAD)
 end
 
 """
@@ -153,6 +154,14 @@ the precision note above [`SearchParams`](@ref).
     params.precision === :f64 && return Float64
     params.precision === :f32 && return Float32
     throw(ArgumentError("precision must be :f64 or :f32, got $(params.precision)"))
+end
+
+# `sigma` is read in the hot loop as `=== :analytic`, so a typo would silently
+# select the measured path rather than erroring.  Check it once, at setup.
+function _check_sigma(params::SearchParams)
+    params.sigma in (:measured, :analytic) ||
+        throw(ArgumentError("sigma must be :measured or :analytic, got $(params.sigma)"))
+    return params.sigma
 end
 
 """
@@ -541,6 +550,55 @@ function _block_sigma(M::AbstractMatrix{T}, nbins::Int, n::Int, buf::Vector{T};
         end
     end
     return T(1.4826) * _median!(buf, ns)
+end
+
+"""
+    _analytic_sigma(filled, k, Hk) -> Float64
+
+The per-bin noise scale of a decimation-`k` folded profile, **computed from the
+normalisation of the input FFT rather than measured from the data** — the
+alternative to [`_block_sigma`](@ref), selected by `SearchParams.sigma =
+:analytic`.
+
+The search is only meaningful on a normalised `.fft` (Fourier powers with mean
+1) in the first place, and that assumption already fixes the fold's noise: mean
+power 1 means the real and imaginary part of every amplitude have variance 1/2.
+The hot loop's unnormalised `brfft` of a stack holding harmonics `1 … H` with DC
+at zero then gives, at every phase bin,
+
+    var(P_j) = 4·(1/2)·(harmonics below the profile's Nyquist bin)
+             +   (1/2)·(1 if the Nyquist bin itself is filled)
+
+— the last term halved because `brfft` keeps only the real part of that bin.
+Hence `σ = sqrt(2·nlow + 0.5·nnyq)`, which is `sqrt(nbins)` times a
+`sqrt(1 − 3/(4H))` correction.  That correction is **not** decoration: 0.6% at
+`H = 60` but **3.8% at the `H = 10` of a `k = 6` fold**, so omitting it would
+bias the shallow folds against the deep ones — exactly the cross-decimation bias
+the boxcar metric exists to avoid.
+
+`filled` is `ws.filled`, indexed by *base* harmonic number: the decimated stack
+holds base harmonics `k, 2k, …, Hk·k`, so its `j`-th entry is filled iff
+`filled[j·k]`.  Counting them rather than assuming `Hk` matters near the top of
+the band, where most of a stack is past Nyquist: those rows are zero and carry
+no noise, and using `Hk` there would overestimate σ and silently suppress fast
+candidates.
+
+**Two known biases, neither corrected.**  (i) The `m`-bin interpolation kernel
+keeps `S_m = Σ sinc²(dr−j) ≈ 1 − 0.203/m` of the noise power along with the
+signal, so this runs ~`0.203/(2m)` high — 0.64% at `m = 16`.  It is a constant
+factor, not scatter, and it is *smaller than the ~1% sampling error of the
+estimator it replaces*.  (ii) It assumes the normalisation holds, where a
+measured estimate adapts to red-noise residue and RFI; that is the real risk,
+and `bench/toy_vs_production.jl` is what measures it on real data.
+"""
+@inline function _analytic_sigma(filled::Vector{Bool}, k::Int, Hk::Int)
+    nlow = 0
+    @inbounds for j in 1:(Hk - 1)
+        nlow += filled[j * k]
+    end
+    @inbounds nnyq = filled[Hk * k] ? 1 : 0
+    (nlow + nnyq) >= 1 || return 0.0
+    return sqrt(2 * nlow + 0.5 * nnyq)
 end
 
 # Prefix sum of the profile column minus a scalar baseline `b`, tiled by one extra
@@ -1258,6 +1316,13 @@ struct Workspace{B, D<:DecimBuf, P<:AbstractFloat}
     # halving the traffic through the inner loop (~1.1x measured).
     re::Vector{Float32}
     im::Vector{Float32}
+    # Which harmonics `fill_chunk_profiles!` actually filled for the CURRENT
+    # chunk (length `nharms`, indexed by harmonic number).  A harmonic past
+    # Nyquist, or one whose interpolation window runs off the amplitudes, is
+    # left as a zero row — which carries no noise either, and so must not be
+    # counted when the noise scale is computed rather than measured.  Only read
+    # by `_analytic_sigma`; the measured path ignores it.
+    filled::Vector{Bool}
 end
 
 Workspace(params::SearchParams, Nprof::Integer) =
@@ -1286,7 +1351,7 @@ function Workspace(::Type{P}, params::SearchParams, Nprof::Integer) where {P<:Ab
     re = Vector{Float32}(undef, nw)
     im = Vector{Float32}(undef, nw)
     return Workspace(ftprofs, profs, brfftplan, bcwidths, bcpsum,
-                     bcsig, bcbatch, decims, re, im)
+                     bcsig, bcbatch, decims, re, im, fill(false, nh))
 end
 
 """
@@ -1307,7 +1372,10 @@ function fill_chunk_profiles!(ws::Workspace, dplans::AbstractVector, ft::FFTFile
                               t0::Integer=0)
     @phase 6 fill!(ws.ftprofs, 0)
     @phase 1 for dp in dplans
-        fill_harmonic_row_direct!(ws, dp, ft, params, t0, n)
+        # The return value is which harmonics carry data this chunk; only the
+        # analytic noise scale reads it, and recording it is one store per
+        # harmonic (61 per chunk), far below the noise of the phase timers.
+        ws.filled[dp.h] = fill_harmonic_row_direct!(ws, dp, ft, params, t0, n)
     end
     # One batched complex→real transform for all Nprof profiles at once.  This
     # is an unnormalised `brfft` (= Nbins × a true irfft).  The boxcar metric is
@@ -1710,7 +1778,9 @@ function decim_pass!(out::Vector{Candidate}, ws::Workspace, db::DecimBuf, ft::FF
     # Nyquist columns are partly zero-padded and would deflate it).
     P = eltype(db.dprofs)
     @phase 8 begin
-        sig = _block_sigma(db.dprofs, nbins, nvalid, db.bcsig)
+        sig = params.sigma === :analytic ?
+              P(_analytic_sigma(ws.filled, k, Hk)) :
+              _block_sigma(db.dprofs, nbins, nvalid, db.bcsig)
         invsigma = sig > 0 ? one(P) / sig : zero(P)
         # Only the valid prefix is scored; past-Nyquist columns are skipped below.
         boxcar_metrics!(db.bcbatch, db.dprofs, nvalid, db.bcpsum,
@@ -1798,6 +1868,9 @@ function _search_region!(ft::FFTFile, params::SearchParams,
                          metricstats::Union{Nothing,MetricStats}, progress::Symbol,
                          dplans::AbstractVector)
     collect_stats = metricstats !== nothing
+    # Hoisted out of the chunk loop: a `Symbol` compare per chunk would be free,
+    # but making it a `Bool` here keeps the hot branch trivially predictable.
+    analytic_sigma = params.sigma === :analytic
     # Fast path: keep the batched `Float32` gate's value for trials that land more
     # than `boxcar_gatemargin` below `threshold`, and re-score the rest in `Float64`
     # (see `boxcar_metrics!`).  Forced off (all `Float64`) when collecting stats or
@@ -1840,7 +1913,9 @@ function _search_region!(ft::FFTFile, params::SearchParams,
                 rmean = rstart + (n - 1) * lodr / 2
                 # one robust σ per block
                 @phase 3 begin
-                    sig = _block_sigma(ws.profs, nbins, n, ws.bcsig)
+                    sig = analytic_sigma ?
+                          P(_analytic_sigma(ws.filled, 1, params.nharms)) :
+                          _block_sigma(ws.profs, nbins, n, ws.bcsig)
                     invsigma = sig > 0 ? one(P) / sig : zero(P)
                 end
                 # All n trials at once: batched `Float32` gate, then a `Float64`
@@ -1986,6 +2061,86 @@ function _plans!(cache::Union{Nothing,SearchCache}, params::SearchParams,
     return ws
 end
 
+# Chunks sampled by `_sigma_sanity_check`, and the relative disagreement it
+# tolerates before warning.  Three chunks is ~0.1% of a real search; 10% is far
+# outside anything the interpolation truncation (0.64% at m=16) or the
+# estimator's own subsampling error (~1-3%) can produce, and far inside the
+# orders of magnitude an un-normalised input gives.
+const _SIGMA_CHECK_CHUNKS = 3
+const _SIGMA_CHECK_TOL = 0.10
+
+"""
+    _sigma_sanity_check(ft, params, ws, dplans, r_lo, lodr, total, Nprof) -> Bool
+
+Guard for `sigma = :analytic`: on a few chunks spread across the band, compare
+the closed-form noise scale against the measured one, and warn if they disagree
+by more than `_SIGMA_CHECK_TOL`.  Returns whether the check passed.
+
+The analytic scale has exactly one assumption — that the input `.fft` is
+normalised, with Fourier powers of mean 1 — and when that assumption fails it
+fails *silently and in the dangerous direction*: the measured scale tracks
+whatever the amplitudes actually are, while the analytic one keeps insisting on
+unit variance, so every reported S/N is inflated by the normalisation error and
+the candidate list fills with noise.  On an un-normalised file that is orders of
+magnitude (a factor of ~1000 on the raw test fixture).  Milder versions —
+residual red noise, an RFI comb, a `rednoise` pass that did not take — inflate it
+by a few tens of percent, which is worse because the output still looks
+plausible.
+
+This costs three chunks out of thousands and turns that silent failure into a
+message naming both numbers, so it is always on.  It only *warns*: switching
+estimator behind the user's back would be a surprise, and `--sigma measured` is
+the documented answer (it also adapts to a noise level that varies with Fourier
+frequency, which is the case this check is most likely to be detecting).
+"""
+function _sigma_sanity_check(ft::FFTFile, params::SearchParams, ws::Workspace,
+                             dplans::AbstractVector, r_lo::Real, lodr::Real,
+                             total::Integer, Nprof::Integer)
+    nchunks = cld(total, Nprof)
+    nsample = min(_SIGMA_CHECK_CHUNKS, nchunks)
+    worst, worst_k, worst_f, meas_w, ana_w = 0.0, 1, 0.0, 0.0, 0.0
+    for i in 1:nsample
+        c = nsample == 1 ? 1 : 1 + ((i - 1) * (nchunks - 1)) ÷ (nsample - 1)
+        i0 = (c - 1) * Nprof
+        n = min(Nprof, total - i0)
+        n >= 8 || continue                      # too short for a meaningful MAD
+        rstart = r_lo + i0 * lodr
+        fill_chunk_profiles!(ws, dplans, ft, params, rstart, lodr, n; t0 = i0)
+        for (k, prof) in vcat([(1, ws.profs)],
+                              [(db.k, (mul!(db.dprofs, db.brfftplan, db.src); db.dprofs))
+                               for db in ws.decims])
+            Hk = fld(params.nharms, k)
+            nbins = 2Hk
+            meas = Float64(_block_sigma(prof, nbins, n, ws.bcsig))
+            ana = _analytic_sigma(ws.filled, k, Hk)
+            (meas > 0 && ana > 0) || continue
+            dev = abs(ana / meas - 1)
+            if dev > worst
+                worst, worst_k, worst_f = dev, k, rstart / ft.T
+                meas_w, ana_w = meas, ana
+            end
+        end
+    end
+    if worst > _SIGMA_CHECK_TOL
+        # Quote the RATIO, not the percentage: a badly un-normalised file is out
+        # by orders of magnitude, and `abs(ratio - 1)` saturates near 100% there,
+        # making a 1000x error read like a 99.9% one.
+        ratio = ana_w / meas_w
+        howmuch = (ratio > 2 || ratio < 0.5) ?
+            "a factor of $(round(max(ratio, 1 / ratio); sigdigits = 3))" :
+            "$(round(100 * worst; digits = 1))%"
+        @warn """The analytic noise scale disagrees with the measured one by \
+                 $howmuch — every reported S/N is scaled by that.  This normally \
+                 means the input FFT is not normalised (Fourier powers with mean \
+                 1); run PRESTO's `rednoise` on it, or pass `--sigma measured` to \
+                 estimate the scale from the data instead.""" file = basename(ft.path)
+        @printf(stderr, "         worst at k=%d, %.4f Hz: measured %.5g vs analytic %.5g (ratio %.4g)\n",
+                worst_k, worst_f, meas_w, ana_w, ratio)
+        return false
+    end
+    return true
+end
+
 """
     search(ft, params; lofreq, hifreq, lobin, blocksize, threshold) -> Vector{Candidate}
 
@@ -2037,6 +2192,7 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
                 cache::Union{Nothing,SearchCache}=nothing)
     progress in (:none, :text, :bar) ||
         throw(ArgumentError("progress must be :none, :text or :bar, got :$progress"))
+    _check_sigma(params)
     FFTW.set_num_threads(1)   # parallelise at the Julia-task level, not inside FFTW
     lodr = params.hidr / params.nharms
     nbins = 2 * params.nharms
@@ -2072,6 +2228,11 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
     end
 
     wisdom && export_wisdom!(wpath)
+
+    # The analytic scale's one assumption is checkable in ~0.1% of the runtime,
+    # and its failure is silent, so check it.
+    params.sigma === :analytic &&
+        _sigma_sanity_check(ft, params, workspaces[1], dplans, r_lo, lodr, total, Nprof)
 
     if verbose
         @printf(stderr, "Search: %d trials in %d chunks of %d over r = %.1f … %.1f bins (%.4f … %.4f Hz), %d thread(s)\n",
