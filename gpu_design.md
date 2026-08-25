@@ -1089,6 +1089,49 @@ instrumentation:
 `--sigma measured` (needs a device MAD), `--normalize` (needs the two-pass
 per-`(k, frequency)` statistics), `--metricstats`.
 
+### 4.6 A large file, and a lesson about whose GPU it is
+
+`NGC6624_16L_DM87.40_red.fft` — **1.29 GiB of amplitudes, T = 26459 s, 105.5M
+trial fundamentals, 12.6x the reference workload**:
+
+| | GTX 1080 | fitzroy `-t 20` | |
+|---|---|---|---|
+| warm search | **9.53 s** | 11.82 s | **1.24x** |
+| ns per trial | 90 | 112 | |
+| candidates | 135 | 135 | agreeing to ~1e-7 |
+
+**The per-trial cost is flat across a 12.6x size range** (88 -> 90 ns on the GPU,
+115 -> 112 on the CPU), so the pipeline scales linearly and the 1.24–1.30x is not
+an artefact of the small file.
+
+**But it produced a desktop low-memory warning at 86% device usage**, and that is
+the part worth recording. Two defects, both fixed:
+
+- **`_region!` uploaded the whole `.fft` on every call and never freed it.** Three
+  searches of NGC6624 reached **5.87 GiB of 7.92**. Explicit `unsafe_free!` of
+  every device buffer brings that to 3.74, and `CUDA.reclaim()` returns it to the
+  *driver* rather than to CUDA.jl's pool — without which the desktop does not get
+  its memory back at all. Residual after a small search is now 221 MiB, which is
+  the CUDA context.
+- **Nothing checked whether the search would fit.** `_check_device_memory` now
+  refuses up front, naming the two knobs that help: `--blocksize` (the workspace
+  scales with it) and *not* using a display GPU (the amplitudes do not). It warns
+  above 60% of free memory and errors above 90%.
+
+**The general point: on a card that drives a display, memory is shared with the
+compositor, and an out-of-memory error is a far better outcome than quietly
+starving the desktop.** That is why the guard errors rather than trying to
+squeeze. It is also a reason to prefer `--blocksize` at the low end of §0.3's
+sweep on such a card — the Ada's optimum of 32768 uses a quarter of 131072's
+workspace and is *faster* there anyway.
+
+**Still open for throughput mode:** `GPUChunk` and `GPUInterpPlan` depend only on
+`(params, Nprof, r_lo)` and not on the file's contents — exactly the property that
+makes the CPU's `SearchCache` safe across files — so they should be cached across
+a multi-file run rather than rebuilt and freed per call. Only the amplitude
+upload is genuinely per-file, and §7.2's prefetch would overlap that with the
+previous file's search.
+
 ---
 
 ## 5. Correctness — the fourth pin

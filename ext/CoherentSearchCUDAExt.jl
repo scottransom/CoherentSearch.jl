@@ -696,6 +696,47 @@ function _fill_stack_gather!(gc::GPUChunk, i::Integer)
     copyto!(gc.cpulayout[i], view(gc.ftprofs, :, 1:k:(gc.Hk[i] * k + 1)))
 end
 
+"""
+    _check_device_memory(ft, params, Nprof, WT)
+
+Refuse to start a search that will not fit, and say what to change.
+
+**This exists because the failure mode is other people's problem, not ours.** A
+GPU that drives a display shares its memory with the desktop: on `fitzroy` a
+1.29 GB `.fft` plus a `Nprof = 131072` workspace pushed the card to 86% and
+produced a system low-memory warning while the search ran perfectly well. An
+out-of-memory *error* is recoverable and obvious; quietly starving the compositor
+is neither. So this checks first, and the message names the two knobs that
+actually help.
+"""
+function _check_device_memory(ft::FFTFile, params::SearchParams, Nprof::Integer,
+                              ::Type{WT}) where {WT}
+    nh = params.nharms
+    ks = sort!(unique(params.decimations))
+    amps = length(ft.amps) * sizeof(ComplexF32)
+    stack = sum((fld(nh, k) + 1) * Nprof * 2 * sizeof(WT) for k in ks)
+    prof = sum(2 * fld(nh, k) * Nprof * sizeof(WT) for k in ks)
+    need = amps + (nh + 1) * Nprof * 2 * sizeof(WT) + stack + prof +
+           Nprof * length(ks) * sizeof(Float32)
+    free, tot = CUDA.memory_info()
+    gb(x) = x / 2^30
+    if need > 0.90 * free
+        error("""
+            This search needs about $(round(gb(need), digits=2)) GiB on the GPU but only             $(round(gb(free), digits=2)) GiB of $(round(gb(tot), digits=2)) GiB is free.
+
+              amplitudes      $(round(gb(amps), digits=2)) GiB  (the whole .fft)
+              chunk workspace $(round(gb(need - amps), digits=2)) GiB  (--blocksize $Nprof)
+
+            Lower --blocksize (the workspace scales with it; the amplitudes do not),
+            or use a GPU that is not also driving a display.""")
+    elseif need > 0.60 * free
+        # A triple-quoted string with line continuations is not a valid @warn
+        # message argument; keep it on one line.
+        @warn "GPU search will use most of the free device memory; if this card also drives a display, expect the desktop to notice" needed_GiB = round(gb(need), digits = 2) free_GiB = round(gb(free), digits = 2) blocksize = Nprof
+    end
+    return nothing
+end
+
 # ---------------------------------------------------------------------------
 # The chunk loop.  Mirrors `_search_region!`, and everything outside it -- the
 # trial grid, the plans, the analytic-sigma sanity check, duplicate and harmonic
@@ -726,6 +767,7 @@ function _region!(::CUDABackend, ft::FFTFile, params::SearchParams,
     metricstats === nothing || error("the CUDA backend does not support --metricstats yet")
 
     WT = eltype(dplans[1].W)
+    _check_device_memory(ft, params, Nprof, WT)
     gc = GPUChunk(WT, params, Nprof)
     gp = GPUInterpPlan(dplans)
     d_amps = CuArray(ft.amps)
@@ -793,6 +835,26 @@ function _region!(::CUDABackend, ft::FFTFile, params::SearchParams,
         _render_progress(progress, nchunks, nchunks)
         println(stderr)
     end
+    # Release the device buffers explicitly.  Without this, CUDA.jl's pool holds
+    # every call's allocations until the next GC, and each call uploads the whole
+    # `.fft` again: three searches of NGC6624 (1.29 GB of amplitudes plus a
+    # ~380 MB chunk workspace) reached 5.87 GB of an 7.92 GB card.  In throughput
+    # mode -- hundreds of files, which is the deployment target -- that is an
+    # out-of-memory failure, not an inefficiency.
+    #
+    # TODO (throughput): the `GPUChunk` and `GPUInterpPlan` depend only on
+    # `(params, Nprof, r_lo)` and not on the file's contents, exactly as the CPU's
+    # `SearchCache` does, so they should be cached across files rather than rebuilt
+    # and freed per call.  Only the amplitude upload is genuinely per-file.
+    CUDA.unsafe_free!(d_amps)
+    CUDA.unsafe_free!(out)
+    CUDA.unsafe_free!(gc.ftprofs)
+    for a in gc.cpulayout; CUDA.unsafe_free!(a); end
+    for a in gc.profs; CUDA.unsafe_free!(a); end
+    # `unsafe_free!` returns blocks to CUDA.jl's pool, not to the driver, so the
+    # desktop does not get its memory back until this.  Cheap, and it runs once
+    # per file.
+    CUDA.reclaim()
     return cands
 end
 
