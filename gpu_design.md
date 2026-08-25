@@ -367,9 +367,9 @@ the *fastest* FP32 part is not the fastest card, and the ranking follows
 SMs x clock and GB/s instead. §0.1 already measured the interpolator at 4.8% of
 peak FLOPs; this is the same fact seen from the hardware side.
 
-**Done — see §0.45.** The 2080 Super measured 2.42x the 1080 against SMs x clock's
-2.51x and FP32's 1.29x, confirming §4.1's verdict to 3.5%. What remains is the
-Ada and A4000 arm, which should tie each other at ~0.1248 ns.
+**Done, and the second card broke the model — see §0.45 and §0.46.** The 2080
+Super fit SMs x clock to 3.5%; the Ada missed it by 26% in the *other* direction,
+so the A4000 is now a two-way discriminator between cores/SM and L2 residency.
 
 ### 0.45 Interpolation measured on a second card — §4.1's verdict CONFIRMED
 
@@ -411,6 +411,85 @@ fitzroy describe *different denominators*, and neither may be multiplied by 20 t
 get a socket comparison for a machine it was not measured on. **Every end-to-end
 ratio in this document is against fitzroy's 20-core Xeon at 1.01 s**; keep the
 GPU's absolute ns and compare that.
+
+### 0.46 Third card breaks the model — the prediction was WRONG
+
+The Ada measured **0.0992 ns** per (harmonic, trial) against a pre-registered
+**0.1248**, and it is **1.12x faster than the 2080 Super** where §0.45 predicted
+the 2080 Super would be 1.12x faster. **Wrong magnitude and wrong direction.**
+
+| | measured ns | SMs x clock | FP32 | cores/SM | L2 |
+|---|---|---|---|---|---|
+| GTX 1080 | 0.2695 | 34.7 | 7323 | 128 | 2 MB |
+| RTX 2080 Super | 0.1112 | 87.1 | 9438 | **64** | 4 MB |
+| RTX 4000 SFF Ada | **0.0992** | 74.9 | 16807 | **128** | **40 MB** |
+
+Speedup over the GTX 1080, against the two candidate models:
+
+| | measured | SMs x clock | FP32 |
+|---|---|---|---|
+| RTX 2080 Super | 2.42x | 2.51x (**3.5%**) | 1.29x (88%) |
+| RTX 4000 SFF Ada | **2.72x** | 2.16x (**25.8%**) | 2.30x (18%) |
+
+**Neither model fits all three cards.** SMs x clock nails the 2080 Super and
+misses the Ada by 26%; FP32 is hopeless on the 2080 Super and merely bad on the
+Ada. §0.45 called SMs x clock "a measured property of the workload on two
+architectures" — **two architectures were not enough, and that claim is now
+retired.** The honest statement is narrower: *FP32 peak is definitively not the
+right predictor* (88% error on the 2080 Super), and SMs x clock is a good first
+approximation that under-predicts the Ada.
+
+**Two candidate explanations, and they are cleanly separable.** The Ada beats
+SMs x clock in the direction of the two things it has that the 2080 Super does
+not:
+
+1. **128 FP32 cores per SM against Turing's 64.** §4.1 found the kernel
+   issue-bound, and issue width per SM is exactly what cores/SM buys — so this
+   would mean the truth is between the two models rather than either one.
+2. **40 MB of L2 against 4 MB.** The kernel is *load-latency* bound (§4.1's probe:
+   volume irrelevant, the load's existence worth 1.73x), and at `Nprof = 65536`
+   the interpolator's amplitude windows total ~7.6 MB across 60 harmonics — which
+   is L2-resident on the Ada and not on either other card. Lower load latency is
+   precisely what would show up here.
+
+**The A4000 now settles it, and it is a clean two-way discriminator.** It has
+**identical SMs (48), clock (1.56 GHz) and cores/SM (128)** to the Ada, and
+**4 MB of L2** like the 2080 Super:
+
+- **A4000 ~= 0.0992 ns (ties the Ada)** -> explanation 1: it is cores/SM, and L2
+  is irrelevant to interpolation.
+- **A4000 ~= 0.1248 ns (the SMs x clock line)** -> explanation 2: it is the 40 MB
+  L2, and cache residency matters to the interpolator as well as to cuFFT.
+
+This is a better experiment than the one §0.5 was designed for, and it costs the
+same single run.
+
+### The two modern cards are a DEAD TIE
+
+With the Ada's interp column now measured:
+
+| | transforms | interp | metric* | total | vs fitzroy `-t 20` |
+|---|---|---|---|---|---|
+| GTX 1080 | 0.275 | 0.1352 | 0.080 | 0.490 s | 2.06x |
+| **RTX 2080 Super** | 0.100 | 0.0558 | 0.044 | **0.1998 s** | **5.06x** |
+| **RTX 4000 SFF Ada** | 0.071 | **0.0498** | 0.079 | **0.1998 s** | **5.06x** |
+
+`*` metric is the one remaining projection; it is the phase stage 2 has not
+written.
+
+**0.1998 s each, to four digits** — a coincidence, but a telling one. They get
+there completely differently: the Ada wins transforms (40 MB L2) *and* now
+interpolation, while the 2080 Super wins the metric on 1.8x the bandwidth. A 2019
+consumer card and a current workstation card tie on this workload while differing
+by 1.78x in FP32, 1.8x in bandwidth and 10x in L2. **That is the hardware lesson
+in its strongest form: above ~48 SMs, this workload does not care much what you
+buy.**
+
+**A third host, a third CPU — the "x one core" column still must not travel.**
+`hypatia` reads 2.59 ns at `Nprof = 2048` against `spare2`'s 3.70 and fitzroy's
+4.85, so the same GPU number reads as 26.1x, 33.2x or 18.5x "one core" depending
+only on which machine it sat in. Every end-to-end ratio in this document is
+against **fitzroy's** 20-core Xeon at 1.01 s.
 
 ### 0.5 Pre-registered prediction for the RTX A4000 (sm_86)
 
