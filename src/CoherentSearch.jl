@@ -13,15 +13,19 @@ module CoherentSearch
 
 using Logging: with_logger, NullLogger
 
+# --- PRESTO file I/O ---
+# Included *before* the interpolation kernels because `fourier_interpolate`
+# (the one-call, whole-file convenience wrapper at the bottom of
+# `fourierinterp.jl`) dispatches on `FFTFile`.  `fileio.jl` itself depends on
+# nothing but `Mmap`, so the order is free.
+export FFTFile, SimpleInf, freqs
+include("fileio.jl")
+
 # --- Fourier interpolation kernels ---
-export finterp_coeffs, fourier_interp, finterp_multi,
+export finterp_coeffs, fourier_interp, fourier_interpolate, finterp_multi,
        finterp_fft, finterp_fft_coeffs, nearby_fourier_bins,
        nearby_fourier_bin_range, next_pow_of_2, next_smooth, is_smooth
 include("fourierinterp.jl")
-
-# --- PRESTO file I/O ---
-export FFTFile, SimpleInf, freqs
-include("fileio.jl")
 
 # --- Search ---
 export SearchParams, Candidate, search, search_block, block_metrics, coherent_profiles,

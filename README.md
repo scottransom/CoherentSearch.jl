@@ -27,6 +27,7 @@ src/
   cli.jl              ArgParse command-line driver (`CoherentSearch.main`)
 bin/
   coherent_search.jl  command-line entry point (a shim onto src/cli.jl)
+  toy_coherent_search.jl  the same search with every optimisation removed
   plotting.jl         CairoMakie candidate-profile plotting (loaded on demand)
   plot_candidates.jl  standalone: re-plot profiles from a saved candidate file
   sift_candidates.py  cross-observation candidate sifter (.cohout / .txt)
@@ -420,6 +421,51 @@ One pulsar in one observation says nothing about relative *sensitivity*, and the
 single-detection scatter is much larger than the gap above; that question is
 settled by the injection Monte Carlo described in `Summary_and_Future_Work.md`
 §3.2, not by this table.
+
+## The toy search
+
+`bin/toy_coherent_search.jl` is the whole algorithm with none of the
+optimisation: brute-force per-point Fourier interpolation, one `irfft` per fold,
+the boxcar matched filter evaluated straight from its definition, and plain
+single-threaded nested loops. It exists to be *read* — it is the code the
+paper's pseudo-code figure describes, line for line, and each function carries
+the figure's line numbers.
+
+```sh
+julia --project=. bin/toy_coherent_search.jl FILE.fft --lofreq 0.1 --hifreq 0.4
+```
+
+It takes the options that set the search itself (`--threshold`, `--nharms`,
+`--m`, `--ncands`, `--lofreq`, `--hifreq`, `--hidr`, `--drtol`, `--maxdecim`,
+`--sigma`) and writes candidates to stdout. It reuses the production candidate
+collapsing and output code unchanged, because that is bookkeeping rather than
+search.
+
+**It is ~190× slower**, so give it a narrow band. Measured on the laptop at
+`-t 1` over 0.1–0.4 Hz of `PM0063_034C1_DM445.0_red.fft`: 243 µs per trial
+fundamental against production's 1.27 µs.
+
+It differs from the production search in exactly two ways, both deliberate and
+both documented in the file: it scans the full geometric width bank rather than
+the ladder-pruned one, and it divides by an **analytic** noise scale rather than
+a measured one. For a normalised input FFT the folded profile's per-bin noise is
+known in closed form,
+
+```
+sigma = sqrt(2*nlow + 0.5*nnyq) / nbins
+```
+
+where `nlow` counts the stacked harmonics below the profile's own Nyquist bin
+and `nnyq` is 1 if that bin carries data — about `1/sqrt(nbins)`, times a
+`sqrt(1 - 3/(4H))` correction that is 0.6% at `H = 60` but 3.8% at the `H = 10`
+of a `k = 6` fold. Harmonics past Nyquist are zero and carry no noise, so the
+count, not the stack length, is what enters.
+
+`bench/toy_vs_production.jl` times the two arms against each other, cross-matches
+their candidate lists, and reports the analytic noise scale against the measured
+one per fold depth and across the band. `test/test_toy.jl` pins the toy's
+interpolation, fold and metric against the oracle-validated reference path, and
+pins the analytic noise scale against synthetic normalised white noise.
 
 ## Testing
 

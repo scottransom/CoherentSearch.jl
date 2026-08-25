@@ -210,3 +210,44 @@ function finterp_fft(lobin::Integer, numbins::Integer, numbetween::Integer,
     # Python: corr[m2*numbetween : (m2+numbins)*numbetween]
     return corr[(m2 * numbetween + 1):((m2 + numbins) * numbetween)]
 end
+
+"""
+    fourier_interpolate(ft::FFTFile, r, m=16) -> ComplexF64
+
+The interpolated complex Fourier amplitude of `ft` at the real-valued Fourier
+frequency `r` (in bins), or **exactly zero** when `r` is not representable by
+the file: past the Nyquist frequency (`r ≥ N/2`), or close enough to either end
+of the stored amplitudes that the `m`-bin kernel window would run off.
+
+This is the one-call form of [`fourier_interp`](@ref): it bundles the range
+checks that every caller has to make, so a search loop can be written as a plain
+`fourier_interpolate(ft, h*r, m)` per harmonic.  Returning zero rather than
+throwing is what the search wants — a harmonic that has run past Nyquist simply
+contributes nothing to the coherent sum, which is how the search degrades
+gracefully at the top of the band (`reference_profiles`,
+`fill_harmonic_row_direct!` and `candidate_profile` all do the same thing, each
+with its own copy of these three inequalities).
+
+Zero is unambiguous in practice: a real amplitude is zero only on a
+measure-zero set, so `iszero` on the result is a reliable "this harmonic was not
+available" test.  A search that needs the count exactly can rely on
+availability being *monotone* in `r` — once one harmonic drops out, every higher
+one does too.
+
+This is the brute-force, per-point kernel: it recomputes the `m` interpolation
+weights for every call.  It is what `bin/toy_coherent_search.jl` and
+[`candidate_profile`](@ref) use, and is *not* what the production search runs —
+`src/directinterp.jl` tabulates those weights once per harmonic and indexes them
+by an exact integer residue, which is the same arithmetic several times faster.
+"""
+function fourier_interpolate(ft::FFTFile, r::Real, m::Integer=16)
+    iseven(m) || throw(ArgumentError("m must be even"))
+    r >= 0 || return zero(ComplexF64)
+    m2 = m ÷ 2
+    # `r_int` is the 0-based bin index, as in the Python original; the kernel
+    # reads the 0-based half-open slice [r_int - m2, r_int + m2).
+    r_int = floor(Int, r + 1e-15) + 1
+    (r_int - m2 >= 0 && r_int + m2 <= length(ft.amps) && r < ft.N / 2) ||
+        return zero(ComplexF64)
+    return fourier_interp(r, ft.amps, m)
+end

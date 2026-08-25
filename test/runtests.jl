@@ -6,4 +6,5 @@ using Test
     include("test_search.jl")
     include("test_candidate.jl")
     include("test_cli.jl")
+    include("test_toy.jl")
 end
