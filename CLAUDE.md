@@ -26,7 +26,9 @@ repeatedly — now with a known mechanism (see the AVX-512 entry below).
 - **`foops`** (laptop) — repo at `/home/sransom/git/CoherentSearch.jl`.
   i7-10510U, Comet Lake, 4 cores / 8 threads, 8 MB L3. **No AVX-512**
   (`avx avx2 fma` only), so `--cpu-target=skylake` is a no-op here. Throttles
-  under sustained load; quote `-t 1`.
+  under sustained load; quote `-t 1`. Pixi env (a Python that can
+  `import coherent_search`, plus riptide's `rseek`):
+  `/home/sransom/python_venvs/pixiPSR/.pixi/envs/default/bin/{python,rseek}`.
 - **`fitzroy`** (workstation) — repo at `/data1/git/CoherentSearch.jl`, *not*
   under `~/git`. `ssh fitzroy` works unattended. Xeon Silver 4114, Skylake-SP,
   2x10 cores, 14 MB L3 per socket, nominal 2.2 GHz. **Has AVX-512.** `perf`
@@ -34,6 +36,11 @@ repeatedly — now with a known mechanism (see the AVX-512 entry below).
   `core_power.lvl{0,1,2}_turbo_license` is available — that is the direct
   license-level counter, better than inferring it from `cycles/ref-cycles`.
   It is Scott's desktop: check `uptime` and top processes before timing.
+  Pixi env: `/data1/environments/pixiPSR/.pixi/envs/default/bin/{python,rseek}`;
+  riptide at `/data1/git/riptide`. **The system `python3` there is too old for
+  `compare/compare_riptide.py`** — run it with the pixi `python`. Neither host
+  has `rseek` on a non-interactive `PATH`, so pass `--rseek <pixi>/bin/rseek`
+  (the script's fallback is the laptop's path only).
 
 ## Architecture essentials
 
@@ -152,23 +159,34 @@ at `../riptide`), not the Python original. Run
 `python3 compare/compare_riptide.py FILE.fft` — it is an *occasional* benchmark
 (~5 min at `--preset bench --repeat 3`), not a dev-loop tool.
 
-**We now beat `rseek` single-threaded on both hosts.** Measured 2026-08-22 on
+**We now beat `rseek` single-threaded on both hosts.** Re-measured **2026-08-24**
+(after the scatter fix and the `:f32` default) on
 `PM0063_034C1_DM445.0_red.fft`, `--preset bench`, both covering **0.1–200 Hz in
 120…20 bins**, median of 3:
 
 | | rseek | ours `-t 1` | ratio | ours, all cores |
 |---|---|---|---|---|
-| i7-10510U (laptop, 4 cores) | 22.25 s | **11.99 s** | **1.84x faster** | 7.77 s `-t 4` |
-| Xeon Silver 4114 (fitzroy, 20 cores) | 19.83 s | **15.79 s** | **1.26x faster** | 3.51 s `-t 20` |
+| i7-10510U (laptop, 4 cores) | 21.13 s | **10.05 s** | **2.13x faster** | 5.20 s `-t 4` |
+| Xeon Silver 4114 (fitzroy, 20 cores) | 19.81 s | **13.45 s** | **1.46x faster** | 2.86 s `-t 20` |
 
-**And we detect more strongly**: the 7.1185 Hz pulsar at S/N 13.27 vs riptide's
-11.80, plus two candidates it does not report. riptide's two extra entries are
-the `f/2` and `2f` of the pulsar, which it does not filter and we collapse.
-**Both of those numbers predate the 2026-08-24 metric change** — the pulsar now
-reads **12.30** on the same config, against a noise floor that fell with it (see
-the metric entry below). Since our S/N is now riptide's statistic exactly, the
-two columns are finally the same quantity and a re-measurement of this table is
-the first thing to do on the next benchmarking pass.
+(2026-08-22, for comparison: laptop 22.25 / 11.99 / 1.84x / 7.77; fitzroy
+19.83 / 15.79 / 1.26x / 3.51. `rseek` itself is reproducible to ~1–5% across the
+two dates, which is the scatter to judge our column against.)
+
+Start-up split, same runs: laptop rseek 1.10 + 19.89 s against ours 0.85 +
+9.01 s (**pure compute 0.45x**); fitzroy rseek 0.79 + 18.74 s against ours
+1.44 + 11.89 s (**0.63x**). On both hosts the pure-compute ratio is at least as
+good as the wall-clock one, so start-up is not what the comparison measures.
+
+**And we detect more strongly**: the 7.1185 Hz pulsar at **S/N 12.30 vs
+riptide's 11.80** (ducy 10.0% against its 6.5% — its width bank is built from
+`bins_min` and cannot reach this pulse at the depth it folded), plus the
+0.2603 Hz candidate at 7.32 that it does not report. riptide's two extra entries
+are the `f/2` and `2f` of the pulsar, which it does not filter and we collapse.
+Both hosts report identical candidates, as they must. **Our S/N is now riptide's
+statistic exactly**, so the two columns are finally the same quantity — but this
+is still one pulsar in one observation, so read §3.2 before drawing any
+sensitivity conclusion from the 0.5 between them.
 
 **This section has read "we are slower" for its whole life and no longer does —
 check the date before quoting it.** The history on the laptop is 29.3 s
@@ -359,6 +377,15 @@ re-deriving them.
   |---|---|---|---|---|---|---|---|---|
   | before 2026-08-22 | 31.9 | 18.3 | 9.4 | 5.4 | 3.3 | 3.2 | 9.9x @20 | 0.059 |
   | after the laptop pass | 22.7 | 12.8 | 6.6 | 4.0 | 2.5 | 2.5 | **9.0x @16** | 0.063 |
+  | **2026-08-24** (scatter fix + `:f32` default) | **11.58** | 6.51 | 3.44 | 1.93 | 1.42 | **1.29** | **9.0x @20** | 0.0646 |
+
+  **The 2026-08-24 row is 1.96x the previous one at `-t 1` and 1.94x at `-t 20`**
+  — the AVX-512 scatter fix plus `:f32` becoming the default. Scaling is
+  unchanged (`s` 0.063 → 0.0646 against a serial baseline that is twice as fast),
+  which is the good outcome: the win was to the parallel part as well as the
+  serial one. CPU-seconds still inflate 62% across the sweep. The plot lives at
+  `docs/thread_scaling.png` and is embedded in the README; regenerate both
+  together, since `bench/thread_scaling.png` is gitignored.
 
   **The laptop pass is worth 1.40x at `-t 1` here** (better than the ~1.24x it
   measured on the laptop) **and 1.26x at `-t 20`** — the win shrinks with thread
@@ -368,9 +395,13 @@ re-deriving them.
   (`_BC_BATCH` 32 → 64, since 64 → 128) and the interpolator's weight table
   (395 KB → 1.45 MB, shared read-only). CPU-seconds inflate 62% over the span,
   the same memory-stall term as before, not a code defect.
-  - **`-t 20` is no longer faster than `-t 16`** (2.54 vs 2.52 s). This is a
-    dual-socket box (2×10 cores, 14 MB L3 *per socket*); past 16 threads the
-    marginal core is buying less than the cross-socket traffic costs.
+  - **RESOLVED 2026-08-24: `-t 20` IS faster than `-t 16` again** (1.29 vs
+    1.42 s, a clean 9% on the full sweep). The 2026-08-22 reading of 2.54 vs
+    2.52 s was inside that day's scatter, and the `:f32`/AVX-512 investigation
+    separately failed to reproduce its own `-t 20` anomaly. This is still a
+    dual-socket box (2×10 cores, 14 MB L3 *per socket*) and the marginal core
+    past 16 threads is worth less than a linear one — 8.15x → 9.00x for a 25%
+    thread increase — but it is not negative. **Do not re-quote the old claim.**
   - The desktop carries ~2 cores of its own load (Chrome, Zoom), which is worth
     remembering before reading too much into the top of the curve.
 - **Done (2026-07):** quickselect median in `_profile_snr` (was 41% of runtime →
@@ -979,7 +1010,9 @@ re-deriving them.
     same day these are 1.220x and 1.268x, i.e. monotone. That earlier `-t 20`
     point was scatter, not a cross-socket or licensing effect — **do not build on
     it.** For the same reason the recorded "`-t 20` is no longer faster than
-    `-t 16`" needs re-checking: `:f64` here is 1.84 s at 16 and 1.75 s at 20.
+    `-t 16`" needed re-checking: `:f64` here is 1.84 s at 16 and 1.75 s at 20,
+    and the full 2026-08-24 sweep confirms 1.42 vs 1.29 s. That claim is now
+    retired — see the scaling table above.
 - **Done (2026-08-22, workstation): `Float32` interpolation weights are now the
   DEFAULT, and the old "1.64x SLOWER" verdict was not merely void but backwards.**
   That verdict blamed the per-trial cross-lane reduce; the trials-axis kernel

@@ -327,42 +327,48 @@ fmax     = 1 / Pmin        hifreq   = fmax / maxdecim   (our fundamental range;
 0.1–200 Hz in 120…20 bins. `Pmin` defaults to `tsamp * bmin`, riptide's own
 floor, so both run the widest band the data support.
 
-Measured 2026-08-22 on `PM0063_034C1_DM445.0_red.fft` (T=2097 s, 4-core
-i7-10510U laptop), `--preset bench`, both covering 0.1–200 Hz, median of 3:
+Measured **2026-08-24** on `PM0063_034C1_DM445.0_red.fft` (T=2097 s),
+`--preset bench`, both covering 0.1–200 Hz, median of 3, on both development
+machines:
 
-| | wall (s) | cores |
-|---|---|---|
-| `rseek` | 22.25 | 1.04 |
-| `coherent_search -t 1` | **11.99** | 1.03 |
-| `coherent_search -t 4` | 7.77 | 3.55 |
+| | `rseek` | ours `-t 1` | like-for-like | ours, all cores |
+|---|---|---|---|---|
+| i7-10510U (laptop, 4 cores) | 21.13 s | **10.05 s** | **2.13× faster** | 5.20 s (`-t 4`) |
+| Xeon Silver 4114 (20 cores) | 19.81 s | **13.45 s** | **1.46× faster** | 2.86 s (`-t 20`) |
+
+The two hosts differ by more than any single optimisation in the code, so quote
+the machine and the date with the ratio.
 
 The harness also splits start-up from searching, so the obvious objection —
 that this is really measuring Julia's start-up — is answered on every run. It
 is not; if anything start-up works against us, since ours is the larger of the
-two and we win anyway.
+two on the workstation and we win anyway.
 
-| | start-up | searching | wall |
+| | start-up | searching | pure-compute ratio |
 |---|---|---|---|
-| `rseek` | 0.46 s (Python import) | 21.54 s | 22.00 s |
-| ours `-t 1` | 0.95 s (boot + JIT + FFTW plans) | 11.03 s | 11.98 s |
+| `rseek` (laptop) | 1.10 s (Python import) | 19.89 s | |
+| ours `-t 1` (laptop) | 0.85 s (boot + JIT + FFTW plans) | 9.01 s | **0.45×** |
+| `rseek` (Xeon) | 0.79 s | 18.74 s | |
+| ours `-t 1` (Xeon) | 1.44 s | 11.89 s | **0.63×** |
 
-so the pure-compute ratio (0.51×) is a shade better than the wall-clock ratio
-(0.54×). Note that riptide's `find_peaks` is 9.9 s — 46% of its compute — and is
-a separate pass doing candidate work we do inline; comparing our figure against
-its `ffa_search` (11.1 s) alone would be wrong.
+so on both hosts the pure-compute ratio is at least as good as the wall-clock
+one. Note that riptide's `find_peaks` is 9.5 s on the laptop — 48% of its
+compute — and is a separate pass doing candidate work we do inline; comparing
+our figure against its `ffa_search` alone would be wrong.
 
-**Single-threaded we are ~1.8× faster, while doing ~2.8× the folds** — the
+**Single-threaded we are 1.5–2.1× faster, while doing ~2.8× the folds** — the
 harness prints that work ratio before it times anything, because the two numbers
 have to be read together. We fold every frequency below `hifreq` once per
 decimation factor, where `rseek` folds it exactly once; that redundancy is our
-harmonic-sum ladder and it is what buys the sensitivity below. Quote the ratio
-with the host and date: this laptop throttles, and the same comparison on a
-20-core Xeon workstation reads differently.
+harmonic-sum ladder and it is what buys the sensitivity below.
 
-**We also detect the 7.1185 Hz pulsar more strongly: S/N 13.27 vs 11.80**, and we
-find two candidates it does not. riptide's two extra entries are the `f/2` and
-`2f` of the pulsar, which it does not filter and we collapse by default
-(`--noharmremove` for a like-for-like count).
+**We also detect the 7.1185 Hz pulsar more strongly: S/N 12.30 vs 11.80** (at a
+10.0% duty cycle against riptide's 6.5% — its width bank is built from
+`bins_min`, so it cannot reach this pulse's width at the depth it folded), and
+we find a candidate it does not (0.2603 Hz at S/N 7.32). riptide's two extra
+entries are the `f/2` and `2f` of the pulsar, which it does not filter and we
+collapse by default (`--noharmremove` for a like-for-like count). Both hosts
+report identical candidates, as they must — the search is deterministic.
 
 For a pure algorithm-vs-algorithm timing at *equal* work, use `--preset matched`,
 which runs one fold depth on each side and equalises the work to a few percent.
@@ -372,11 +378,38 @@ the obvious-looking choice — has us search 6× riptide's band and reports us a
 2.1× slower, which is an artefact of the mismatch, not a result.
 
 The threading axis is ours alone rather than a like-for-like win: riptide's C
-extension is built without OpenMP, so `rseek` cannot use more cores.
+extension is built without OpenMP, so `rseek` cannot use more cores. Measured on
+the 20-core workstation with `bench/thread_scaling.jl`, which times only the
+*warm in-process* search so that the fixed start-up cost does not contaminate
+the fit:
 
-Reading the output: the two S/N values are *different statistics* (time-domain
-matched filter vs coherent Fourier boxcar) and only roughly comparable. The duty
-cycles are defined identically on both sides and are the quantity to compare.
+![Thread scaling on a 20-core Xeon Silver 4114](docs/thread_scaling.png)
+
+| threads | 1 | 2 | 4 | 8 | 16 | 20 |
+|---|---|---|---|---|---|---|
+| wall (s) | 11.58 | 6.51 | 3.44 | 1.93 | 1.42 | 1.29 |
+| speedup | 1.00× | 1.78× | 3.37× | 6.00× | 8.15× | **9.00×** |
+
+The Amdahl fit gives a serial fraction of 0.065 (ceiling 15.5×). The right-hand
+panel is the part worth reading: CPU-seconds for *identical* work inflate 62%
+across the sweep, which is memory-stall and clock-throttle time, not a code
+defect — and on a dual-socket box past 16 threads the marginal core is also
+paying for cross-socket traffic. Production searches are often run as one
+single-threaded process per DM, in which case the `-t 1` CPU-seconds column
+governs throughput rather than this curve.
+
+Reading the output: **the two S/N values are the same statistic** as of
+2026-08-24 — both are the peak of riptide's zero-mean unit-L2 boxcar matched
+filter (`cpp/snr.hpp:snr1`), verified against the `rseek` binary itself to
+1.4e-7 on identical profiles. What still differs is the *profile* each is
+computed on (our coherent Fourier fold vs riptide's time-domain FFA fold) and
+the σ̂ estimate, so a residual S/N gap is a statement about the folds, not about
+the detector. Duty cycles are defined identically on both sides too.
+
+One pulsar in one observation says nothing about relative *sensitivity*, and the
+single-detection scatter is much larger than the gap above; that question is
+settled by the injection Monte Carlo described in `Summary_and_Future_Work.md`
+§3.2, not by this table.
 
 ## Testing
 
