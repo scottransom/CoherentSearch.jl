@@ -66,7 +66,12 @@ BENCHDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # First positional argument selects the script to run; default the probe.
 SCRIPT="${1:-$BENCHDIR/gpu_probe.jl}"
 [ -f "$SCRIPT" ] || SCRIPT="$BENCHDIR/$(basename "$SCRIPT")"
-PROBE="${PROBE:-$SCRIPT}"
+# NOT `${PROBE:-$SCRIPT}`.  `PROBE` is a generic name, and honouring an inherited
+# one meant a stray `PROBE` in the caller's environment silently replaced the
+# script being run -- which surfaced as "probe script not found at <a directory>"
+# with nothing to connect it to the cause.  The positional argument above is the
+# override; the environment is not.
+PROBE="$SCRIPT"
 # A checkout looks like <repo>/bench/this-script, with <repo>/Project.toml naming
 # the package.
 REPO="$(dirname "$BENCHDIR")"
@@ -78,7 +83,14 @@ else
 fi
 JULIA_VERSION="${JULIA_VERSION:-1.12.7}"
 
-[ -f "$PROBE" ] || { echo "error: probe script not found at $PROBE" >&2; exit 1; }
+if [ ! -f "$PROBE" ]; then
+    echo "error: probe script not found at $PROBE" >&2
+    echo "  this script lives in : $BENCHDIR" >&2
+    echo "  requested script     : ${1:-<none: defaulted to gpu_probe.jl>}" >&2
+    echo "  repo detected        : ${REPO:-<none>}" >&2
+    echo "  Run it from a checkout, or pass a path: ./gpu_probe_setup.sh bench/gpu_probe.jl" >&2
+    exit 1
+fi
 
 echo "== host: $(hostname)  prefix: $PREFIX"
 if command -v nvidia-smi >/dev/null 2>&1; then

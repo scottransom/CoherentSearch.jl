@@ -2363,6 +2363,38 @@ Three fixes:
 - Nothing was done to the repo checkouts themselves; `git checkout --
   Project.toml Manifest.toml` is Scott's to run.
 
+**A second bug, found because the first fix did not unblock him.**
+`gpu_probe_setup.sh` failed on `hypatia` with
+
+```
+error: probe script not found at /users/sransom/git/CoherentSearch.jl/bench
+```
+
+— a path that is a *directory*, which no line of the script constructs. The
+cause: `PROBE="${PROBE:-$SCRIPT}"`. `PROBE` was an undocumented internal
+variable, and `${PROBE:-...}` honours an inherited one, so a stray `PROBE` in
+the caller's environment silently replaced the script being run. It is a generic
+enough name to collide with anything. The positional argument was already the
+documented override, so the environment knob was pure footgun: it is now
+`PROBE="$SCRIPT"`, and the guard prints `BENCHDIR`, the requested script and the
+detected repo so the next such failure explains itself.
+
+**Reproduced both ways on `fitzroy` before and after** — with `PROBE` exported to
+a directory the old script died exactly as Scott's did and the new one ignores
+it, and a genuinely bad argument now names all three values. This is §4.11's
+"validate a script to its last line of output" again, one level down: the guard
+*worked*, and was useless because it printed a value without printing where the
+value came from.
+
+**And a warning about the diagnosis above it.** The shared checkout at
+`/users/sransom/git/CoherentSearch.jl` — the one visible from `fitzroy` and
+`usnea` — was still at `21fa9fe` with `Project.toml` modified while Scott
+reported his `hypatia` tree clean and pulled. So **`hypatia` does not share that
+`$HOME`**, and the shared-Manifest story, though real for `fitzroy`/`usnea`, is
+not established as the cause of `hypatia`'s CUDA precompile failure. That one is
+still open. The `PREFIX` and README fixes stand on their own merits; do not
+record them as having explained `hypatia`.
+
 **One hypothesis was tested and REFUTED, which is why it is not in the fix.** The
 polluted `Project.toml` leaves `CUDA` in `[deps]` while `[extensions]` still
 names it as the trigger for `CoherentSearchCUDAExt`, and an extension trigger
