@@ -362,9 +362,13 @@ two 48-SM cards tie to 3.9% while differing 1.8x in FP32, 1.8x in bandwidth and
 10x in L2; `--blocksize` is a per-device parameter worth 1.2-2.3x and the cards
 want opposite ends of the range. The **transform is the largest phase on every
 card measured** (31-38.5%) — the predicted drop to ~18% did not happen, which is
-why **per-rung transform sub-batching** (§4.9, `gpu_subbatch!`) is the live item:
-bit-exact, self-disabling on a small-L2 card, and predicted at **1.25x on the
-Ada**, unscored until that card is re-run. The GPU report now labels phases
+why **per-rung transform sub-batching** (§4.9) was tried. **It is SCORED and it
+is 1.000x on all three cards** (§4.10): the mechanism works (1.166x at blocksize
+262144 on the Ada) but the Ada's optimum blocksize is 16384, where it does not
+engage, and the other two cards' gates decline. Its value is robustness — the
+Ada's blocksize cliff falls 1.21x -> 1.06x. **The 1.25x prediction was wrong in
+direction (0.960x), because §4.8's non-transform decomposition had the wrong
+sign; do not re-use that column.** The GPU report now labels phases
 `:device`/`:transfer`/`:host` — **`scan` is host-CPU work and moved 1.75x between
 two hosts**, so classify a card on the device column only. `bench/gpu_probe_setup.sh` classifies a new host in
 one command. **fitzroy's GPU drives Scott's desktop — prefer another host for

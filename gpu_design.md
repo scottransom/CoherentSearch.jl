@@ -1376,6 +1376,15 @@ for everyone else. **The 2080 Super is the control and comes out at exactly
 carries into the search, and finding (3) above says the *magnitude* does not.
 Treat 1.25x as an upper bound to be tested, not a result.
 
+**TESTED 2026-08-25 AND REFUTED — see §4.10. The sign of the non-transform term
+is wrong on the Ada.** Sub-batching now measures the transform's blocksize
+dependence directly instead of importing the probe's shape, and what is left
+over says the Ada's non-transform phases are **flat to slightly worse** at
+262144, not 1.42x better. The 1.25x became **0.960x**. The 2080 Super row
+survives (its non-transform really does improve with blocksize); the Ada row was
+an artefact of anchoring on the probe. **Do not re-use this table's
+`non-transform` column for the Ada.**
+
 #### Refined pre-registration for the RTX A4000 (sm_86)
 
 §0.5's predictions stand; these are the search-level ones the two runs above now
@@ -1485,9 +1494,12 @@ absolute wall clocks landing again — the target *sweep* shape (204 / 145 / 134
 131 / 138 ns/trial over 0.125–2.0x L2) is real and useful, the difference between
 its floor and the unsplit arm is not.
 
-The useful negative result: **a forced split is not HARMFUL on a small-L2 card**,
-merely useless. So the gate is protecting against nothing measurable, and if the
-Ada result argues for widening it, that can be done without fear.
+~~The useful negative result: a forced split is not HARMFUL on a small-L2 card,
+merely useless, so the gate is protecting against nothing measurable.~~
+**WRONG, and overturned the same day by the RTX 2080 Super — see §4.10.** On a
+quieter host the same sweep is monotone and a forced split is a real regression:
+**8.7% at the `:auto` target and 34% at 0.125x L2.** The gate is worth those.
+The 1080's scatter was hiding it.
 
 #### Pre-registered, for the RTX 4000 SFF Ada
 
@@ -1515,6 +1527,113 @@ standalone transform sweep's *shape* on the measured in-search transform and
 subtracting. §4.8 established that the probe's *magnitude* does not carry into
 the pipeline. So 1.25x is an upper bound to be tested, and 1.10x would still be
 the largest single GPU win found since stage 2.
+
+
+### 4.10 Sub-batching scored — the mechanism works, the premise it was built on does not
+
+Both cards run 2026-08-25, `bench/gpu_subbatch_bench.jl` on `NGC6624`.
+**§4.9's central prediction was wrong in direction, and the reason is that
+§4.8's decomposition had a sign error that only sub-batching itself could
+expose.**
+
+| ns/trial, NGC6624 | blocksize 16384 | blocksize 262144 |
+|---|---|---|
+| **RTX 4000 SFF Ada** `:off` | **41.0** | 49.8 |
+| **RTX 4000 SFF Ada** `:auto` | 40.3 *(no split — see below)* | **42.7** |
+| **RTX 2080 Super** `:off` | 53.1 | **43.5** |
+| **RTX 2080 Super** `:auto` | 53.1 *(no split)* | 43.6 *(no split)* |
+
+#### The predictions
+
+1. **`:auto` splits at every rung on the Ada — HIT.** 13 x 20165, 7 x 37450,
+   5 x 52429, 4 x 65536, 3 x 87382, 3 x 87382, working sets 14.0–18.6 MB.
+2. **"Blocksize 262144 with `:auto` beats 16384 with `:off` by ~1.25x" — MISS,
+   and in the wrong direction: 0.960x.** Predicted 32.7 ns/trial, measured 42.7.
+3. **`:auto` at each card's own best blocksize is worth 1.000x on all three
+   cards.** This is §4.9's outcome 3, and it says drop or demote, not tune.
+4. **Target sweep minimum near 0.5x L2 — HIT.** The Ada reads 44.3 / **42.5** /
+   42.6 / 43.9 / 48.7 at 0.125–2.0x, a flat 0.25–0.5x plateau. `_SUB_L2_FRACTION
+   = 0.5` is within 0.2% of the best and needs no change.
+5. **The 2080 Super is a 1.00x control — HIT exactly.** `:auto` declined to
+   split at both blocksizes, and the arms agree to 0.02%.
+
+#### The mechanism works; it is the motivation that was wrong
+
+Sub-batching does precisely what it was designed to do. On the Ada at 262144 it
+takes the transform stage from 49.8 to **42.7 ns/trial — 1.166x**, recovering
+**7.1 of the 8.8 ns/trial** blocksize penalty (81% of it). The idea is sound and
+the implementation delivers.
+
+**But the Ada's optimum blocksize is 16384, where the policy does not engage at
+all** — at `Nprof = 16384` every rung's L2-sized batch is already ≥ the whole
+chunk, so `_sub_cols` returns `Nprof` and there is nothing to split. So the
+shipped benefit is **1.000x on every card measured**: on two of them the gate
+declines, and on the third the operating point is below where splitting begins.
+
+**§4.9's premise came from §4.8 finding (c), and that finding is refuted.** It
+claimed the non-transform phases are 1.42x better at 262144 than at 16384 on the
+Ada — derived by subtracting a *modelled* transform (the standalone probe's
+shape) from the measured sweep. Sub-batching lets that be measured instead: with
+the transform's blocksize dependence removed, the Ada reads 40.3 at 16384 and
+42.7 at 262144, so the non-transform phases are **flat to slightly worse** at the
+large end. **The model had the sign wrong**, and it produced a confident 1.25x
+from it. The 2080 Super's row survives — there the large blocksize genuinely wins
+1.222x — so the two cards differ in the non-transform phases' response to
+blocksize, not just the transform's. That is consistent with §0.46's second
+explanation: on 40 MB of L2 a *small* chunk makes the whole pipeline resident,
+not merely the transform, so the Ada wants small everywhere.
+
+#### An accidental scatter calibration, and it is the most useful number here
+
+Because `:auto` produces **no split at all** at blocksize 16384 on the Ada and at
+either blocksize on the 2080 Super, four of the eight headline rows are *the same
+code path run twice*. They read 41.0 vs 40.3 (Ada, **1.7%**) and 53.1 vs 53.1 /
+43.5 vs 43.6 (2080 Super, **0.02% and 0.2%**). So this harness is reproducible to
+a few tenths of a percent on `spare2` and to ~1.7% on `hypatia` — which retires
+the Ada's apparent "1.017x at 16384" as noise, and sets the bar any future claim
+on these hosts has to clear. **Two identical arms in a benchmark are worth the
+run time.**
+
+#### The gate earned its keep, which §4.9 doubted
+
+§4.9 recorded, from the GTX 1080, that a forced split "is not harmful, merely
+useless". **The 2080 Super overturns that on a quieter host**: forced splits are
+monotone and always worse than unsplit — 58.2 / 49.4 / 47.3 / 45.3 / 45.2 against
+43.5 — so at the `:auto` target the gate is preventing an **8.7% regression**, and
+at 0.125x L2 a **34%** one. The 1080's ±7–49% scatter was hiding a real effect,
+which is this file's standing rule landing yet again.
+
+**And the cost is per-launch overhead, linear and measurable.** Penalty divided
+by extra transform launches, over the 2080 Super's four resolvable points:
+
+| target | blocks/chunk | extra launches | penalty | µs per launch |
+|---|---|---|---|---|
+| 0.125x L2 | 1206 | 483,600 | 1.551 s | **3.21** |
+| 0.25x L2 | 606 | 241,800 | 0.623 s | **2.57** |
+| 0.5x L2 | 306 | 120,900 | 0.401 s | **3.32** |
+| 1.0x L2 | 153 | 59,241 | 0.190 s | **3.21** |
+
+**~3.2 µs per launch, flat across a 16x span of block count.** That also explains
+why the Ada tolerates its split and the 2080 Super would not: the L2-derived
+policy gives the Ada **35 blocks per chunk** against the 2080 Super's would-be
+306, because a 40 MB target needs an order of magnitude fewer blocks to reach.
+The gate and the block count are the same fact seen twice.
+
+#### What the code is now worth, and the decision it needs
+
+Peak throughput on all three cards is **unchanged**. What sub-batching buys is
+**robustness to a badly-chosen `--blocksize` on a big-L2 card**: the Ada's cliff
+between its best and worst sweep point falls from **1.21x to 1.06x**. A user who
+does not sweep — which is every user who is not classifying a card — loses much
+less by guessing wrong.
+
+That is a real but modest property, and it is Scott's call whether it is worth
+carrying ~80 lines, a struct, a knob and 60 tests, against this file's explicit
+retirement discipline. **Keeping it** is defensible on the robustness argument
+plus the fact that a future card with big L2 *and* a large optimal blocksize
+would need it, and it is bit-exact and self-disabling so it can never cost
+anything. **Reverting it** is defensible because it is inert on every card that
+exists here today. It should not be described as a speed win either way.
 
 
 ---
