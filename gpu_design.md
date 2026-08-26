@@ -2386,14 +2386,39 @@ it, and a genuinely bad argument now names all three values. This is §4.11's
 *worked*, and was useless because it printed a value without printing where the
 value came from.
 
-**And a warning about the diagnosis above it.** The shared checkout at
-`/users/sransom/git/CoherentSearch.jl` — the one visible from `fitzroy` and
-`usnea` — was still at `21fa9fe` with `Project.toml` modified while Scott
-reported his `hypatia` tree clean and pulled. So **`hypatia` does not share that
-`$HOME`**, and the shared-Manifest story, though real for `fitzroy`/`usnea`, is
-not established as the cause of `hypatia`'s CUDA precompile failure. That one is
-still open. The `PREFIX` and README fixes stand on their own merits; do not
-record them as having explained `hypatia`.
+#### The topology: `/users/sransom` is TWO filesystems, and that is the whole trap
+
+The path is identical on all four hosts and the filesystem is not (Scott,
+2026-08-26):
+
+| site | NFS `/users/sransom` shared by | their GPUs |
+|---|---|---|
+| Charlottesville | **`fitzroy`**, **`usnea`** | GTX 1080 / 2x RTX A4000 |
+| Green Bank | **`hypatia`**, **`spare2`** | RTX 4000 SFF Ada / RTX 2080 Super |
+
+So `$HOME/.gpuprobe` names **two** environments across four hosts, **each shared
+by a pair of machines with different cards** — which is exactly the condition
+that breaks a CUDA install, and it is invisible because every host prints the
+same path.
+
+**This resolves a caveat I wrote and got backwards.** I had noticed that the
+shared checkout visible from `fitzroy` and `usnea` was still at `21fa9fe` while
+Scott reported his `hypatia` tree clean and pulled, concluded "`hypatia` does not
+share that `$HOME`", and downgraded the shared-Manifest story to "not established
+as the cause". The premise was right and the conclusion was wrong: `hypatia`
+does not share with `usnea`, it shares with **`spare2`** — a different card
+again. **The mechanism is live for `hypatia`, just with the other partner.**
+`spare2` and `hypatia` were both probed for §4.8 out of the same Green Bank
+home, so one Manifest has been serving an sm_75 and an sm_89 card throughout.
+
+**The fix, since `PREFIX` deriving from the depot does not cover it.** If a pair
+of hosts shares a home *and* a depot, they derive the same `PREFIX` and still
+collide. So the script now **stamps the GPU name into the environment and warns
+when it changes**, naming both cards and both hosts. The discriminator is the
+GPU, not the hostname, so the air-gapped login-node workflow in the script header
+does not warn spuriously — a login node has no GPU and leaves the stamp alone.
+Tested on `fitzroy` in all four cases: fresh env, same card twice, a simulated
+`spare2`-then-`hypatia` collision, and a node with no `nvidia-smi`.
 
 **One hypothesis was tested and REFUTED, which is why it is not in the fix.** The
 polluted `Project.toml` leaves `CUDA` in `[deps]` while `[extensions]` still

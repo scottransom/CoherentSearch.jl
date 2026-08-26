@@ -133,6 +133,44 @@ fi
 ENVDIR="$PREFIX/env"
 mkdir -p "$ENVDIR"
 echo "== depot: ${JULIA_DEPOT_PATH:-$HOME/.julia}  (CUDA artifacts are ~2.2 GB)"
+
+# Warn when TWO DIFFERENT CARDS end up sharing one environment, which is the
+# condition that actually breaks things: the env holds a Manifest.toml, and a
+# Manifest pins the exact CUDA_Runtime_jll and artifact versions the depot must
+# contain -- a choice made from the host's driver and card.  Two GPUs, one
+# Manifest, and whoever installed last wins.
+#
+# This is easy to walk into without noticing, because the same $HOME PATH can be
+# two different filesystems: Scott's `/users/sransom` is one NFS home shared by
+# `fitzroy` and `usnea` in Charlottesville and a DIFFERENT one shared by
+# `hypatia` and `spare2` in Green Bank -- so `$HOME/.gpuprobe` names two
+# environments across four hosts, each shared by a pair with different cards.
+#
+# The discriminator is the GPU NAME, not the hostname, so that the air-gapped
+# login-node workflow in the header does not warn spuriously: a login node has
+# no GPU and simply leaves the stamp alone.
+GPUSTAMP="$ENVDIR/.gpu-stamp"
+THISGPU=""
+if command -v nvidia-smi >/dev/null 2>&1; then
+    THISGPU="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true)"
+fi
+if [ -n "$THISGPU" ]; then
+    if [ -f "$GPUSTAMP" ]; then
+        WASGPU="$(cat "$GPUSTAMP" 2>/dev/null || true)"
+        WASHOST="$(cat "$ENVDIR/.host-stamp" 2>/dev/null || echo '?')"
+        if [ -n "$WASGPU" ] && [ "$WASGPU" != "$THISGPU" ]; then
+            echo "== WARNING: this environment was last installed for a DIFFERENT GPU" >&2
+            echo "==   env      : $ENVDIR" >&2
+            echo "==   was      : $WASGPU  (on host $WASHOST)" >&2
+            echo "==   now      : $THISGPU  (on host $(hostname -s))" >&2
+            echo "==   Two cards sharing one Manifest.toml is how CUDA precompiles start" >&2
+            echo "==   failing on a missing .so.  Give each machine its own environment:" >&2
+            echo "==     PREFIX=<host-local dir>/gpuprobe $0" >&2
+        fi
+    fi
+    printf '%s\n' "$THISGPU" > "$GPUSTAMP"
+    printf '%s\n' "$(hostname -s)" > "$ENVDIR/.host-stamp"
+fi
 if [ "$HAVE_REPO" = 1 ]; then
     echo "== repo detected at $REPO; adding CUDA + CoherentSearch (dev) to $ENVDIR"
     echo "== (ONE-TIME: ~4-6 min of precompilation, more on NFS.  It is not hung.)"

@@ -568,7 +568,9 @@ export JULIA_DEPOT_PATH=/fast/local/depot
 ```
 
 **If you use more than one GPU machine, give each its own environment, and put
-it next to that machine's depot.** The environment holds a `Manifest.toml`, and
+it next to that machine's depot.** Watch for a shared `$HOME` in particular — and
+note that the same home *path* on two machines is not proof they share, nor
+proof they do not. The environment holds a `Manifest.toml`, and
 a Manifest pins the exact `CUDA_Runtime_jll` and artifact versions the depot has
 to contain — a choice that depends on the host's driver and card. Put one
 environment on a shared NFS `$HOME` and two machines will fight over it: whoever
