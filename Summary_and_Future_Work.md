@@ -83,7 +83,8 @@ Following `coherent_search_design.md`, the production search is structured as
 three nested loops, with parallelism at the *outermost* one:
 
 - **Loop #1 — chunks (parallel).** The fundamental-frequency range is cut into
-  chunks of `Nprof` trial fundamentals (`blocksize`, default 2048). Chunks are
+  chunks of `Nprof` trial fundamentals (`blocksize`, default 2048 on the CPU —
+  the GPU backend defaults to 65536, see `gpu_design.md` §4.13). Chunks are
   independent and are distributed round-robin across `nthreads()` tasks with
   `Threads.@spawn`; each task owns one private `Workspace`, so there is no shared
   mutable state and no `threadid()` indexing (robust under task migration).

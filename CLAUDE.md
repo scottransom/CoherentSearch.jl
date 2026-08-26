@@ -386,9 +386,10 @@ deriving it was DECLINED (§4.11) and the A100 refutes the fitted
 `0.5 x L2 / 2912 B` rule by a factor of 32 (predicts 6868 for its 40 MB of L2,
 measures 262144, because occupancy on 108 SMs beats L2 residency). 65536 is
 within **1.14x** of the optimum on all six cards. **The one card it costs
-anything is the RTX 4000 SFF Ada — pass `--blocksize 8192` there** (1.13x). Instead `gpu_search_report.jl` sweeps from 2048 and *recommends*,
-`--gpu` warns when the default is left in place, and the README has a GPU
-section. The governing rule, Scott's: **automate what can't hurt, measure what
+anything is the RTX 4000 SFF Ada — pass `--blocksize 8192` there** (1.13x).
+`gpu_search_report.jl` still sweeps from 2048 and *recommends*, reporting the
+penalty against the GPU default; `--gpu` prints the default it used and warns
+only on an explicit `--blocksize <= 2048`; and the README has a GPU section. The governing rule, Scott's: **automate what can't hurt, measure what
 can't be guessed.** **Throughput mode is fixed (§4.6):** `GPUChunk`/
 `GPUInterpPlan` are cached across files and `CUDA.reclaim()` moved to
 `release_backend!` (once per invocation, called by `main`) — marginal cost
