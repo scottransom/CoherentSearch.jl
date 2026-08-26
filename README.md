@@ -584,12 +584,12 @@ node that shares the filesystem, then run on the GPU node with the same
 environment and `JULIA_DEPOT_PATH` — that case is fine, because it really is one
 machine's worth of hardware.
 
-### Tune `--blocksize` for your card — it is worth up to 1.14x over the default
+### Tune `--blocksize` for your card — it is worth up to ~1.2x over the default
 
 **Not urgent any more, but still worth one run.** `--blocksize` (trial
 fundamentals per chunk) defaults to **65536 under `--gpu`** and 2048 on the CPU;
 the two backends want values 32x apart. 65536 is one constant chosen for its
-worst case — it is within **1.14x** of the optimum on all six cards we have
+worst case — it is within **~1.2x** of the optimum on the cards we have
 measured, spanning 6 to 108 SMs and 1 to 40 MB of L2 — and it is not a per-device
 rule, because the optimum is *not* predictable from the hardware: the A100 and
 the RTX 4000 Ada have the same 40 MB of L2 and want opposite ends of a 32x range.
@@ -625,7 +625,7 @@ Measured optima: RTX 4000 Ada 8192, RTX A4000 131072, RTX 2080 Super 262144,
 GTX 1080 262144, A100 262144, RTX A400 65536 or above (its sweep was capped by
 device memory). **If you are on an RTX 4000 SFF Ada, pass `--blocksize 8192`** —
 it is the one measured card the 65536 default costs anything worth having
-(1.13x).
+(1.22x).
 
 ### What the GPU path does and does not support
 

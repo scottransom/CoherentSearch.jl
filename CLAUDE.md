@@ -391,8 +391,11 @@ DRAM, impossible from memory — so residency is worth **2.32x** to it; the A100
 has the same 40 MB but 1683 GB/s of DRAM, never exceeds it, and is instead
 **2.21x** worse at the SMALL end because 108 SMs cannot be filled. Two
 mechanisms, opposite directions, near-equal size. 65536 is
-within **1.14x** of the optimum on all six cards. **The one card it costs
-anything is the RTX 4000 SFF Ada — pass `--blocksize 8192` there** (1.13x).
+within **1.22x** of the optimum on the cards measured. **The one card it costs
+anything real is the RTX 4000 SFF Ada — pass `--blocksize 8192` there**, and
+that penalty GREW from 1.13x to **1.22x** once the overlap landed, because the
+overlap helps small chunks most and so sharpens a card that already wanted them
+(§4.13). The other five sweeps are pre-overlap; the bound is provisional.
 `gpu_search_report.jl` still sweeps from 2048 and *recommends*, reporting the
 penalty against the GPU default; `--gpu` prints the default it used and warns
 only on an explicit `--blocksize <= 2048`; and the README has a GPU section. The governing rule, Scott's: **automate what can't hurt, measure what

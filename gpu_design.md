@@ -2017,7 +2017,7 @@ already contain a constant that is safe on all six cards.** Cost of a flat
 | GTX 1080 | ~140 ns/tr (interp.) | 136.1 | ~1.03x |
 | RTX A4000 | 5.731 s | 5.476 | 1.05x |
 | RTX 2080 Super | 45.5 ns/tr | 42.3 | 1.08x |
-| RTX 4000 SFF Ada | 42.9 ns/tr | 37.9 | 1.13x |
+| RTX 4000 SFF Ada | 42.9 ns/tr | 37.9 | 1.13x *(re-measured post-overlap: **1.22x**)* |
 | **A100 80GB** | 2.265 s | 1.990 | **1.14x** |
 
 **Worst case 1.14x, across 6–108 SMs and 1–40 MB of L2, against 1.37–5.55x
@@ -2502,6 +2502,60 @@ weaker — and §4.11/§4.12 killed one fitted rule already. The rule that fits 
 six cards is *a card wants a small chunk only if its L2 both holds a rung's
 workset and materially out-runs its DRAM*, which is one card out of six. Scott's
 call stands: measure it, and let `gpu_search_report.jl` recommend.
+
+#### The Ada re-measured with the overlap: 37.9 -> 29.5 ns/trial, and the `--blocksize` bound moves
+
+First card report taken with the load average on the record (`hypatia`, 64
+cores, load 12.42 — 19%, so the new busy-host warning correctly did not fire).
+Same file, same card, same `--blocksize 8192`, **135 candidates and the same
+top five**:
+
+| | §4.11 (pre-overlap) | 2026-08-26 | |
+|---|---|---|---|
+| best blocksize | 8192 | **8192** | unchanged |
+| clean total | 3.994 s | **3.117 s** | **1.28x** |
+| ns/trial | 37.9 | **29.5** | |
+| vs fitzroy `-t 20` (11.82 s) | 2.96x | **3.79x** | |
+
+**Do not read the 1.28x as the overlap's value on this card — it is not a
+controlled A/B.** The §4.11 run was taken on an unknown load through a CUDA
+environment that has since been rebuilt. The defensible statement is that the
+Ada's best figure is now 29.5 ns/trial. For what the overlap is worth, the
+controlled measurement is `fitzroy`'s worktree A/B (1.205x at 131072) and the
+one Scott's 220-file run will give.
+
+That said, the phase table bounds it: `download` + `scan` are **11.9%** of the
+instrumented total, so hiding them entirely is **1.135x**, and the observed
+1.28x is larger than the host term can explain. The remainder is load, the
+rebuilt environment, or both.
+
+**The device ranking from §4.11 holds and sharpens.** Device-only shares:
+boxcar **27.9%**, transform 27.1%, interp 23.9%, transpose 16.0%, zero 5.1% —
+so the boxcar is still the largest device phase on this card, as §4.12 found on
+the A100. Optimise the boxcar.
+
+**And a claim of mine needs weakening.** I argued for `GPU_DEFAULT_BLOCKSIZE =
+65536` on the grounds that it is within **1.14x** of the optimum on all six
+cards. On the Ada that figure has moved to **1.22x** (3.797 s against 3.117 s),
+and the mechanism is the overlap itself:
+
+| Ada sweep spread (best..worst, excluding 2048) | |
+|---|---|
+| §4.11, pre-overlap | 37.9 → 44.5 ns/trial, **1.17x** |
+| today, with overlap | 29.5 → 36.4 ns/trial, **1.23x** |
+
+**The overlap helps small chunks most** — 8192 means 12,881 chunks against
+262144's 402, so there is far more per-chunk host work to hide — which
+*flattens* the curve on a card whose optimum is at the large end (the GTX 1080
+went 1.28x → 1.17x, §4.13 above) and *steepens* it on a card whose optimum is at
+the small end. Same mechanism, opposite effect on the spread, and the Ada is the
+only card of the six in the second camp.
+
+**So the six-card 1.14x bound is stale in general: five of those six sweeps were
+taken on pre-overlap code and have not been redone.** 65536 is still much better
+than the 2048 it replaced (which costs this card **1.91x**, and the A100 5.55x),
+so the default stands — but the number quoted for it is now **~1.2x** and should
+be treated as provisional until the other cards are re-swept.
 
 #### The memory gate no longer double-counts the pool
 

@@ -272,16 +272,19 @@ function main(argv)
         # of L2 as the RTX 4000 SFF Ada, opposite end of the range, because
         # occupancy on 108 SMs beats L2 residency.  What is defensible is a
         # single constant chosen for its WORST case: across all six measured
-        # cards, 65536 is never worse than **1.14x** off that card's own optimum
-        # (A400 1.00x, 1080 ~1.03x, A4000 1.05x, 2080 Super 1.08x, Ada 1.13x,
-        # A100 1.14x), against 1.37-5.55x for 2048.  It also fails safe on
+        # cards, 65536 is never worse than **1.22x** off that card's own optimum
+        # (A400 1.00x, 1080 ~1.03x, A4000 1.05x, 2080 Super 1.08x, A100 1.14x,
+        # Ada 1.22x), against 1.37-5.55x for 2048.  All but the Ada's were
+        # measured before the download/scan overlap, which helps small chunks
+        # most; the Ada's own figure moved 1.13x -> 1.22x for that reason, so
+        # treat the bound as provisional.  It also fails safe on
         # memory: 65536 needs 0.18 GiB of workspace and fits on the smallest card
         # here, where 131072 does not.  gpu_design.md §4.12.
         if a["blocksize"] == 0
             a["blocksize"] = GPU_DEFAULT_BLOCKSIZE
             @info "Using the GPU default --blocksize $(GPU_DEFAULT_BLOCKSIZE) " *
                   "(the CPU's 2048 costs 1.4-5.6x on the cards measured).  This is " *
-                  "one constant, not a per-device rule: it is within 1.14x of the " *
+                  "one constant, not a per-device rule: it is within 1.22x of the " *
                   "optimum on all six cards measured, and the optimum itself spans " *
                   "8192-262144.  For the last few percent sweep your card once with " *
                   "`julia --project=. bench/gpu_search_report.jl FILE.fft`; see the " *

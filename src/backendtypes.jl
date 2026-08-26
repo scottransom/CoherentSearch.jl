@@ -162,9 +162,13 @@ const _GPU_TIMING = Ref(false)
 #    three cards is refuted 32x by the A100, which has the RTX 4000 SFF Ada's
 #    40 MB of L2 and wants the opposite end of the range because occupancy on
 #    108 SMs beats L2 residency.  65536 is chosen for its WORST case -- within
-#    1.14x of the optimum on all six cards measured, spanning 6-108 SMs and
-#    1-40 MB of L2 -- and because it fails safe on memory, needing 0.18 GiB of
-#    workspace where 131072 does not fit the smallest card here.
+#    1.22x of the optimum on the cards measured, spanning 6-108 SMs and 1-40 MB
+#    of L2 -- and because it fails safe on memory, needing 0.18 GiB of workspace
+#    where 131072 does not fit the smallest card here.  (The bound was 1.14x
+#    when the six sweeps were taken; the RTX 4000 SFF Ada re-measured at 1.22x
+#    after the download/scan overlap, which helps small chunks most and so
+#    sharpens that card's preference.  The other five sweeps are pre-overlap and
+#    have not been redone -- gpu_design.md §4.13.)
 #    `bench/gpu_search_report.jl` still sweeps and recommends, for the last 14%.
 #    gpu_design.md §4.11-§4.12.
 # ---------------------------------------------------------------------------
