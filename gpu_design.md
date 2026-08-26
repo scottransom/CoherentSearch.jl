@@ -1168,7 +1168,63 @@ nothing per file and should run once per invocation.
 
 So the throughput fix is two changes, not one: cache the chunk and plans across
 files (the original TODO), *and* move `reclaim()` out of `_region!` to the end of
-the run — or make it conditional on the device driving a display.
+the run.
+
+**DONE 2026-08-25 — both changes, and the marginal per-file cost halves.**
+
+- `_cached_chunk` / `_cached_gp` in the extension keep the `GPUChunk`, `out` and
+  `GPUInterpPlan` across calls, keyed on `(WT, params, Nprof, subbatch)` and
+  `(WT, params, r_lo)` respectively, comparing `params` by `===` exactly as the
+  CPU's `_plans!` does. A key change frees the old workspace before building the
+  new one, so a heterogeneous run cannot leak.
+- `CUDA.reclaim()` and the workspace frees leave `_region!`. `release_backend!`
+  does them once, and `CoherentSearch.main` calls it after the file loop, in a
+  `finally` so an error mid-batch still returns the memory. It is a no-op method
+  on `CPUBackend`, so nothing on the CPU path changes.
+- **The amplitude upload is still freed per file**, which is what §4.6's
+  out-of-memory story was actually about — that has not been relaxed.
+
+**Peak memory is unchanged**: every cached buffer was live during each search
+anyway. What a display GPU gives up is only the *valley between files*, which is
+why `release_backend!` exists rather than the cache simply never being freed.
+
+**Measured, PM0063 through the CLI, GTX 1080, `--blocksize 262144`:**
+
+| | 1 file | n files | marginal per file |
+|---|---|---|---|
+| before | 25.13 s | 30.33 s (n=4) | **1.73 s** |
+| after | 24.14 s | 26.72 s (n=4) | **0.86 s** |
+| after, interleaved 1/8/1/8 on an idle host | 25.16, 24.28 s | 30.06, 29.83 s (n=8) | **0.79 s** |
+
+**~2.2x on the marginal file.** At 220 files that is ~3.5 min saved. The
+remaining 0.79 s is very nearly the search itself (~0.7 s at this blocksize once
+setup is out of it) plus the 32 MB upload — i.e. the per-file *overhead* is now
+~0.1 s rather than ~0.6 s.
+
+**A measurement trap worth recording, because it nearly went into this table.**
+An intermediate run read 1.85 s marginal — *worse* than before the fix — because
+the CPU test suite was running concurrently on the same host. Same code, same
+command, 2.3x the answer. The numbers above are interleaved on an idle machine;
+the contaminated one was discarded, not averaged in.
+
+**And it revealed that this document's own per-search numbers were inflated.**
+`bench/gpu_search_report.jl`'s sweep calls `search` repeatedly, so every row used
+to pay a full build + `reclaim()`; PM0063's "1.14 s clean total" contained ~0.5 s
+of that. The marginal 0.86 s now *below* the old quoted search time is not a
+paradox, it is the setup leaving the measurement. Two consequences: **the sweep
+now measures steady-state throughput, which is what a 220-file run actually
+experiences**, and small blocksizes were previously penalised slightly more than
+large ones (build is 0.133 s at 8192 against 0.073 s at 262144). That is ~1.5% on
+an NGC6624-sized search and does not overturn the Ada's 8192 (37.9 vs 41.0 ns at
+16384), but per-card optima should be re-read from a post-fix sweep.
+
+`test/test_gpu.jl` is **236 tests**: the cache is exercised only through a full
+`search`, since `chunk_profiles` builds a `GPUChunk` directly and bypasses it, so
+the new testset covers a cache hit, a key change and rebuild, a
+`release_backend!` and rebuild, and idempotent release. Its band and threshold
+are chosen to return **13** candidates rather than zero — an all-empty comparison
+would have passed even if the cache returned garbage, which is exactly how the
+first draft of that test passed nothing useful.
 
 ### 4.7 Classifying a new card in one command
 

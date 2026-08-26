@@ -374,7 +374,10 @@ was DECLINED (§4.11) — the rule fits three cards and the middle of the L2 ran
 is unmeasured. Instead `gpu_search_report.jl` sweeps from 2048 and *recommends*,
 `--gpu` warns when the default is left in place, and the README has a GPU
 section. The governing rule, Scott's: **automate what can't hurt, measure what
-can't be guessed.** **The 1.25x prediction was wrong in
+can't be guessed.** **Throughput mode is fixed (§4.6):** `GPUChunk`/
+`GPUInterpPlan` are cached across files and `CUDA.reclaim()` moved to
+`release_backend!` (once per invocation, called by `main`) — marginal cost
+per file 1.73 s -> 0.79 s. Amplitudes are still freed per file. **The 1.25x prediction was wrong in
 direction (0.960x), because §4.8's non-transform decomposition had the wrong
 sign; do not re-use that column.** The GPU report now labels phases
 `:device`/`:transfer`/`:host` — **`scan` is host-CPU work and moved 1.75x between

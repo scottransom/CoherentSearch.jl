@@ -158,6 +158,50 @@ else
         @test E._sub_cols(Float32, 60, 262144, 0) == 262144
     end
 
+    # ------------------------------------------------------------------
+    # The cross-file throughput cache (gpu_design.md 4.6).  `chunk_profiles`
+    # above builds a `GPUChunk` directly and so never touches it -- only
+    # `_region!`, i.e. a full `search`, goes through the cache.  These are the
+    # only tests that do.
+    #
+    # What could break: a stale workspace surviving a key change, a freed buffer
+    # being reused after `release_backend!`, or results depending on whether a
+    # given search was the first in its process.  All three would be invisible
+    # to every other test here.
+    # ------------------------------------------------------------------
+    @testset "cross-file cache: repeated searches agree" begin
+        G = CS.require_gpu()
+        # The fixture is synthetic and T = 6.55 s, so the band and threshold are
+        # chosen to yield a NON-EMPTY list (13 candidates, top S/N 4.39).  An
+        # all-empty comparison would pass even if the cache returned garbage.
+        srch(bs) = search(ft, params; lofreq = 5.0, hifreq = 40.0, blocksize = bs,
+                          threshold = 2.0, progress = :none, wisdom = false,
+                          backend = G)
+        a = srch(4096)
+        b = srch(4096)                       # cache HIT
+        @test length(a) > 5                  # a real list, not an empty one
+        @test length(a) == length(b)
+        @test all(x.r == y.r && x.metric == y.metric for (x, y) in zip(a, b))
+
+        c = srch(2048)                       # key CHANGE -> rebuild, old one freed
+        d = srch(4096)                       # and back again
+        @test length(c) == length(a)
+        @test all(x.r == y.r && x.metric == y.metric for (x, y) in zip(a, d))
+
+        CoherentSearch.release_backend!(G)   # frees the workspace + reclaim
+        e = srch(4096)                       # must rebuild from nothing
+        @test length(e) == length(a)
+        @test all(x.r == y.r && x.metric == y.metric for (x, y) in zip(a, e))
+        CoherentSearch.release_backend!(G)
+    end
+
+    @testset "release_backend! is a no-op on the CPU and idempotent" begin
+        @test CoherentSearch.release_backend!(CPUBackend()) === nothing
+        G = CS.require_gpu()
+        @test CoherentSearch.release_backend!(G) === nothing
+        @test CoherentSearch.release_backend!(G) === nothing   # twice is safe
+    end
+
     @testset "backend registry" begin
         @test CoherentSearch.has_gpu()
         @test CoherentSearch.require_gpu() === CoherentSearch.gpu_backend()

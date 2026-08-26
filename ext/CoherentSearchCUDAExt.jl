@@ -899,6 +899,101 @@ end
 # ---------------------------------------------------------------------------
 # Time phase `i` if timing is on.  `CUDA.synchronize()` is what makes the number
 # meaningful and also what makes it not free -- see `gpu_timing!`.
+# ---------------------------------------------------------------------------
+# Throughput cache: `GPUChunk`, `GPUInterpPlan` and the metric download buffers
+# reused ACROSS FILES.
+#
+# All three are pure functions of `(WT, params, Nprof)` — and `GPUInterpPlan`
+# additionally of `r_lo`, through the `DirectPlan`s it is built from — and of
+# nothing in the file's contents.  That is exactly the property that makes the
+# CPU's `SearchCache` safe across a heterogeneous glob, and it is safe here for
+# the same reason.  A dedispersion sweep gives every DM identical `N`, `dt` and
+# hence `T` and `r_lo`, so the whole 220-file run reuses one workspace.
+#
+# **Why this is worth caching and the amplitudes are not.** Measured per file on
+# a GTX 1080: `CUDA.reclaim()` 0.362 s, `GPUChunk` build+free 0.073-0.133 s,
+# `GPUInterpPlan` 0.004 s — against an amplitude upload of only 0.042 s for a
+# 188 MB file.  So the genuinely per-file part is ~8% of the per-file cost and
+# the cacheable part is ~92%.  End to end that was 1.73 s marginal per file
+# against a ~1.14 s search (gpu_design.md §4.6).
+#
+# **`reclaim()` is deliberately NOT here any more.** It returns memory to the
+# *driver* rather than to CUDA.jl's pool, which is what lets a desktop have its
+# memory back — but it only needs doing once per invocation, not once per file.
+# `release_backend!` does it, and `CoherentSearch.main` calls that after the file
+# loop.  Peak memory is unchanged either way: the workspace was live during every
+# search before, and the amplitudes are still freed per file, so nothing
+# accumulates.  What changes is only that the valleys BETWEEN files are no longer
+# handed back.
+# ---------------------------------------------------------------------------
+
+const _CACHE_CHUNK = Ref{Any}(nothing)
+const _CACHE_GP    = Ref{Any}(nothing)
+const _CACHE_OUT   = Ref{Any}(nothing)
+const _CACHE_KEY   = Ref{Any}(nothing)   # (WT, params, Nprof, subbatch)
+const _CACHE_GPKEY = Ref{Any}(nothing)   # (WT, params, r_lo)
+
+"""Free the cached device workspace (not the driver-level reclaim)."""
+function _free_cache!()
+    gc = _CACHE_CHUNK[]
+    if gc !== nothing
+        CUDA.unsafe_free!(gc.ftprofs)
+        for a in gc.cpulayout; CUDA.unsafe_free!(a); end
+        for a in gc.profs; CUDA.unsafe_free!(a); end
+        for w in gc.widths; CUDA.unsafe_free!(w); end
+    end
+    _CACHE_OUT[] !== nothing && CUDA.unsafe_free!(_CACHE_OUT[])
+    _CACHE_CHUNK[] = nothing; _CACHE_OUT[] = nothing; _CACHE_KEY[] = nothing
+    _CACHE_GP[] = nothing; _CACHE_GPKEY[] = nothing
+    return nothing
+end
+
+"""
+    _cached_chunk(WT, params, Nprof) -> (GPUChunk, out)
+
+The chunk workspace and metric buffer for this `(WT, params, Nprof)`, rebuilt
+only when the key changes.  `params` is compared by `===`, as `_plans!` does on
+the CPU: the CLI hands the same `SearchParams` object to every file.
+"""
+function _cached_chunk(::Type{WT}, params::SearchParams, Nprof::Integer) where {WT}
+    key = (WT, params, Int(Nprof), _GPU_SUBBATCH[])
+    k = _CACHE_KEY[]
+    if k !== nothing && k[1] === key[1] && k[2] === key[2] &&
+       k[3] == key[3] && k[4] === key[4]
+        return _CACHE_CHUNK[]::GPUChunk{WT}, _CACHE_OUT[]::CuMatrix{Float32}
+    end
+    _free_cache!()                       # a changed key means the old one is dead
+    gc = GPUChunk(WT, params, Nprof; subbatch = _GPU_SUBBATCH[])
+    out = CUDA.zeros(Float32, Nprof, length(gc.ks))
+    _CACHE_CHUNK[] = gc; _CACHE_OUT[] = out; _CACHE_KEY[] = key
+    return gc, out
+end
+
+"""The interpolation plan for this `(WT, params, r_lo)`, rebuilt only on change."""
+function _cached_gp(::Type{WT}, params::SearchParams, r_lo::Real,
+                    dplans::AbstractVector) where {WT}
+    key = (WT, params, Float64(r_lo))
+    k = _CACHE_GPKEY[]
+    if k !== nothing && k[1] === key[1] && k[2] === key[2] && k[3] == key[3]
+        return _CACHE_GP[]::GPUInterpPlan{WT}
+    end
+    gp = GPUInterpPlan(dplans)
+    _CACHE_GP[] = gp; _CACHE_GPKEY[] = key
+    return gp
+end
+
+"""
+    release_backend!(::CUDABackend)
+
+Free the cross-file workspace and return its memory to the driver.  Call after a
+batch of searches; `CoherentSearch.main` does so after its file loop.
+"""
+function CoherentSearch.release_backend!(::CUDABackend)
+    _free_cache!()
+    CUDA.reclaim()
+    return nothing
+end
+
 @inline function _gpt(f, i::Int)
     if _GPU_TIMING[]
         CUDA.synchronize(); t = time_ns()
@@ -923,15 +1018,14 @@ function _region!(::CUDABackend, ft::FFTFile, params::SearchParams,
 
     WT = eltype(dplans[1].W)
     _check_device_memory(ft, params, Nprof, WT)
-    gc = GPUChunk(WT, params, Nprof; subbatch = _GPU_SUBBATCH[])
-    gp = GPUInterpPlan(dplans)
-    d_amps = CuArray(ft.amps)
+    gc, out = _cached_chunk(WT, params, Nprof)
+    gp = _cached_gp(WT, params, r_lo, dplans)
+    d_amps = CuArray(ft.amps)          # the one genuinely per-file allocation
     # One column per rung, so the whole chunk's metrics come back in ONE D2H
     # copy.  Six separate `copyto!`s were six synchronisation points per chunk --
     # each blocking until its boxcar kernel retired, which serialised the queue
     # and cost more than every kernel in it.
     nk = length(gc.ks)
-    out = CUDA.zeros(Float32, Nprof, nk)
     hostm = Matrix{Float32}(undef, Nprof, nk)
     nvalids = Vector{Int}(undef, nk)
     cands = Candidate[]
@@ -996,26 +1090,19 @@ function _region!(::CUDABackend, ft::FFTFile, params::SearchParams,
         _render_progress(progress, nchunks, nchunks)
         println(stderr)
     end
-    # Release the device buffers explicitly.  Without this, CUDA.jl's pool holds
-    # every call's allocations until the next GC, and each call uploads the whole
-    # `.fft` again: three searches of NGC6624 (1.29 GB of amplitudes plus a
-    # ~380 MB chunk workspace) reached 5.87 GB of an 7.92 GB card.  In throughput
-    # mode -- hundreds of files, which is the deployment target -- that is an
-    # out-of-memory failure, not an inefficiency.
-    #
-    # TODO (throughput): the `GPUChunk` and `GPUInterpPlan` depend only on
-    # `(params, Nprof, r_lo)` and not on the file's contents, exactly as the CPU's
-    # `SearchCache` does, so they should be cached across files rather than rebuilt
-    # and freed per call.  Only the amplitude upload is genuinely per-file.
+    # **The amplitudes are the ONE genuinely per-file allocation, and they are
+    # still freed here.**  Without this each call uploads the whole `.fft` again
+    # and CUDA.jl's pool holds every call's copy until the next GC: three
+    # searches of NGC6624 (1.29 GB of amplitudes each) reached 5.87 GB of an
+    # 7.92 GB card.  In throughput mode -- hundreds of files, the deployment
+    # target -- that is an out-of-memory failure, not an inefficiency.
     CUDA.unsafe_free!(d_amps)
-    CUDA.unsafe_free!(out)
-    CUDA.unsafe_free!(gc.ftprofs)
-    for a in gc.cpulayout; CUDA.unsafe_free!(a); end
-    for a in gc.profs; CUDA.unsafe_free!(a); end
-    # `unsafe_free!` returns blocks to CUDA.jl's pool, not to the driver, so the
-    # desktop does not get its memory back until this.  Cheap, and it runs once
-    # per file.
-    CUDA.reclaim()
+    # The chunk workspace, the interpolation plan and `out` are NOT freed here:
+    # they are keyed on `(WT, params, Nprof)` / `(WT, params, r_lo)` and reused by
+    # the next file.  `release_backend!` frees them and calls `CUDA.reclaim()`
+    # once, after the whole batch.  Peak memory is unchanged -- all of this was
+    # live during the search anyway -- so what a display GPU loses is only the
+    # valley between files, in exchange for ~0.5 s per file.
     return cands
 end
 

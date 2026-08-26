@@ -34,6 +34,24 @@ equivalence pin is written against.
 """
 struct CPUBackend <: SearchBackend end
 
+"""
+    release_backend!(backend)
+
+Release any resources a backend holds between searches, and return device memory
+to the driver.  A no-op on the CPU.
+
+**Why this exists.** The GPU path caches its chunk workspace and interpolation
+plan across files — they are a pure function of `(params, Nprof, r_lo)` and not
+of the file's contents, exactly as the CPU's `SearchCache` is — so a multi-file
+run does not rebuild them per file.  Something then has to hand the memory back
+at the end, and that is this.
+
+Call it after a batch of searches, not between them; `CoherentSearch.main` does.
+Calling it more often than necessary is safe but costs ~0.36 s each time
+(measured on a GTX 1080), which is the whole reason the caching exists.
+"""
+release_backend!(::SearchBackend) = nothing
+
 # Populated by `CoherentSearchCUDAExt.__init__` when CUDA is functional.  `Any`
 # rather than `Union{Nothing,SearchBackend}` because the concrete type does not
 # exist until the extension loads; it is read once per search, never in a hot loop.

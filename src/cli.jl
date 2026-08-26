@@ -300,7 +300,18 @@ function main(argv)
         end
     end
 
-    plot_all(toplot, params, a)
+    # Hand the GPU's cross-file workspace back to the driver.  The device cache
+    # is keyed on `(params, Nprof, r_lo)` and deliberately survives the loop
+    # above -- rebuilding it per file cost ~0.5 s each, dominated by the
+    # `CUDA.reclaim()` that used to run per file (gpu_design.md §4.6).  A no-op
+    # on the CPU backend.  In a `try`/`finally` so an error mid-batch still
+    # releases: this is the only thing that returns device memory to the driver,
+    # and on a display GPU that memory is the desktop's.
+    try
+        plot_all(toplot, params, a)
+    finally
+        release_backend!(backend)
+    end
     return nothing
 end
 
