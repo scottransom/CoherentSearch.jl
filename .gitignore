@@ -59,3 +59,9 @@ oracle.json
 # are synced between foops and fitzroy by hand.
 PM0063_034C1*
 NGC6624_*
+
+# Pasted GPU probe/report output.  These are working notes: the numbers that
+# matter end up as tables in gpu_design.md, and six of them were committed by
+# accident on 2026-08-26 (see the `git add -A` rule in CLAUDE.md).
+*_probe.txt
+*_search_report.txt
