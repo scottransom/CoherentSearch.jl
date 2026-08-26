@@ -19,9 +19,11 @@
 #    OFF, and the phase breakdown from a separate pass with it on.  Read the
 #    shares from the second and the total from the first.
 #  - **The best `--blocksize` is per-device and the known cards want opposite
-#    ends** (GTX 1080 and RTX 2080 Super: 262144; RTX 4000 Ada: 16384, because its
-#    40 MB L2 holds the whole transform working set).  That is why this sweeps
-#    rather than assuming.  The sweep starts at 4096 because the Ada's in-search
+#    ends** (GTX 1080, RTX 2080 Super and A100: 262144; RTX A4000: 131072;
+#    RTX 4000 Ada: 8192, because its 40 MB L2 holds the whole pipeline at that
+#    size).  Note the A100 has the SAME 40 MB and wants the other end, because
+#    108 SMs need a big chunk to fill -- so this sweeps rather than assuming.
+#    The sweep starts at 2048 because the Ada's in-search
 #    optimum turned out to sit BELOW the standalone probe's knee -- when cuFFT
 #    shares that L2 with the rest of the pipeline the effective knee moves down,
 #    so a sweep that bottoms out at 16384 can miss it (`gpu_design.md` §4.8).
@@ -101,28 +103,35 @@ best = isempty(results) ? (65536, NaN) : results[argmin(last.(results))]
 
 # ---------------------------------------------------------------------------
 # The recommendation.  This is the whole point of the script for a user (as
-# opposed to for `gpu_design.md`): `--blocksize` defaults to 2048, which is the
-# CPU's tuned value and is wrong on every GPU measured so far -- 1.65x off the
-# best on a GTX 1080.  The optimum spans 8192 to 262144 across three cards, a
-# factor of 32, and it tracks L2 size INVERSELY (a big cache wants a small chunk,
-# so the whole pipeline stays resident; a small cache cannot hold anything at any
-# size, so only occupancy and launch amortisation are left and bigger wins).
+# opposed to for `gpu_design.md`): `--blocksize` under `--gpu` defaults to
+# `GPU_DEFAULT_BLOCKSIZE`, which is one constant chosen for its WORST case
+# (within 1.14x of the optimum on all six cards measured), not a per-device rule.
+# This script finds the remaining few percent.
 #
-# We deliberately do NOT derive this at run time.  A rule fitted to three cards
-# is not a rule, and the middle of the L2 range -- around 12 MB, where the two
-# regimes meet -- is entirely unmeasured.  Sweeping takes minutes and is exact.
+# The optimum spans 8192 to 262144 -- a factor of 32 -- and is NOT predictable
+# from the hardware.  It is a tug of war between L2 (a big cache wants a small
+# chunk, so the whole pipeline stays resident) and SM count (a lot of SMs want a
+# big one, because a small chunk cannot fill them).  Which wins is not something
+# a spec sheet settles: the RTX 4000 Ada (40 MB L2, 48 SMs) wants 8192 while the
+# A100 (the same 40 MB, 108 SMs) wants 262144 and is nearly 2x slower at 8192.
+# A rule fitted to the first three cards predicted 6868 for the A100 and was
+# wrong by 32x -- see gpu_design.md §4.11-§4.12 for why this is measured and not
+# derived.
 # ---------------------------------------------------------------------------
 if !isempty(results)
     d = Dict(results)
     println("\n" * "-"^78)
     @printf("RECOMMENDATION for this card:  --blocksize %d\n", best[1])
+    gdef = CS.GPU_DEFAULT_BLOCKSIZE
+    if haskey(d, gdef)
+        pen = d[gdef] / best[2]
+        @printf("  Not passing --blocksize gets the GPU default of %d, which on this\n", gdef)
+        @printf("  card costs %.2fx (%.3f s against %.3f s).\n", pen, d[gdef], best[2])
+        pen < 1.02 && println("  (So on this card the default is already as good as tuning it.)")
+    end
     if haskey(d, 2048)
-        pen = d[2048] / best[2]
-        @printf("  Not passing --blocksize gets the CPU default of 2048, which on this\n")
-        @printf("  card costs %.2fx (%.3f s against %.3f s).\n", pen, d[2048], best[2])
-        pen < 1.05 && println("  (On this card the default happens to be fine -- unusual; the three cards
-" *
-                              "   in gpu_design.md all lose 1.2x or more.)")
+        @printf("  For reference, the CPU's default of 2048 would cost %.2fx here.\n",
+                d[2048] / best[2])
     end
     # How sharp is the optimum?  A user who guesses one row away should know
     # whether that costs 1% or 20%.

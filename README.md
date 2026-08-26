@@ -557,14 +557,18 @@ On a cluster whose compute nodes are air-gapped, run the `Pkg.add` on a login
 node that shares the filesystem, then run on the GPU node with the same
 `JULIA_DEPOT_PATH`.
 
-### Tune `--blocksize` for your card first — it is worth up to 1.65x
+### Tune `--blocksize` for your card — it is worth up to 1.14x over the default
 
-**This is the one thing you must do before running a real GPU search.**
-`--blocksize` (trial fundamentals per chunk) defaults to 2048, which is tuned for
-the CPU and is a poor choice on every GPU we have measured. The best value is a
-property of the card and spans **8192 to 262144** — a factor of 32 — so there is
-no single default that would serve everyone, and we would rather measure it than
-guess it:
+**Not urgent any more, but still worth one run.** `--blocksize` (trial
+fundamentals per chunk) defaults to **65536 under `--gpu`** and 2048 on the CPU;
+the two backends want values 32x apart. 65536 is one constant chosen for its
+worst case — it is within **1.14x** of the optimum on all six cards we have
+measured, spanning 6 to 108 SMs and 1 to 40 MB of L2 — and it is not a per-device
+rule, because the optimum is *not* predictable from the hardware: the A100 and
+the RTX 4000 Ada have the same 40 MB of L2 and want opposite ends of a 32x range.
+
+The best value is a property of the card and spans **8192 to 262144**. To find
+yours:
 
 ```sh
 julia --project=. bench/gpu_search_report.jl FILE.fft
@@ -578,15 +582,23 @@ not passing one. Then run searches with that value:
 julia --project=. bin/coherent_search.jl --gpu --blocksize 8192 FILE.fft
 ```
 
-The search warns once per invocation if you leave `--blocksize` at the default.
+The search prints the default it used, and warns if you pass `--blocksize 2048`
+or less explicitly — that is the CPU's value and it costs 1.4x to 5.6x on a GPU.
 
-**Why it varies so much, if you are curious.** The optimum tracks the card's L2
-cache *inversely*. A card with a large L2 (an RTX 4000 Ada has 40 MB) wants a
-**small** chunk, so the whole pipeline stays resident in cache; a card with a
-small L2 (a GTX 1080 has 2 MB, an RTX 2080 Super 4 MB) cannot hold the working
-set at any chunk size, so only occupancy and launch amortisation are left and
-**bigger** wins. Measured optima: RTX 4000 Ada 8192, RTX 2080 Super 262144,
-GTX 1080 262144.
+**Why it varies so much, if you are curious.** Two effects pull in opposite
+directions. A large L2 wants a **small** chunk, so the whole pipeline stays
+resident in cache; a lot of SMs want a **big** one, because a small chunk cannot
+fill them. Which wins is not predictable from a spec sheet: the RTX 4000 Ada
+(40 MB L2, 48 SMs) wants **8192**, while the A100 (the same 40 MB, but 108 SMs)
+wants **262144** and is nearly 2x slower at 8192. Cards with a small L2 cannot
+hold the working set at any chunk size, so only occupancy and launch
+amortisation are left and bigger always wins.
+
+Measured optima: RTX 4000 Ada 8192, RTX A4000 131072, RTX 2080 Super 262144,
+GTX 1080 262144, A100 262144, RTX A400 65536 or above (its sweep was capped by
+device memory). **If you are on an RTX 4000 SFF Ada, pass `--blocksize 8192`** —
+it is the one measured card the 65536 default costs anything worth having
+(1.13x).
 
 ### What the GPU path does and does not support
 

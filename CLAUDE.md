@@ -377,15 +377,16 @@ is 1.000x on all three cards** (§4.10): the mechanism works (1.166x at blocksiz
 engage, and the other two cards' gates decline. Its value is robustness — the
 Ada's blocksize cliff falls 1.21x -> 1.06x. **The Ada's real optimum is
 blocksize 8192, not 16384** (§4.11): 37.9 ns/trial, ~2.96x fitzroy's 20 cores,
-the best number any card here has produced. **But `--blocksize` defaults to 2048
-even under `--gpu`, and that costs 1.37x (A400) to 3.91x (A4000) to 5.55x
-(A100) — the bigger the card, the worse the default hurts (§4.12).** Deriving it
-per-device was DECLINED (§4.11) and the A100 vindicates that: the fitted
-`0.5 x L2 / 2912 B` rule predicts blocksize 6868 for its 40 MB of L2 and the
-measured optimum is **262144, a factor of 32 out**, because occupancy on 108 SMs
-beats L2 residency. §4.12 proposes a flat GPU default of **65536** instead —
-worst case 1.14x across all six cards — which is Scott's call and not
-implemented. Instead `gpu_search_report.jl` sweeps from 2048 and *recommends*,
+the best number any card here has produced. **`--blocksize` now defaults PER BACKEND — 2048 on the CPU, 65536 on the
+GPU** (§4.13; `CPU_DEFAULT_BLOCKSIZE`/`GPU_DEFAULT_BLOCKSIZE`, resolved in both
+`main` and `search` so a library caller is covered too). The old shared 2048 cost
+1.37x (A400) to 3.91x (A4000) to **5.55x** (A100) — the bigger the card, the
+worse it hurt. This is deliberately **one constant, not a per-device rule**:
+deriving it was DECLINED (§4.11) and the A100 refutes the fitted
+`0.5 x L2 / 2912 B` rule by a factor of 32 (predicts 6868 for its 40 MB of L2,
+measures 262144, because occupancy on 108 SMs beats L2 residency). 65536 is
+within **1.14x** of the optimum on all six cards. **The one card it costs
+anything is the RTX 4000 SFF Ada — pass `--blocksize 8192` there** (1.13x). Instead `gpu_search_report.jl` sweeps from 2048 and *recommends*,
 `--gpu` warns when the default is left in place, and the README has a GPU
 section. The governing rule, Scott's: **automate what can't hurt, measure what
 can't be guessed.** **Throughput mode is fixed (§4.6):** `GPUChunk`/
@@ -395,9 +396,16 @@ per file 1.73 s -> 0.79 s. Amplitudes are still freed per file. **The 1.25x pred
 direction (0.960x), because §4.8's non-transform decomposition had the wrong
 sign; do not re-use that column.** The GPU report now labels phases
 `:device`/`:transfer`/`:host` — **`scan` is host-CPU work and has now moved 3.5x between
-two hosts** (§4.12), so classify a card on the device column only. **On the two
-fast cards `download` + `scan` is ~31% of wall clock**, which makes overlapping
-them with the next chunk's device work (~1.4x) the largest single item left. `bench/gpu_probe_setup.sh` classifies a new host in
+two hosts** (§4.12), so classify a card on the device column only. **`download` + `scan` are now OVERLAPPED with the next
+chunk's device work** (§4.13): double-buffered `out`/`hostm`, a separate copy
+stream gated by an event, pinned host memory, candidates byte-identical.
+Measured **1.294x at blocksize 8192 and 1.205x at 131072 on the GTX 1080**, whose
+14.1% host share is the smallest of the modern cards — the A100 and A4000 sit at
+~31% and should see nearer 1.4x, `hypatia`'s Ada nearer 1.15x. Throughput mode
+gains the same 1.167x per file. **The phase table deliberately still reports the
+UN-overlapped cost** (timing-on reverts to a serial schedule) so old card reports
+stay comparable; read the clean total for the win. `_ChunkIO` is cached across
+files because `CUDA.pin` is a driver call, not a `malloc`. `bench/gpu_probe_setup.sh` classifies a new host in
 one command. **fitzroy's GPU drives Scott's desktop — prefer another host for
 anything large.**
 

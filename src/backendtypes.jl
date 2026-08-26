@@ -146,6 +146,32 @@ const _GPU_PHASE_NS = zeros(Int64, length(GPU_PHASE_NAMES))
 const _GPU_TIMING = Ref(false)
 
 # ---------------------------------------------------------------------------
+# Default `--blocksize` (Nprof), resolved per backend by `main`.  The two
+# backends want values 32x apart and each has been measured on its own hardware:
+#
+#  - **CPU 2048.** Chunk->thread assignment is whole-chunk round-robin so that
+#    each harmonic's bin window is loaded once per chunk and read back from L1
+#    by every trial in it.  Shrinking the chunk to relieve cache pressure was
+#    tried and is worse at every thread count (2048/512/256 -> 29.3/31.9/37.0 s
+#    at `-t 1`), because the per-chunk fixed costs -- batched `brfft`
+#    efficiency, the sigma-hat subsample -- dominate.
+#
+#  - **GPU 65536.** 2048 costs 1.37x (RTX A400) to 5.55x (A100-SXM4-80GB) there,
+#    and the penalty GROWS with the card.  This is deliberately a single
+#    constant and NOT a per-device rule: the `0.5 * L2 / 2912 B` rule fitted to
+#    three cards is refuted 32x by the A100, which has the RTX 4000 SFF Ada's
+#    40 MB of L2 and wants the opposite end of the range because occupancy on
+#    108 SMs beats L2 residency.  65536 is chosen for its WORST case -- within
+#    1.14x of the optimum on all six cards measured, spanning 6-108 SMs and
+#    1-40 MB of L2 -- and because it fails safe on memory, needing 0.18 GiB of
+#    workspace where 131072 does not fit the smallest card here.
+#    `bench/gpu_search_report.jl` still sweeps and recommends, for the last 14%.
+#    gpu_design.md §4.11-§4.12.
+# ---------------------------------------------------------------------------
+const CPU_DEFAULT_BLOCKSIZE = 2048
+const GPU_DEFAULT_BLOCKSIZE = 65536
+
+# ---------------------------------------------------------------------------
 # Transform sub-batching policy, read by the CUDA extension when it builds a
 # `GPUChunk`.  `:auto` derives the target from the device's L2 (the shipped
 # behaviour, and a no-op on a small-L2 card); `:off` forces one un-split batch

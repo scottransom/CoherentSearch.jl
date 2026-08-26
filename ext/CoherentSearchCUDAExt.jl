@@ -860,12 +860,35 @@ function _check_device_memory(ft::FFTFile, params::SearchParams, Nprof::Integer,
     stack = sum((fld(nh, k) + 1) * Nprof * 2 * sizeof(WT) for k in ks)
     prof = sum(2 * fld(nh, k) * Nprof * sizeof(WT) for k in ks)
     need = amps + (nh + 1) * Nprof * 2 * sizeof(WT) + stack + prof +
-           Nprof * length(ks) * sizeof(Float32)
+           2 * Nprof * length(ks) * sizeof(Float32)   # `out` is double-buffered
+    # `CUDA.memory_info()` reports what the DRIVER has free, and CUDA.jl's pool
+    # holds on to freed blocks rather than returning them -- deliberately, since
+    # §4.6 moved `CUDA.reclaim()` out to `release_backend!` so that a many-file
+    # run does not pay for it per file.  So from the second search in a process
+    # onwards this free figure EXCLUDES the previous file's amplitudes and chunk
+    # workspace, while `need` above still counts them: the gate charges for the
+    # same bytes twice and refuses configurations that fit.
+    #
+    # Not hypothetical.  On a 3.67 GiB RTX A400 it refused `--blocksize 131072`
+    # with "needs about 1.64 GiB but only 1.77 GiB is free" -- a message that
+    # reads as self-contradictory until you find the 0.90 margin -- when the
+    # actual new demand was ~0.35 GiB.  Two rows of that card's sweep were lost
+    # to it and its reported optimum is a ceiling, not an optimum
+    # (gpu_design.md §4.12).
+    #
+    # The fix reclaims ONLY on the path that was about to fail, so the normal
+    # path still never pays the ~0.36 s.  Reclaiming and re-reading is exact,
+    # where adding the pool's reserve to the free figure would not be: the
+    # reserve counts bytes that are still in use as well as bytes that are not.
     free, tot = CUDA.memory_info()
+    if need > 0.90 * free
+        CUDA.reclaim()
+        free, tot = CUDA.memory_info()
+    end
     gb(x) = x / 2^30
     if need > 0.90 * free
         error("""
-            This search needs about $(round(gb(need), digits=2)) GiB on the GPU but only             $(round(gb(free), digits=2)) GiB of $(round(gb(tot), digits=2)) GiB is free.
+            This search needs about $(round(gb(need), digits=2)) GiB on the GPU but only $(round(gb(free), digits=2)) GiB of $(round(gb(tot), digits=2)) GiB is free (after reclaiming the CUDA.jl pool).
 
               amplitudes      $(round(gb(amps), digits=2)) GiB  (the whole .fft)
               chunk workspace $(round(gb(need - amps), digits=2)) GiB  (--blocksize $Nprof)
@@ -927,9 +950,37 @@ end
 # handed back.
 # ---------------------------------------------------------------------------
 
+"""
+    _ChunkIO(Nprof, nk)
+
+The host side of the download/scan overlap: two page-locked staging matrices,
+their per-buffer valid-trial counts and chunk start bins, a copy stream, and two
+pairs of events (`ready` = this chunk's boxcars have retired, `done` = its D2H
+has landed).  Cached across files by `_cached_chunk`; see `_region!` for what
+makes the double buffering safe.
+"""
+struct _ChunkIO
+    hostm::NTuple{2,Matrix{Float32}}
+    nvalids::NTuple{2,Vector{Int}}
+    rstarts::Vector{Float64}
+    stream::CuStream
+    ready::NTuple{2,CuEvent}
+    done::NTuple{2,CuEvent}
+end
+
+function _ChunkIO(Nprof::Int, nk::Int)
+    _ChunkIO(ntuple(_ -> CUDA.pin(Matrix{Float32}(undef, Nprof, nk)), 2),
+             ntuple(_ -> Vector{Int}(undef, nk), 2),
+             zeros(Float64, 2),
+             CuStream(),
+             ntuple(_ -> CuEvent(CUDA.EVENT_DISABLE_TIMING), 2),
+             ntuple(_ -> CuEvent(CUDA.EVENT_DISABLE_TIMING), 2))
+end
+
 const _CACHE_CHUNK = Ref{Any}(nothing)
 const _CACHE_GP    = Ref{Any}(nothing)
 const _CACHE_OUT   = Ref{Any}(nothing)
+const _CACHE_IO    = Ref{Any}(nothing)   # pinned host buffers, copy stream, events
 const _CACHE_KEY   = Ref{Any}(nothing)   # (WT, params, Nprof, subbatch)
 const _CACHE_GPKEY = Ref{Any}(nothing)   # (WT, params, r_lo)
 
@@ -943,30 +994,45 @@ function _free_cache!()
         for w in gc.widths; CUDA.unsafe_free!(w); end
     end
     _CACHE_OUT[] !== nothing && CUDA.unsafe_free!(_CACHE_OUT[])
+    # The pinned host buffers unpin themselves through the finalizer `CUDA.pin`
+    # attaches, so dropping the reference is all that is needed here.
+    _CACHE_IO[] = nothing
     _CACHE_CHUNK[] = nothing; _CACHE_OUT[] = nothing; _CACHE_KEY[] = nothing
     _CACHE_GP[] = nothing; _CACHE_GPKEY[] = nothing
     return nothing
 end
 
 """
-    _cached_chunk(WT, params, Nprof) -> (GPUChunk, out)
+    _cached_chunk(WT, params, Nprof) -> (GPUChunk, out, io)
 
-The chunk workspace and metric buffer for this `(WT, params, Nprof)`, rebuilt
-only when the key changes.  `params` is compared by `===`, as `_plans!` does on
-the CPU: the CLI hands the same `SearchParams` object to every file.
+The chunk workspace, metric buffers and download plumbing for this
+`(WT, params, Nprof)`, rebuilt only when the key changes.  `params` is compared
+by `===`, as `_plans!` does on the CPU: the CLI hands the same `SearchParams`
+object to every file.
+
+**`io` is cached for the same reason the device workspace is** (§4.6): its host
+matrices are PAGE-LOCKED, and `CUDA.pin` is a driver call, not a `malloc`.
+Building it per file would put two registrations, two unregistrations and
+`2 * Nprof * nk * 4` bytes of host allocation on every one of a 220-file
+throughput run -- exactly the per-file cost §4.6 removed from everything else.
 """
 function _cached_chunk(::Type{WT}, params::SearchParams, Nprof::Integer) where {WT}
     key = (WT, params, Int(Nprof), _GPU_SUBBATCH[])
     k = _CACHE_KEY[]
     if k !== nothing && k[1] === key[1] && k[2] === key[2] &&
        k[3] == key[3] && k[4] === key[4]
-        return _CACHE_CHUNK[]::GPUChunk{WT}, _CACHE_OUT[]::CuMatrix{Float32}
+        return _CACHE_CHUNK[]::GPUChunk{WT}, _CACHE_OUT[]::CuArray{Float32,3},
+               _CACHE_IO[]::_ChunkIO
     end
     _free_cache!()                       # a changed key means the old one is dead
     gc = GPUChunk(WT, params, Nprof; subbatch = _GPU_SUBBATCH[])
-    out = CUDA.zeros(Float32, Nprof, length(gc.ks))
-    _CACHE_CHUNK[] = gc; _CACHE_OUT[] = out; _CACHE_KEY[] = key
-    return gc, out
+    # Two metric buffers, not one: the download/scan overlap in `_region!`
+    # alternates between them.  It costs 24 B per trial of the ~2912 B the whole
+    # chunk workspace uses (§4.11), i.e. under 1%.
+    out = CUDA.zeros(Float32, Nprof, length(gc.ks), 2)
+    io = _ChunkIO(Int(Nprof), length(gc.ks))
+    _CACHE_CHUNK[] = gc; _CACHE_OUT[] = out; _CACHE_IO[] = io; _CACHE_KEY[] = key
+    return gc, out, io
 end
 
 """The interpolation plan for this `(WT, params, r_lo)`, rebuilt only on change."""
@@ -1018,7 +1084,7 @@ function _region!(::CUDABackend, ft::FFTFile, params::SearchParams,
 
     WT = eltype(dplans[1].W)
     _check_device_memory(ft, params, Nprof, WT)
-    gc, out = _cached_chunk(WT, params, Nprof)
+    gc, out, io = _cached_chunk(WT, params, Nprof)
     gp = _cached_gp(WT, params, r_lo, dplans)
     d_amps = CuArray(ft.amps)          # the one genuinely per-file allocation
     # One column per rung, so the whole chunk's metrics come back in ONE D2H
@@ -1026,12 +1092,62 @@ function _region!(::CUDABackend, ft::FFTFile, params::SearchParams,
     # each blocking until its boxcar kernel retired, which serialised the queue
     # and cost more than every kernel in it.
     nk = length(gc.ks)
-    hostm = Matrix{Float32}(undef, Nprof, nk)
-    nvalids = Vector{Int}(undef, nk)
+    # --- Download/scan overlap -------------------------------------------
+    # Chunk `c`'s D2H copy and host-side candidate scan run WHILE chunk `c+1`'s
+    # kernels are on the device.  Before this, both were on the critical path:
+    # `download` + `scan` measured **31.5% of wall clock on an A100 and 31.4%
+    # on an RTX A4000** (against 4.6% on an RTX A400), because the device got
+    # ~8x faster over six cards and the host did not (gpu_design.md §4.12).
+    # It is the largest single item left on any modern card.
+    #
+    # Three things make it safe, and all three are needed:
+    #
+    #  - **Double buffering.** `out[:, :, b]` and `hostm[b]` alternate, so
+    #    chunk `c+2` is the first to reuse chunk `c`'s buffers -- and the host
+    #    has already waited for chunk `c`'s copy (while scanning it, at
+    #    iteration `c+1`) before iteration `c+2` queues anything into them.
+    #    Host-side ordering is what makes the write-after-read safe; there is no
+    #    need for the compute stream to wait on an event.
+    #  - **A separate copy stream plus an event.** `copystream` waits on
+    #    `ready[b]`, recorded on the compute stream after the last boxcar, so
+    #    the transfer cannot start early; running it off the compute stream is
+    #    what lets PCIe and the SMs work at the same time.
+    #  - **Pinned host memory.** `unsafe_copyto!(...; async = true)` only really
+    #    returns early from page-locked memory, and pageable D2H measured
+    #    10-11 GB/s on two hosts -- about half of what the link can do.
+    #
+    # Candidate ORDER is unchanged: chunk `c-1` is scanned before chunk `c` is,
+    # and within a chunk the rung/trial loops are untouched.  So the output is
+    # byte-identical, which is what `test_gpu.jl` and §5's batch-invariance pin
+    # check.
+    # Built once per `(WT, params, Nprof)` and reused across files, like the
+    # device workspace -- pinning host memory is a driver call (see `_ChunkIO`).
+    hostm, nvalids, rstarts = io.hostm, io.nvalids, io.rstarts
+    copystream, ready, done = io.stream, io.ready, io.done
+    pending = 0            # buffer holding a chunk not yet scanned; 0 = none
     cands = Candidate[]
     nyq = ft.N / 2
+    thr = Float32(threshold)
+
+    # Scan one landed host buffer.  Split out only so that the overlapped and
+    # the timing-on schedules can share one implementation -- if these ever
+    # diverge, the phase table stops describing the code that ships.
+    @inline function scan_buffer!(b::Int)
+        hm = hostm[b]; nv = nvalids[b]; rs = rstarts[b]
+        @inbounds for i in 1:nk
+            k = gc.ks[i]
+            Hk = gc.Hk[i]
+            for j in 1:nv[i]
+                hm[j, i] > thr || continue             # Float32 compare: no conversion
+                rf = k * (rs + (j - 1) * lodr)
+                push!(cands, Candidate(rf / ft.T, Float64(hm[j, i]), rf, Hk))
+            end
+        end
+        return nothing
+    end
 
     for c in 1:nchunks
+        b = 1 + (c - 1) % 2
         i0 = (c - 1) * Nprof
         n = min(Nprof, total - i0)
         rstart = r_lo + i0 * lodr
@@ -1060,31 +1176,55 @@ function _region!(::CUDABackend, ft::FFTFile, params::SearchParams,
                     nvalid += 1
                 end
             end
-            nvalids[i] = nvalid
+            nvalids[b][i] = nvalid
             nvalid == 0 && continue
             sig = _analytic_sigma(filled, k, Hk)
             invsig = sig > 0 ? 1.0 / sig : 0.0
-            gpu_boxcar!(view(out, :, i), gc.profs[i], nvalid, 2Hk, gc.widths[i],
+            gpu_boxcar!(view(out, :, i, b), gc.profs[i], nvalid, 2Hk, gc.widths[i],
                         gc.hwidths[i][end], invsig)
         end
         end
-        # One copy for the whole chunk, after every rung has been queued.  The
-        # offset form, not `copyto!(view(...), view(...))`: a SubArray of a
+        rstarts[b] = rstart
+        # One copy for the whole chunk, after every rung has been queued, issued
+        # on `copystream` behind an event so it cannot overtake the boxcars.
+        # The pointer form, not `copyto!(view(...), view(...))`: a SubArray of a
         # CuArray falls back to scalar indexing, which CUDA.jl refuses outright.
-        _gpt(() -> copyto!(hostm, 1, out, 1, Nprof * nk), 6)
-        tscan = time_ns()
-        thr = Float32(threshold)
-        @inbounds for i in 1:nk
-            k = gc.ks[i]
-            Hk = gc.Hk[i]
-            for j in 1:nvalids[i]
-                hostm[j, i] > thr || continue          # Float32 compare: no conversion
-                rf = k * (rstart + (j - 1) * lodr)
-                push!(cands, Candidate(rf / ft.T, Float64(hostm[j, i]), rf, Hk))
-            end
+        CUDA.record(ready[b])
+        CUDA.wait(ready[b], copystream)
+        GC.@preserve hostm out begin
+            CUDA.unsafe_copyto!(pointer(hostm[b]),
+                                pointer(out, 1 + (b - 1) * Nprof * nk),
+                                Nprof * nk; stream = copystream, async = true)
         end
-        _GPU_TIMING[] && (@inbounds _GPU_PHASE_NS[7] += time_ns() - tscan)
+        CUDA.record(done[b], copystream)
+
+        if _GPU_TIMING[]
+            # Timing already serialises the queue (see `gpu_timing!`), so make
+            # the schedule serial too: the phase table then measures download
+            # and scan un-overlapped, which is what makes it comparable with
+            # every card report taken before this change.  The clean total, run
+            # with timing OFF, is where the overlap shows up.
+            _gpt(() -> CUDA.synchronize(done[b]), 6)
+            tscan = time_ns()
+            scan_buffer!(b)
+            @inbounds _GPU_PHASE_NS[7] += time_ns() - tscan
+        else
+            # Scan the PREVIOUS chunk while this one's kernels run.  The wait is
+            # on that chunk's own copy event, so it does not block on anything
+            # queued for chunk `c`.
+            if pending != 0
+                CUDA.synchronize(done[pending])
+                scan_buffer!(pending)
+            end
+            pending = b
+        end
         _render_progress(progress, c, nchunks)
+    end
+    # Drain the last chunk.
+    if pending != 0
+        CUDA.synchronize(done[pending])
+        scan_buffer!(pending)
+        pending = 0
     end
     if progress !== :none
         _render_progress(progress, nchunks, nchunks)

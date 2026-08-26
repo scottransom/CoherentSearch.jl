@@ -124,9 +124,9 @@ function parse_cmdline(argv)
             default = "analytic"
             range_tester = x -> x in ("measured", "analytic")
         "--blocksize"
-            help = "Trial fundamentals per parallel chunk (Nprof)"
+            help = "Trial fundamentals per parallel chunk (Nprof).  0 (the default) resolves per backend: 2048 on the CPU, 65536 on the GPU.  The two backends want values 32x apart, and on a GPU the wrong end of that range costs up to 5.55x, so sweep yours once with bench/gpu_search_report.jl"
             arg_type = Int
-            default = 2048
+            default = 0
         "--maxdecim"
             help = "Max harmonic-decimation factor k: also search 2..k times each fundamental, folding nharms/k harmonics. 1 disables it"
             arg_type = Int
@@ -261,27 +261,45 @@ function main(argv)
         end
         backend = require_gpu()
         @info "GPU backend active" device=string(backend)
-        # `--blocksize` defaults to 2048, which is the CPU's tuned value and is
-        # wrong on every GPU measured (1.65x off the best on a GTX 1080; the
-        # optimum spans 8192-262144 across three cards, a factor of 32, and it
-        # tracks L2 INVERSELY).  We do NOT guess a better one here -- a rule
-        # fitted to three cards is not a rule, and the middle of the L2 range is
-        # unmeasured -- but a silent 1.65x is not acceptable either, so say so
-        # once and point at the sweep that measures it exactly.
+        # `--blocksize` used to default to 2048 on both backends -- the CPU's
+        # tuned value, and wrong on every GPU measured.  The penalty grows with
+        # the card: 1.37x (RTX A400), 1.65x (GTX 1080), 3.91x (RTX A4000),
+        # **5.55x** (A100-SXM4-80GB).  On the A100 that turns a 5.94x win over a
+        # 20-core Xeon into 1.07x, silently.
         #
-        # Comparing against the default value also warns someone who typed
-        # `--blocksize 2048` explicitly.  That is correct, not a false positive:
-        # it is a poor choice on a GPU either way.
-        if a["blocksize"] == 2048
-            @warn "--gpu is using the default --blocksize 2048, which is tuned for " *
-                  "the CPU and is a poor choice on every GPU measured so far " *
-                  "(1.65x off the best on a GTX 1080).  The best value is " *
-                  "per-device and spans 8192-262144.  Sweep it once for your card " *
-                  "with `julia --project=. bench/gpu_search_report.jl FILE.fft` and " *
-                  "pass the --blocksize it recommends; see the GPU section of the " *
-                  "README."
+        # We still do NOT derive it per device.  §4.11 fitted `0.5 * L2 / 2912 B`
+        # to three cards and the A100 refutes it by a factor of 32 -- same 40 MB
+        # of L2 as the RTX 4000 SFF Ada, opposite end of the range, because
+        # occupancy on 108 SMs beats L2 residency.  What is defensible is a
+        # single constant chosen for its WORST case: across all six measured
+        # cards, 65536 is never worse than **1.14x** off that card's own optimum
+        # (A400 1.00x, 1080 ~1.03x, A4000 1.05x, 2080 Super 1.08x, Ada 1.13x,
+        # A100 1.14x), against 1.37-5.55x for 2048.  It also fails safe on
+        # memory: 65536 needs 0.18 GiB of workspace and fits on the smallest card
+        # here, where 131072 does not.  gpu_design.md §4.12.
+        if a["blocksize"] == 0
+            a["blocksize"] = GPU_DEFAULT_BLOCKSIZE
+            @info "Using the GPU default --blocksize $(GPU_DEFAULT_BLOCKSIZE) " *
+                  "(the CPU's 2048 costs 1.4-5.6x on the cards measured).  This is " *
+                  "one constant, not a per-device rule: it is within 1.14x of the " *
+                  "optimum on all six cards measured, and the optimum itself spans " *
+                  "8192-262144.  For the last few percent sweep your card once with " *
+                  "`julia --project=. bench/gpu_search_report.jl FILE.fft`; see the " *
+                  "GPU section of the README."
+        elseif a["blocksize"] <= 2048
+            # An explicit small value is still a poor choice on a GPU however it
+            # was arrived at, so this is correct rather than a false positive.
+            @warn "--blocksize $(a["blocksize"]) is tuned for the CPU and is a poor " *
+                  "choice on every GPU measured (up to 5.55x off the best on an " *
+                  "A100).  Omit --blocksize to get the GPU default of " *
+                  "$(GPU_DEFAULT_BLOCKSIZE), or sweep your card with " *
+                  "`julia --project=. bench/gpu_search_report.jl FILE.fft`."
         end
     end
+    # The CPU keeps its own tuned value; the two backends differ by 32x and
+    # nothing about the GPU finding above applies to `_search_region!`, where
+    # shrinking the chunk was measured WORSE at every thread count (CLAUDE.md).
+    a["blocksize"] == 0 && (a["blocksize"] = CPU_DEFAULT_BLOCKSIZE)
 
     cache = SearchCache()
     # Deferred plotting: (FFTFile, candidates, stem) per file with something to

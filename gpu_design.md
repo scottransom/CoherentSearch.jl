@@ -2162,6 +2162,115 @@ In value order, all of it measured rather than modelled:
 6. **Run `bench/gpu_interp_bench.jl` on all three new cards** to close §0.46.
 
 
+### 4.13 Download/scan overlap, and a GPU `--blocksize` default — measured on the GTX 1080
+
+Three changes, all from §4.12's findings, all with candidates **byte-identical**
+to the code before them at every blocksize tried.
+
+#### The overlap: 1.29x at blocksize 8192, 1.21x at 131072
+
+§4.12 identified `download` + `scan` as ~31% of wall clock on the A100 and the
+A4000 and called it the largest single item left. It is now overlapped with the
+next chunk's device work. Interleaved A/B against a worktree at `cf4dd1b`,
+PM0063, GTX 1080 on `fitzroy`, warm in-process, min of 3 per invocation, three
+rounds:
+
+| blocksize | before | after | **speedup** |
+|---|---|---|---|
+| 8192 | 0.9479 / 0.9373 / 0.9570 | 0.7323 | **1.294x** |
+| 131072 | 0.7560 / 0.7415 / 0.7575 | 0.6273 | **1.205x** |
+
+Round-to-round scatter is under 1% in both arms, which is unusually clean for
+this host and worth noting given how much of this file is warnings about
+scatter. **Throughput mode gains the same 1.167x** and does not drift: four
+files in one process, 0.7791 s each before against 0.6675 s each after, against
+single-file 0.7678 / 0.6581.
+
+**This is the SMALLEST win the change should produce.** The GTX 1080's host share
+is 14.1%; the A100's and the A4000's are ~31.4%, so those should land nearer
+1.4x. `hypatia`'s RTX 4000 SFF Ada has the fastest host CPU measured (scan 2.97
+ns/trial) and only a 13.8% host share at blocksize 16384, so expect ~1.15x there,
+not 1.4x.
+
+**How it works, and the three things that make it safe** (all three are needed;
+the code comment in `_region!` says the same in place):
+
+- **Double buffering.** `out[:, :, b]` and `hostm[b]` alternate, so chunk `c+2`
+  is the first to reuse chunk `c`'s buffers — and the host has already waited for
+  chunk `c`'s copy (while scanning it, at iteration `c+1`) before iteration `c+2`
+  queues anything. **Host-side ordering is what makes the write-after-read safe**,
+  so the compute stream never has to wait on an event.
+- **A separate copy stream plus an event.** `copystream` waits on `ready[b]`,
+  recorded on the compute stream after the last boxcar. Running the transfer off
+  the compute stream is what lets PCIe and the SMs work at once; issuing it on
+  the compute stream would have kept the scan overlap and thrown the download
+  overlap away.
+- **Pinned host memory.** `unsafe_copyto!(...; async = true)` only really returns
+  early from page-locked memory, and §4.12 measured pageable D2H at 10-11 GB/s on
+  two hosts, about half the link.
+
+**Candidate order is unchanged** — chunk `c-1` is scanned before chunk `c`, and
+the rung/trial loops inside a chunk are untouched — which is why the output is
+byte-identical rather than merely equivalent. Verified at blocksize 8192, 65536
+and 131072, single-file and two-file, and against the single-file `.cohout`.
+
+**`_ChunkIO` is cached across files, and that was not an optimisation but a
+regression fix I nearly shipped.** The first working version allocated and
+`CUDA.pin`ed two host matrices per `_region!` call. `pin` is a driver
+registration, not a `malloc`, so on a 220-file run that is 440 register/unregister
+calls and ~690 MB of host churn — exactly the per-file cost §4.6 removed from
+everything else. Caching it on the same `(WT, params, Nprof)` key was worth a
+further 1.6-3.2% even in a *single*-file measurement (0.7442 -> 0.7323 at 8192,
+0.6475 -> 0.6273 at 131072).
+
+**The phase table deliberately does NOT show the overlap.** With `gpu_timing!`
+on, the schedule reverts to serial — sync, then scan, then next chunk — so
+`download` and `scan` still report their un-overlapped cost and every card report
+taken before this change stays comparable. The clean total, timing off, is where
+the win appears. The two schedules share one `scan_buffer!` implementation, so
+they cannot drift apart.
+
+**A secondary effect worth having: it flattens the blocksize response.** The
+1080's spread between 8192 and 131072 was 1.28x and is now 1.17x. Small chunks
+mean more chunks and so more host-side work per unit of device work, which is
+exactly what the overlap hides — so this helps most where §4.10's sub-batching
+also aimed, and by a larger factor.
+
+#### `--blocksize` now defaults per backend: 2048 on the CPU, 65536 on the GPU
+
+§4.12 proposed it and Scott took it. `CPU_DEFAULT_BLOCKSIZE` and
+`GPU_DEFAULT_BLOCKSIZE` live in `src/backendtypes.jl`; `--blocksize 0` (the new
+ArgParse default) resolves per backend, and `search(...)` resolves it the same
+way so a **library** caller who never passes `blocksize` is not left in the hole
+either. The CPU's tuned 2048 is untouched.
+
+This is deliberately **one constant, not the per-device rule §4.11 declined and
+§4.12 refuted**: 65536 is within 1.14x of the optimum on all six measured cards,
+against 1.37-5.55x for 2048, and it fails safe on memory (0.18 GiB of workspace,
+which fits the 3.67 GiB RTX A400 where 131072 does not). An explicit
+`--blocksize <= 2048` under `--gpu` still warns; the default now emits an `@info`
+naming the sweep instead.
+
+**The one card this makes WORSE is the RTX 4000 SFF Ada**, whose measured optimum
+is 8192 (§4.11) — 65536 costs it 1.13x. That is the price of a single constant
+and it is inside the 1.14x bound, but anyone running on that card should pass
+`--blocksize 8192` explicitly.
+
+#### The memory gate no longer double-counts the pool
+
+§4.12's diagnosis, fixed: `_check_device_memory` reclaims **only on the path that
+was about to fail**, then re-reads `CUDA.memory_info()`. The normal path still
+never pays the ~0.36 s, so §4.6's throughput fix is intact.
+
+**The obvious alternative is wrong and was checked in the source rather than
+assumed.** Adding `CUDA.cached_memory()` to the free figure looks like the
+natural fix, but CUDA.jl defines it as `MEMPOOL_ATTR_RESERVED_MEM_CURRENT` — the
+pool's *total* backing memory, used and unused alike — so it would have counted
+live allocations as available, and it returns `missing` on a device without a
+stream-ordered allocator. `reclaim`-then-measure is exact and needs no such
+assumption. `out` being double-buffered is also now in `need`.
+
+
 ---
 
 ## 5. Correctness — the fourth pin

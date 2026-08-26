@@ -2149,6 +2149,11 @@ parallelised across independent fundamental-frequency chunks of `blocksize`
 trials each.  Each task owns a private [`Workspace`](@ref); all FFTW plans and
 interpolation kernels are built once before the parallel region.
 
+`blocksize = 0` (the default) resolves per backend -- `CPU_DEFAULT_BLOCKSIZE`
+(2048) or `GPU_DEFAULT_BLOCKSIZE` (65536).  The two differ by 32x and both are
+measured; see those constants for why, and `gpu_design.md` §4.12 for the sweep
+that a GPU user should run to squeeze out the last ~14%.
+
 The `lofreq`/`lobin` precedence matches the Python CLI: `lofreq` is used unless
 `lobin` is set to something other than its default of 100.
 
@@ -2182,7 +2187,7 @@ built once for the whole run instead of once per file.  Results are unchanged.
 """
 function search(ft::FFTFile, params::SearchParams=SearchParams();
                 lofreq::Real=0.1, hifreq::Real=100.0, lobin::Integer=100,
-                blocksize::Integer=2048, threshold::Real=params.threshold,
+                blocksize::Integer=0, threshold::Real=params.threshold,
                 remove::Bool=true, dr_tol::Real=1.0,
                 harm_remove::Bool=true, numharm::Integer=16, harm_tol::Real=1.0,
                 progress::Symbol=:none,
@@ -2206,7 +2211,14 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
 
     total = max(0, floor(Int, (r_hi - r_lo) / lodr) + 1)
     total == 0 && return Candidate[]
-    Nprof = max(1, Int(blocksize))
+    # `blocksize = 0` means "this backend's default", which is 2048 on the CPU
+    # and 65536 on the GPU -- see `CPU_DEFAULT_BLOCKSIZE`/`GPU_DEFAULT_BLOCKSIZE`
+    # for why they differ by 32x.  Resolving it here rather than in the CLI keeps
+    # a library caller who never passes `blocksize` out of the same hole.
+    bs = blocksize == 0 ?
+        (backend isa CPUBackend ? CPU_DEFAULT_BLOCKSIZE : GPU_DEFAULT_BLOCKSIZE) :
+        blocksize
+    Nprof = max(1, Int(bs))
     nchunks = cld(total, Nprof)
 
     # Load saved FFTW wisdom so the (single-threaded, up-front) planning below
