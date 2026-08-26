@@ -2557,6 +2557,50 @@ than the 2048 it replaced (which costs this card **1.91x**, and the A100 5.55x),
 so the default stands — but the number quoted for it is now **~1.2x** and should
 be treated as provisional until the other cards are re-swept.
 
+#### The sweep now runs to 1048576, and the GTX 1080's optimum is bracketed at last
+
+Extended for the A100, whose sweep was still improving 1.04x at the top row and
+so had never bracketed its optimum — the same mistake §4.11 caught at the *other*
+end, where the Ada's real optimum turned out to sit below the old floor. Rows
+that do not fit are skipped by `_check_device_memory` and cost nothing.
+
+It paid for itself on the first run. On the GTX 1080, `524288` reads **0.645 s
+against 262144's 0.630** — so that card's optimum is a genuine interior minimum,
+where before it was merely the last row measured and could have been a ceiling.
+
+#### The memory gate ALSO under-counted cuFFT's scratch, by up to 1.39x
+
+Found while chasing a skip message that looked wrong. There is **no leak** — the
+device memory a sweep holds is exactly the live cached workspace for the current
+blocksize, and `release_backend!` returns all of it (measured across six
+blocksizes: pool `used` 0.01 → 2.34 GiB rising with `Nprof`, then 0.00 after
+release). But comparing the gate's `need` against the pool's actual `used`:
+
+| `Nprof` | gate `need` | actually used | unaccounted |
+|---|---|---|---|
+| 32768 | 0.121 GiB | 0.129 | 0.008 (**1.07x**) |
+| 131072 | 0.390 GiB | 0.510 | 0.120 (**1.31x**) |
+| 524288 | 1.465 GiB | 2.033 | 0.568 (**1.39x**) |
+
+The missing term is **cuFFT's own plan scratch**, which the gate never counted
+and which scales with batch size: 262 B/trial at 32768, 983 at 131072, 1164 at
+524288 — rising, then flattening near ~1.2 kB as cuFFT switches strategy. So the
+gate could pass a configuration that then died with a bare
+`OutOfGPUMemoryError`, **which is precisely the failure it exists to replace with
+a useful message.**
+
+Now charged at the plateau, 1200 B/trial, and the error breakdown gained a
+`cuFFT scratch` line. Re-measured, `need` is **0.95-0.99x** of actual — slightly
+conservative, which is the right direction for a gate. It over-counts at small
+`Nprof` (by 0.03 GiB at 32768, i.e. nothing) and is roughly right where it
+matters. **It is a budget, not a model:** one card, one rung set, and the
+constant should be re-checked if the decimation ladder or `nharms` defaults move.
+
+This lands on top of the pool double-count fix above; the two are independent
+and both were needed. Between them the per-trial device footprint the user
+should assume is **~4.1 kB**, not §4.11's 2912 B — that figure counted only the
+buffers this code allocates itself.
+
 #### The memory gate no longer double-counts the pool
 
 §4.12's diagnosis, fixed: `_check_device_memory` reclaims **only on the path that

@@ -859,8 +859,20 @@ function _check_device_memory(ft::FFTFile, params::SearchParams, Nprof::Integer,
     amps = length(ft.amps) * sizeof(ComplexF32)
     stack = sum((fld(nh, k) + 1) * Nprof * 2 * sizeof(WT) for k in ks)
     prof = sum(2 * fld(nh, k) * Nprof * sizeof(WT) for k in ks)
+    # cuFFT allocates scratch of its own for the batched C2R plans, and this used
+    # to be missing entirely -- so the gate passed configurations that then died
+    # with a bare OutOfGPUMemoryError, which is the exact failure it exists to
+    # replace with a useful message.  Measured on a GTX 1080 (PM0063, six rungs,
+    # pool `used` after a search minus the accounted total): 262 B/trial at
+    # `Nprof = 32768`, 983 at 131072, 1164 at 524288 -- rising, then flattening
+    # near ~1.2 kB as cuFFT switches strategy with batch size.  Charging the
+    # plateau over-counts at small `Nprof`, but by 0.03 GiB at 32768, which is
+    # nothing; under-counting at large `Nprof` was worth **1.39x** and is not.
+    # Approximate and from one card: it is a budget, not a model.
+    fftws = 1200 * Nprof
     need = amps + (nh + 1) * Nprof * 2 * sizeof(WT) + stack + prof +
-           2 * Nprof * length(ks) * sizeof(Float32)   # `out` is double-buffered
+           2 * Nprof * length(ks) * sizeof(Float32) +   # `out` is double-buffered
+           fftws
     # `CUDA.memory_info()` reports what the DRIVER has free, and CUDA.jl's pool
     # holds on to freed blocks rather than returning them -- deliberately, since
     # §4.6 moved `CUDA.reclaim()` out to `release_backend!` so that a many-file
@@ -891,7 +903,8 @@ function _check_device_memory(ft::FFTFile, params::SearchParams, Nprof::Integer,
             This search needs about $(round(gb(need), digits=2)) GiB on the GPU but only $(round(gb(free), digits=2)) GiB of $(round(gb(tot), digits=2)) GiB is free (after reclaiming the CUDA.jl pool).
 
               amplitudes      $(round(gb(amps), digits=2)) GiB  (the whole .fft)
-              chunk workspace $(round(gb(need - amps), digits=2)) GiB  (--blocksize $Nprof)
+              chunk workspace $(round(gb(need - amps - fftws), digits=2)) GiB  (--blocksize $Nprof)
+              cuFFT scratch   $(round(gb(fftws), digits=2)) GiB  (estimated; also scales with --blocksize)
 
             Lower --blocksize (the workspace scales with it; the amplitudes do not),
             or use a GPU that is not also driving a display.""")

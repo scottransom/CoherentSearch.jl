@@ -101,7 +101,14 @@ end
 println("\nblocksize sweep (timing OFF -- these are the honest totals):")
 println("  blocksize    wall (s)    ns/trial   cands")
 results = Tuple{Int,Float64}[]
-for bs in (2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144)
+# Up to 1048576 because the A100's sweep was still improving at 262144 (1.04x
+# from the row below it) and so never bracketed its optimum -- the same mistake
+# §4.11 caught at the OTHER end, where the Ada's real optimum turned out to sit
+# below the old floor of 16384.  Rows that do not fit are skipped by
+# `_check_device_memory` and cost nothing: at ~2912 B per trial, 1048576 needs
+# 3.05 GiB of workspace on top of the amplitudes, so a small card simply drops
+# the top rows.
+for bs in (2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576)
     # Three searches per row: one warm-up plus two timed.  The candidate count
     # comes from the warm-up rather than a fourth call -- on a big file each
     # search is seconds, and a redundant one per row is minutes over the sweep.
