@@ -2567,17 +2567,37 @@ invocation at `--blocksize 8192`, measured first-output to last-output:
 | 2026-08-25 | 1151 s (19m11s) | 5.232 s | |
 | 2026-08-26 | **934 s (15m34s)** | **4.245 s** | **1.232x** |
 
-**Three outcomes were pre-registered before the run** from yesterday's per-file
+**Three outcomes were pre-registered before the run** from the 08-25 per-file
 decomposition (5.232 s = 3.994 s of search + 1.238 s of read/upload/write):
 958 s if the single-file 1.28x carried, 1046 s if only the overlap's
 phase-table-bounded 1.135x was real, 1151 s if the job was I/O bound. **Measured
-934 s — 2.5% better than the most optimistic of the three**, so the I/O worry
-(§0.5's "in throughput mode the limit becomes I/O, not the GPU") does not bite
-on this host, and the improvement carries into throughput mode in full.
+934 s.** So §0.5's I/O worry ("in throughput mode the limit becomes I/O, not the
+GPU") does not bite on this host, and the improvement carries into throughput
+mode in full.
 
-Implied search per file is **3.008 s** against the single-file report's 3.117 s
-— slightly *better*, which is the right direction: start-up and plans are
-amortised over 220 files and `_ChunkIO` is pinned once instead of 440 times.
+**The 24 s by which it beat the best prediction is NOT the code — it is a
+confound, and it lands to 0.1 s.** The 08-26 run served its files from
+`/dev/shm`; the 08-25 run used a local fast `/tmp`. Decomposing (the report's
+clean total is I/O-independent — `FFTFile` is opened once outside the timing
+loop, so the mmap pages are already faulted and the timed searches copy from
+page cache either way, which makes it a fair proxy for per-file search time):
+
+| | per file | search | overhead |
+|---|---|---|---|
+| 2026-08-25, local `/tmp` | 5.232 s | 3.994 | 1.238 |
+| 2026-08-26, `/dev/shm` | 4.245 s | 3.117 | **1.128** |
+
+Overhead improved 1.097x, i.e. **0.109 s/file — 24.1 s over the job**, against a
+prediction-to-measurement gap of **24.1 s**. So the model was right and the
+overshoot is entirely the filesystem. **`/dev/shm` is 11% of the 0.986 s/file
+saved; the code is the other 89%.** Note what that also says about the storage:
+0.11 s/file on a 1.29 GiB file means the local `/tmp` was already serving most
+of it from page cache, so there was little for a RAM disk to win.
+
+**Do not quote "beat the most optimistic prediction".** It *matched* the
+prediction, which is the better result — a per-file model built the day before
+from a single-file report predicted a 220-file job to 2.5%, and the residual was
+explained by a change in the inputs rather than left as scatter.
 
 **Attribution, stated carefully.** This is 1.232x on the *job*, not 1.232x
 attributable to the overlap. The 2026-08-25 baseline ran through a CUDA

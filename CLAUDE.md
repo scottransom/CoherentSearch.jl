@@ -415,8 +415,11 @@ measuring the host's scheduler, not the GPU — discard it. **`download` + `scan
 chunk's device work** (§4.13): double-buffered `out`/`hostm`, a separate copy
 stream gated by an event, pinned host memory, candidates byte-identical.
 **On Scott's real 220-file job (RTX 4000 SFF Ada, `--blocksize 8192`) the wall
-clock went 19m11s -> 15m34s, 1.232x, beating the most optimistic of three
-pre-registered predictions and ruling out the I/O-bound case** (§4.13).
+clock went 19m11s -> 15m34s, 1.232x, matching a pre-registered per-file model to
+2.5% and ruling out the I/O-bound case** (§4.13; the 2.5% is a filesystem
+confound — files came from `/dev/shm` rather than local `/tmp`, worth 0.109 s per
+file or 24.1 s over the job against a 24.1 s gap, so **11% of the saving is I/O
+and 89% is the code**).
 Measured **1.294x at blocksize 8192 and 1.205x at 131072 on the GTX 1080**, whose
 14.1% host share is the smallest of the modern cards — the A100 and A4000 sit at
 ~31% and should see nearer 1.4x, `hypatia`'s Ada nearer 1.15x. Throughput mode
