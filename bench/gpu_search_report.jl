@@ -107,16 +107,16 @@ CS.gpu_timing!(false)
 pt = CS.gpu_phase_times()
 kind = CS.GPU_PHASE_KIND
 acc = sum(last.(pt))
-dev = sum(s for (i, (_, s)) in enumerate(pt) if kind[i] === :device)
+devsecs = sum(s for (i, (_, s)) in enumerate(pt) if kind[i] === :device)
 println("                                  share of  share of")
 println("  phase       where      time (s)     total    device")
 for (i, (name, secs)) in enumerate(pt)
-    devshare = kind[i] === :device ? @sprintf("%7.1f%%", 100 * secs / dev) : "       -"
+    devshare = kind[i] === :device ? @sprintf("%7.1f%%", 100 * secs / devsecs) : "       -"
     @printf("  %-10s %-9s %8.4f  %7.1f%%  %s\n",
             name, string(kind[i]), secs, 100 * secs / acc, devshare)
 end
-@printf("  %-10s %-9s %8.4f  %7.1f%%\n", "= device", "", dev, 100 * dev / acc)
-@printf("  %-10s %-9s %8.4f  %7.1f%%\n", "= host+pcie", "", acc - dev, 100 * (acc - dev) / acc)
+@printf("  %-10s %-9s %8.4f  %7.1f%%\n", "= device", "", devsecs, 100 * devsecs / acc)
+@printf("  %-10s %-9s %8.4f  %7.1f%%\n", "= host+pcie", "", acc - devsecs, 100 * (acc - devsecs) / acc)
 @printf("  %-10s %-9s %8.4f   (instrumented; clean total was %.3f s)\n", "TOTAL", "", acc, best[2])
 println("  NOTE: `scan` is this HOST's CPU and `download` is PCIe -- neither is a")
 println("        property of the card.  Compare cards on the device column.")
@@ -137,7 +137,7 @@ println("PASTE THIS BLOCK BACK:")
 @printf("  phases (of total):  %s\n",
         join((@sprintf("%s %.1f%%", n, 100 * s / acc) for (n, s) in pt), "  "))
 @printf("  phases (of device): %s   [device %.1f%% of instrumented]\n",
-        join((@sprintf("%s %.1f%%", n, 100 * s / dev)
+        join((@sprintf("%s %.1f%%", n, 100 * s / devsecs)
               for (i, (n, s)) in enumerate(pt) if kind[i] === :device), "  "),
-        100 * dev / acc)
+        100 * devsecs / acc)
 println("="^78)

@@ -1627,13 +1627,108 @@ between its best and worst sweep point falls from **1.21x to 1.06x**. A user who
 does not sweep — which is every user who is not classifying a card — loses much
 less by guessing wrong.
 
-That is a real but modest property, and it is Scott's call whether it is worth
-carrying ~80 lines, a struct, a knob and 60 tests, against this file's explicit
-retirement discipline. **Keeping it** is defensible on the robustness argument
-plus the fact that a future card with big L2 *and* a large optimal blocksize
-would need it, and it is bit-exact and self-disabling so it can never cost
-anything. **Reverting it** is defensible because it is inert on every card that
-exists here today. It should not be described as a speed win either way.
+**KEPT — Scott's call, 2026-08-25, and his reason is better than the one this
+section first gave.** Not "it might help a future card": *there are a wide
+variety of GPUs out there and very few people are willing or able to devote
+resources to tuning for what they have.* On that criterion the figure of merit
+is **the worst case an untuned user hits**, not the best case a tuned one
+reaches — and sub-batching improves the worst case by 1.21x -> 1.06x on the one
+card where the cliff is steep, at zero cost to the best case, bit-exactly and
+with no flag to set. **It should still never be described as a speed win**; it is
+a flattening of the `--blocksize` response curve.
+
+**That criterion immediately indicts something bigger — see §4.11.** If the
+untuned user is who we are optimising for, the first thing to look at is what
+they actually get by default, and `--blocksize` defaults to **2048** on the GPU
+as well as the CPU.
+
+
+### 4.11 The lower sweep floor paid off, and it exposes a much bigger robustness hole
+
+`gpu_search_report.jl` re-run on `hypatia` with the labelled phases and the
+sweep extended down to 4096.
+
+**The extended floor was worth 1.074x, for free — §4.8's guess was right.** §4.8
+argued the Ada's in-search knee had moved below the bottom of the old sweep,
+because cuFFT there shares its 40 MB with the rest of the pipeline. It had:
+
+| Ada, ns/trial | 4096 | **8192** | 16384 | 32768 | 65536 | 131072 | 262144 |
+|---|---|---|---|---|---|---|---|
+| | 44.5 | **37.9** | 41.0 | 42.8 | 42.9 | 43.1 | 42.6 |
+
+**8192 is a genuine interior minimum** (4096 is worse), and it takes the card
+from §4.8's 40.7 to **37.9 ns/trial — 3.994 s on NGC6624**. That is the best
+number any card has produced here, and it cost nothing but two more sweep rows.
+**The Ada is 15.49x `hypatia`'s own single core** (61.849 s) and **~2.96x
+fitzroy's 20-core Xeon** (11.82 s).
+
+#### Device-only shares, and the boxcar finally takes the lead
+
+| at each card's best blocksize | zero | interp | transpose | transform | boxcar |
+|---|---|---|---|---|---|
+| GTX 1080 (262144), device-only | 2.8% | 17.8% | 14.7% | **45.1%** | 19.5% |
+| RTX 4000 Ada (8192), device-only | 5.4% | 24.3% | 14.4% | 26.3% | **29.6%** |
+
+**§4.7's prediction that "the boxcar becomes the largest phase" has finally come
+true on the Ada — by a route it did not predict.** Not because a 40 MB L2 made
+the transform cheap (§4.8 measured that not carrying into the pipeline), but
+because the *blocksize* fell to 8192 and because the host scan and PCIe are now
+out of the denominator. Right answer, wrong mechanism, two sections apart.
+
+**The renormalisation arithmetic checks out where it can be checked.** §4.10
+predicted 44.8% device-transform for the 1080 from renormalising §4.7's raw
+shares; measured **45.1%**. That is worth noting because the same run's absolute
+total moved **24%** between sessions (1.115 s against §4.7's 0.896 s) on a card
+that drives Scott's desktop — **the shares held to 0.3 points while the seconds
+moved 24%**, which is this file's "read the shares" rule proving itself rather
+than merely being asserted. **Do not update §4.7's reference total from a
+desktop-card run.** The Ada's 26.3% is at blocksize 8192 and so does not score
+§4.10's 38.3% prediction, which was a renormalisation of a 16384 run — different
+operating point, not comparable.
+
+#### The real robustness hole: `--blocksize` defaults to 2048 on the GPU
+
+`--blocksize` defaults to **2048** — the CPU's tuned value — and `--gpu` does not
+change it. Measured on the GTX 1080, PM0063:
+
+| blocksize | ns/trial | vs this card's best |
+|---|---|---|
+| **2048 (the default)** | **224.5** | **1.65x** |
+| 8192 | 166.0 | 1.22x |
+| 32768 | 143.7 | 1.06x |
+| 131072 | 137.0 | 1.01x |
+| 262144 | 136.1 | 1.00x |
+
+**An untuned `--gpu` run gives up 1.65x on this card**, which dwarfs the
+1.21x -> 1.06x that §4.10 kept sub-batching for. And the optimum spans **8192 to
+262144 — a factor of 32 — across three cards**, so there is no single constant to
+move it to; the default has to be derived per device or the user has to sweep.
+
+**A derived rule that fits all three, using the same constant as `_sub_cols`.**
+The whole per-trial device footprint of a `GPUChunk` at the default parameters is
+`ftprofs` 488 B + the six stacks 1224 B + the six profile buffers 1176 B + `out`
+24 B = **2912 B per trial**. Taking the same `0.5 x L2` target:
+
+| | 0.5 x L2 / 2912 | measured optimum |
+|---|---|---|
+| RTX 4000 Ada (40 MB) | **6868** | **8192** |
+| RTX 2080 Super (4 MB) | 687 — below any floor, fall back | **262144** |
+| GTX 1080 (2 MB) | 344 — below any floor, fall back | **262144** |
+
+Same two-regime shape as the sub-batch policy, same constant, and it lands on all
+three measured optima. **Not implemented — proposed.** It changes a shipped
+default, so it is Scott's call, and the floor and the fallback value both want
+measuring on more than three cards before being trusted.
+
+#### A bug of mine, recorded because it is the kind that recurs
+
+The device/host labelling in §4.8 introduced `dev = sum(...)` in
+`gpu_search_report.jl`, **shadowing the `dev = CUDA.device()` set 60 lines
+earlier**, so the pasteable summary block — the last thing the script prints, and
+the whole point of it — died with `MethodError: no method matching name(::Float64)`
+*after* a full multi-minute run on a remote host. The script had been validated on
+the GTX 1080, but only as far as the phase table. **Validate a script to its last
+line of output, not to the part you changed.**
 
 
 ---
