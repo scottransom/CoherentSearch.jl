@@ -2326,6 +2326,52 @@ Consequences, in order of how much they matter:
   about checking `uptime` on `fitzroy` before timing — applied to hosts nobody
   thought of as desktops.
 
+#### A shared NFS `$HOME` broke CUDA installs on two hosts, and the tooling caused it
+
+Hit 2026-08-26 when Scott could not get CUDA to precompile on `hypatia`. His
+first guess was that the two hosts were clashing through the depot; they were
+clashing, but not there.
+
+**Separate `JULIA_DEPOT_PATH`s really do isolate precompile caches and
+artifacts. What was shared was the ENVIRONMENT, and an environment holds a
+`Manifest.toml`** — which pins the exact `CUDA_Runtime_jll` and artifact versions
+that depot has to contain, a choice CUDA.jl makes from the host's *driver and
+card*. `bench/gpu_probe_setup.sh` defaulted `PREFIX` to `$HOME/.gpuprobe`, and
+NRAO `$HOME` is NFS, so `usnea` (2x RTX A4000, sm_86) and `hypatia` (RTX 4000
+SFF Ada, sm_89) shared one Manifest. Whoever ran the setup last won; the other
+host tried to instantiate artifacts its depot had never seen. **The failure mode
+is precompiling CUDACore dying on a missing `.so`** — I hit the same thing from
+the other direction on `usnea`, where a fresh resolve wanted
+`libnvJitLink.so.13`.
+
+The repo's *own* `Project.toml` and `Manifest.toml` were polluted the same way,
+and the README was telling people to do it: it said
+`julia --project=. -e 'using Pkg; Pkg.add("CUDA")'`, which **moves `CUDA` out of
+`[weakdeps]`** — defeating the extension, since every CPU-only user would then
+download it — and resolves the whole CUDA tree into this repo's Manifest, on
+shared NFS, for every host at once.
+
+Three fixes:
+
+- **`PREFIX` now travels with the depot**: `${JULIA_DEPOT_PATH%%:*}/gpuprobe`
+  when a depot is set, else `$HOME/.gpuprobe/$(hostname -s)`. The air-gapped
+  login-node case in the script's header still works, because sharing a depot
+  derives the same PREFIX — and that case really is one machine's worth of
+  hardware, which is the distinction that matters.
+- **The README installs into a separate environment**, with a paragraph on why
+  one environment per GPU machine, next to that machine's depot.
+- Nothing was done to the repo checkouts themselves; `git checkout --
+  Project.toml Manifest.toml` is Scott's to run.
+
+**One hypothesis was tested and REFUTED, which is why it is not in the fix.** The
+polluted `Project.toml` leaves `CUDA` in `[deps]` while `[extensions]` still
+names it as the trigger for `CoherentSearchCUDAExt`, and an extension trigger
+that is a hard dependency looks like it must be invalid. Reproduced on `fitzroy`
+with exactly that file: **it precompiles fine and the extension loads**
+(`has_gpu()` true). Julia 1.12 tolerates it. So the corrupted `Project.toml` is
+a real problem for CPU-only users and is *not* what broke `hypatia` — the
+Manifest is. Worth recording because it is the obvious answer and it is wrong.
+
 #### The memory gate no longer double-counts the pool
 
 §4.12's diagnosis, fixed: `_check_device_memory` reclaims **only on the path that

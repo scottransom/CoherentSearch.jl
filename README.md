@@ -541,10 +541,24 @@ You need an NVIDIA **driver**. You do *not* need a system CUDA toolkit, `nvcc`,
 or a module-loaded CUDA — CUDA.jl ships its own toolkit as artifacts and will
 use those in preference to anything on the system.
 
+**Install CUDA into a separate environment, not into this repo.** `Pkg.add`
+would move `CUDA` out of `[weakdeps]` in `Project.toml` — defeating the whole
+point of the extension, since every CPU-only user would then download it — and
+resolve the entire CUDA dependency tree into this repo's `Manifest.toml`.
+
 ```sh
-julia --project=. -e 'using Pkg; Pkg.add("CUDA")'
-julia --project=. -e 'using CUDA; CUDA.versioninfo()'      # check it works
+mkdir -p ~/gpuenv && cat > ~/gpuenv/Project.toml <<'TOML'
+[deps]
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+CoherentSearch = "b7e4a1c2-3d6f-4e8a-9c1b-2a5d8f3e6c40"
+TOML
+julia --project=~/gpuenv -e 'using Pkg; Pkg.develop(path="."); Pkg.instantiate()'
+julia --project=~/gpuenv -e 'using CUDA; CUDA.versioninfo()'   # check it works
+julia --project=~/gpuenv bin/coherent_search.jl --gpu FILE.fft
 ```
+
+`bench/gpu_probe_setup.sh` does all of this for you and picks the location
+itself; use it if you would rather not think about any of the above.
 
 The artifacts are ~2.2 GB and land in the Julia depot. If `$HOME` is small or on
 slow NFS, point the depot at local scratch first:
@@ -553,9 +567,20 @@ slow NFS, point the depot at local scratch first:
 export JULIA_DEPOT_PATH=/fast/local/depot
 ```
 
-On a cluster whose compute nodes are air-gapped, run the `Pkg.add` on a login
+**If you use more than one GPU machine, give each its own environment, and put
+it next to that machine's depot.** The environment holds a `Manifest.toml`, and
+a Manifest pins the exact `CUDA_Runtime_jll` and artifact versions the depot has
+to contain — a choice that depends on the host's driver and card. Put one
+environment on a shared NFS `$HOME` and two machines will fight over it: whoever
+installed last wins, and the other tries to instantiate artifacts its depot has
+never seen and fails to precompile CUDA with a missing `.so`. Separate
+`JULIA_DEPOT_PATH`s do **not** protect you here, because the depot is not what is
+being shared.
+
+On a cluster whose compute nodes are air-gapped, run the install on a login
 node that shares the filesystem, then run on the GPU node with the same
-`JULIA_DEPOT_PATH`.
+environment and `JULIA_DEPOT_PATH` — that case is fine, because it really is one
+machine's worth of hardware.
 
 ### Tune `--blocksize` for your card — it is worth up to 1.14x over the default
 

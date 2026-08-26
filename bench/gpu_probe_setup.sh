@@ -37,10 +37,31 @@
 #
 # Internet: needed for the install only.  If compute nodes are air-gapped, run
 # this once on a login node with the same filesystem, then run the probe itself
-# on the GPU node with the same PREFIX and JULIA_DEPOT_PATH.
+# on the GPU node with the same PREFIX and JULIA_DEPOT_PATH.  (That case still
+# works below: sharing a depot gives the same derived PREFIX.)
+#
+# PREFIX MUST TRAVEL WITH THE DEPOT, and defaulting it to $HOME broke that.  The
+# env this creates holds a Manifest.toml, and a Manifest pins the exact
+# CUDA_Runtime_jll and artifact versions the depot has to contain -- a choice
+# that depends on the host's driver and card.  On a site with a shared NFS $HOME
+# and per-host depots (NRAO), two machines then fight over one Manifest: whoever
+# ran this last wins, and the other host tries to instantiate artifacts its
+# depot has never seen and dies precompiling CUDACore on a missing .so.  Two
+# hosts, two GPUs, one Manifest -- and separate JULIA_DEPOT_PATHs do NOT save
+# you, because the depot is not what is shared.
+#
+# So: derive PREFIX from the depot when there is one, and fall back to a
+# per-host directory otherwise.  Setting PREFIX explicitly still overrides.
 set -euo pipefail
 
-PREFIX="${PREFIX:-$HOME/.gpuprobe}"
+if [ -z "${PREFIX:-}" ]; then
+    if [ -n "${JULIA_DEPOT_PATH:-}" ]; then
+        # First entry of a :-separated depot list is the writable one.
+        PREFIX="${JULIA_DEPOT_PATH%%:*}/gpuprobe"
+    else
+        PREFIX="$HOME/.gpuprobe/$(hostname -s)"
+    fi
+fi
 BENCHDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # First positional argument selects the script to run; default the probe.
 SCRIPT="${1:-$BENCHDIR/gpu_probe.jl}"
