@@ -81,7 +81,7 @@ end
 println("\nblocksize sweep (timing OFF -- these are the honest totals):")
 println("  blocksize    wall (s)    ns/trial   cands")
 results = Tuple{Int,Float64}[]
-for bs in (4096, 8192, 16384, 32768, 65536, 131072, 262144)
+for bs in (2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144)
     # Three searches per row: one warm-up plus two timed.  The candidate count
     # comes from the warm-up rather than a fourth call -- on a big file each
     # search is seconds, and a redundant one per row is minutes over the sweep.
@@ -98,6 +98,39 @@ for bs in (4096, 8192, 16384, 32768, 65536, 131072, 262144)
 end
 best = isempty(results) ? (65536, NaN) : results[argmin(last.(results))]
 @printf("  best: blocksize %d at %.3f s\n", best[1], best[2])
+
+# ---------------------------------------------------------------------------
+# The recommendation.  This is the whole point of the script for a user (as
+# opposed to for `gpu_design.md`): `--blocksize` defaults to 2048, which is the
+# CPU's tuned value and is wrong on every GPU measured so far -- 1.65x off the
+# best on a GTX 1080.  The optimum spans 8192 to 262144 across three cards, a
+# factor of 32, and it tracks L2 size INVERSELY (a big cache wants a small chunk,
+# so the whole pipeline stays resident; a small cache cannot hold anything at any
+# size, so only occupancy and launch amortisation are left and bigger wins).
+#
+# We deliberately do NOT derive this at run time.  A rule fitted to three cards
+# is not a rule, and the middle of the L2 range -- around 12 MB, where the two
+# regimes meet -- is entirely unmeasured.  Sweeping takes minutes and is exact.
+# ---------------------------------------------------------------------------
+if !isempty(results)
+    d = Dict(results)
+    println("\n" * "-"^78)
+    @printf("RECOMMENDATION for this card:  --blocksize %d\n", best[1])
+    if haskey(d, 2048)
+        pen = d[2048] / best[2]
+        @printf("  Not passing --blocksize gets the CPU default of 2048, which on this\n")
+        @printf("  card costs %.2fx (%.3f s against %.3f s).\n", pen, d[2048], best[2])
+        pen < 1.05 && println("  (On this card the default happens to be fine -- unusual; the three cards
+" *
+                              "   in gpu_design.md all lose 1.2x or more.)")
+    end
+    # How sharp is the optimum?  A user who guesses one row away should know
+    # whether that costs 1% or 20%.
+    near = sort([(abs(log2(bs / best[1])), bs, t) for (bs, t) in results])
+    length(near) > 1 && @printf("  Neighbouring rows: %s\n",
+        join((@sprintf("%d -> %.2fx", bs, t / best[2]) for (_, bs, t) in near[2:min(3, end)]), ", "))
+    println("-"^78)
+end
 
 println("\nper-phase breakdown at blocksize $(best[1]) (timing ON -- read the SHARES;")
 println("the synchronisation this needs inflates the total, so take that from above):")

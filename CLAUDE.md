@@ -369,8 +369,12 @@ engage, and the other two cards' gates decline. Its value is robustness — the
 Ada's blocksize cliff falls 1.21x -> 1.06x. **The Ada's real optimum is
 blocksize 8192, not 16384** (§4.11): 37.9 ns/trial, ~2.96x fitzroy's 20 cores,
 the best number any card here has produced. **But `--blocksize` defaults to 2048
-even under `--gpu`, which costs 1.65x on the 1080** — a derived per-device
-default is proposed in §4.11 and not yet implemented. **The 1.25x prediction was wrong in
+even under `--gpu`, which costs 1.62-1.65x on the 1080.** Deriving it per-device
+was DECLINED (§4.11) — the rule fits three cards and the middle of the L2 range
+is unmeasured. Instead `gpu_search_report.jl` sweeps from 2048 and *recommends*,
+`--gpu` warns when the default is left in place, and the README has a GPU
+section. The governing rule, Scott's: **automate what can't hurt, measure what
+can't be guessed.** **The 1.25x prediction was wrong in
 direction (0.960x), because §4.8's non-transform decomposition had the wrong
 sign; do not re-use that column.** The GPU report now labels phases
 `:device`/`:transfer`/`:host` — **`scan` is host-CPU work and moved 1.75x between

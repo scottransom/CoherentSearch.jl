@@ -1716,9 +1716,35 @@ The whole per-trial device footprint of a `GPUChunk` at the default parameters i
 | GTX 1080 (2 MB) | 344 — below any floor, fall back | **262144** |
 
 Same two-regime shape as the sub-batch policy, same constant, and it lands on all
-three measured optima. **Not implemented — proposed.** It changes a shipped
-default, so it is Scott's call, and the floor and the fallback value both want
-measuring on more than three cards before being trusted.
+three measured optima.
+
+**DECIDED 2026-08-25: NOT implemented, and deliberately so.** Scott's call, and
+the reasoning is worth keeping because it is the general rule this track should
+follow: **automate what can't hurt, measure what can't be guessed.**
+Sub-batching (§4.10) is free, automatic and bit-exact, so it ships silently;
+`--blocksize` cannot be chosen well without measurement, so it gets measured. A
+rule fitted to three cards is not a rule, and the middle of the L2 range —
+around 12 MB, where the two regimes meet — is entirely unmeasured. Requiring a
+user to sweep once also means anyone running GPU searches is deliberate about
+it, which is the realistic population anyway.
+
+What shipped instead, all three of which guess no value:
+
+- **`bench/gpu_search_report.jl` sweeps from 2048** and ends with an explicit
+  recommendation, the measured penalty for taking the default, and the cost of
+  the neighbouring rows so the user knows how sharp the optimum is. On the GTX
+  1080: `--blocksize 262144`, default costs **1.62x**, neighbours 1.00x/1.02x.
+- **`--gpu` warns once** when `--blocksize` is left at 2048, naming the sweep.
+  It fires on an explicit `--blocksize 2048` too, which is correct rather than a
+  false positive: 2048 is a poor choice on a GPU however it was arrived at.
+- **A GPU section in the README** covering CUDA.jl installation (driver only, no
+  toolkit; the depot/NFS and air-gapped-node traps), the tuning step and why the
+  optimum tracks L2 *inversely*, the unsupported flags, the accuracy pins, and
+  how to report a new card.
+
+**Revisit when there are more cards.** If a fourth and fifth land in the same two
+regimes with nothing near the boundary, deriving the default becomes defensible;
+if one lands near 12 MB of L2, this section already says what to measure.
 
 #### A bug of mine, recorded because it is the kind that recurs
 

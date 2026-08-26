@@ -261,6 +261,26 @@ function main(argv)
         end
         backend = require_gpu()
         @info "GPU backend active" device=string(backend)
+        # `--blocksize` defaults to 2048, which is the CPU's tuned value and is
+        # wrong on every GPU measured (1.65x off the best on a GTX 1080; the
+        # optimum spans 8192-262144 across three cards, a factor of 32, and it
+        # tracks L2 INVERSELY).  We do NOT guess a better one here -- a rule
+        # fitted to three cards is not a rule, and the middle of the L2 range is
+        # unmeasured -- but a silent 1.65x is not acceptable either, so say so
+        # once and point at the sweep that measures it exactly.
+        #
+        # Comparing against the default value also warns someone who typed
+        # `--blocksize 2048` explicitly.  That is correct, not a false positive:
+        # it is a poor choice on a GPU either way.
+        if a["blocksize"] == 2048
+            @warn "--gpu is using the default --blocksize 2048, which is tuned for " *
+                  "the CPU and is a poor choice on every GPU measured so far " *
+                  "(1.65x off the best on a GTX 1080).  The best value is " *
+                  "per-device and spans 8192-262144.  Sweep it once for your card " *
+                  "with `julia --project=. bench/gpu_search_report.jl FILE.fft` and " *
+                  "pass the --blocksize it recommends; see the GPU section of the " *
+                  "README."
+        end
     end
 
     cache = SearchCache()

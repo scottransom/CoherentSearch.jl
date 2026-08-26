@@ -521,6 +521,109 @@ one per fold depth and across the band. `test/test_toy.jl` pins the toy's
 interpolation, fold and metric against the oracle-validated reference path, and
 pins the analytic noise scale against synthetic normalised white noise.
 
+## GPU support (`--gpu`)
+
+A CUDA GPU can run the whole search. On the cards measured so far it is roughly
+**1.2x to 3x a 20-core Xeon**, and candidates agree with the CPU path to ~2e-7
+(comparable, deliberately not guaranteed bit-identical — see below).
+
+CUDA is a **weak dependency**: it is not installed unless you ask for it, and a
+CPU-only user downloads nothing. The GPU code lives in a package extension
+(`ext/CoherentSearchCUDAExt.jl`) that loads only when CUDA is present.
+
+### Installing CUDA.jl
+
+You need an NVIDIA **driver**. You do *not* need a system CUDA toolkit, `nvcc`,
+or a module-loaded CUDA — CUDA.jl ships its own toolkit as artifacts and will
+use those in preference to anything on the system.
+
+```sh
+julia --project=. -e 'using Pkg; Pkg.add("CUDA")'
+julia --project=. -e 'using CUDA; CUDA.versioninfo()'      # check it works
+```
+
+The artifacts are ~2.2 GB and land in the Julia depot. If `$HOME` is small or on
+slow NFS, point the depot at local scratch first:
+
+```sh
+export JULIA_DEPOT_PATH=/fast/local/depot
+```
+
+On a cluster whose compute nodes are air-gapped, run the `Pkg.add` on a login
+node that shares the filesystem, then run on the GPU node with the same
+`JULIA_DEPOT_PATH`.
+
+### Tune `--blocksize` for your card first — it is worth up to 1.65x
+
+**This is the one thing you must do before running a real GPU search.**
+`--blocksize` (trial fundamentals per chunk) defaults to 2048, which is tuned for
+the CPU and is a poor choice on every GPU we have measured. The best value is a
+property of the card and spans **8192 to 262144** — a factor of 32 — so there is
+no single default that would serve everyone, and we would rather measure it than
+guess it:
+
+```sh
+julia --project=. bench/gpu_search_report.jl FILE.fft
+```
+
+Use one of your own `.fft` files, ideally a large one. It sweeps `--blocksize`,
+prints a per-phase breakdown, and ends with a recommendation and the penalty for
+not passing one. Then run searches with that value:
+
+```sh
+julia --project=. bin/coherent_search.jl --gpu --blocksize 8192 FILE.fft
+```
+
+The search warns once per invocation if you leave `--blocksize` at the default.
+
+**Why it varies so much, if you are curious.** The optimum tracks the card's L2
+cache *inversely*. A card with a large L2 (an RTX 4000 Ada has 40 MB) wants a
+**small** chunk, so the whole pipeline stays resident in cache; a card with a
+small L2 (a GTX 1080 has 2 MB, an RTX 2080 Super 4 MB) cannot hold the working
+set at any chunk size, so only occupancy and launch amortisation are left and
+**bigger** wins. Measured optima: RTX 4000 Ada 8192, RTX 2080 Super 262144,
+GTX 1080 262144.
+
+### What the GPU path does and does not support
+
+| | |
+|---|---|
+| `--sigma analytic` | required (the default). `--sigma measured` needs a device MAD and errors out |
+| `--normalize` | not supported yet; errors out |
+| `--metricstats` | not supported yet; errors out |
+| everything else | as on the CPU |
+
+Each of these errors clearly rather than silently doing something different.
+
+### Accuracy, and how the GPU is pinned
+
+The GPU is `Float32` throughout and agrees with the CPU to **~2e-7** on profiles
+and on the boxcar metric, against a pinned tolerance of 1e-5. In practice
+candidate lists have come out byte-identical on real data, but that is **not
+guaranteed** — a trial sitting exactly on the threshold could cross either way.
+
+Two properties *are* guaranteed and tested:
+
+- **Batch invariance is bit-exact.** A chunk starting at global trial `t0`
+  reproduces one long chunk exactly, so `--blocksize` changes speed and nothing
+  else. This is what makes tuning it safe.
+- **Transform sub-batching is bit-exact**, likewise — it is a scheduling change
+  only.
+
+`test/test_gpu.jl` (226 tests) runs automatically as part of `Pkg.test()` when a
+functional CUDA device is present, and skips itself when there is not.
+
+### Reporting a new card
+
+`bench/gpu_search_report.jl`'s final block is designed to be pasted back into an
+issue or email. Results from cards we have not seen are genuinely useful: the
+design log (`gpu_design.md`) keeps per-card measurements, and the `--blocksize`
+guidance above is built from only three GPUs so far.
+
+If you want to bootstrap Julia and CUDA.jl on a bare GPU host with no root,
+`bench/gpu_probe_setup.sh` does the whole thing and needs nothing from this repo
+but itself and `bench/gpu_probe.jl`.
+
 ## Testing
 
 ```sh
