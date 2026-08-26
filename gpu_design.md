@@ -2429,6 +2429,26 @@ with exactly that file: **it precompiles fine and the extension loads**
 a real problem for CPU-only users and is *not* what broke `hypatia` — the
 Manifest is. Worth recording because it is the obvious answer and it is wrong.
 
+#### A card classification survives an environment rebuild — 0.4%
+
+After the `PROBE` fix, `hypatia` reinstalled from scratch into a fresh
+environment and re-ran `gpu_probe.jl` (2026-08-26). Against §0.3's recorded
+numbers for the same card:
+
+| | recorded (§0.3, §4.8) | rebuilt env | |
+|---|---|---|---|
+| FP32 achieved | 16807 GFLOP/s | **16869** | 0.4% |
+| copy bandwidth | 239 GB/s | **240** | 0.4% |
+| L2 / arch | 40 MB / sm_89 | 40 MB / sm_89 | — |
+
+**This retires a caveat rather than adding a finding.** `hypatia` and `spare2`
+had been sharing one Manifest out of the Green Bank home for the whole of §4.8
+and §4.11, so those runs were made through whatever CUDA runtime the other host
+last pinned — which raised the question of whether the hypatia-vs-spare2
+comparison was even like-for-like. A fresh, unshared environment reproduces the
+card to 0.4%, so the answer is yes: the Manifest picks CUDA versions, not kernel
+behaviour, and the §4.8/§4.11 numbers stand.
+
 #### The memory gate no longer double-counts the pool
 
 §4.12's diagnosis, fixed: `_check_device_memory` reclaims **only on the path that
