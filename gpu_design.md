@@ -2557,6 +2557,77 @@ than the 2048 it replaced (which costs this card **1.91x**, and the A100 5.55x),
 so the default stands — but the number quoted for it is now **~1.2x** and should
 be treated as provisional until the other cards are re-swept.
 
+### 4.14 A BUG the A100 exposed: results are not chunk-invariant across a Nyquist crossing
+
+**Found 2026-08-26 in the A100 report, and it is pre-existing, shared, and NOT a
+GPU bug** — the GPU only surfaced it because it wants huge chunks. The candidate
+count moved with `--blocksize`:
+
+| blocksize | 2048 … 131072 | 262144 | 524288 | 1048576 |
+|---|---|---|---|---|
+| candidates | **802** | 804 | 805 | **810** |
+
+That contradicts §5's batch-invariance pin, which is the standard this project
+uses for "a change that should not move results".
+
+**The mechanism, in one line of shared code.** `fill_harmonic_row_direct!`
+(`src/directinterp.jl`) gives up on a harmonic with
+
+```julia
+(lo_trial >= 1 && hi_trial <= namps && (dp.rfloor0 + qintl) < Nhalf) || return false
+```
+
+`qintl` comes from `t0 + n - 1` — **the chunk's LAST trial** — and the verdict is
+applied to the whole chunk. So when a chunk straddles the frequency at which
+harmonic `h` crosses Nyquist, *every* trial in it loses `h`, including the ones
+below the crossing that were entitled to it. `ws.filled[h]` then goes false and
+`_analytic_sigma` counts one harmonic fewer for all of them. Move the chunk
+boundaries and a different set of trials is affected — hence the drift.
+
+**Reproduced on `fitzroy`, and it happens on the CPU too**, which is the
+important part: PM0063 over 30–40 Hz (harmonic 60 crosses at 33.333 Hz) gives 6
+candidates at blocksize 2048/8192/65536 and **7** at 262144, *identically on both
+backends*. So GPU/CPU equivalence is intact; what is broken is chunk-invariance,
+on both.
+
+**Why nobody saw it for a month.** It requires a harmonic to cross Nyquist
+*inside the search band*, and the standard band does not:
+
+| band | harmonics crossing | trials wrongly losing one, by blocksize |
+|---|---|---|
+| 0.1–33.3 Hz (standard) | **0** | 0% at every blocksize |
+| 0.1–133.3 Hz (A100 run) | **12** (`h = 49…60`) | 0.003% @2048, 0.093% @65536, 0.372% @262144, **1.487% @1048576** |
+
+Every previous byte-identical `.cohout` comparison was run in a band with **no
+crossings at all**, so the invariant held vacuously. Scott's reaction on being
+shown it — *"would be hard to see with 2048 size blocks, but 1M is very
+different"* — is exactly the scaling: the affected fraction is linear in
+blocksize, and the GPU pushed blocksize up 512x. The measured candidate drift
+(+0.25%, +0.37%, +1.0% at 262144/524288/1048576) tracks the predicted affected
+fraction (0.37%, 0.74%, 1.49%) to within a factor of ~1.5.
+
+**How bad is it, honestly.** Not very, scientifically: σ is computed from the
+harmonics actually summed, so the *reported S/N is still correctly normalised* —
+the affected trials simply get a slightly shallower search, ~`sqrt(59/60)` ≈ 0.8%
+of S/N on ≤1.5% of trials at the worst blocksize measured. **The real cost is
+reproducibility**: `.cohout` diffs stop being a valid regression test in any band
+that reaches a crossing, and that is the tool this project leans on hardest.
+
+**Recommended fix: forbid a chunk from straddling a crossing.** The crossing
+trial indices are known in closed form — `t_h = ceil((Nhalf/h − r_lo)/lodr)` for
+each harmonic `h` — so adding them as forced chunk boundaries costs at most
+`nharms` extra (short) chunks per search, 12 in the run above. That restores
+exact chunk-invariance *and* removes the sensitivity loss, since every chunk then
+lies wholly on one side of every crossing. It has to go in both backends'
+chunk loops.
+
+Rejected alternatives: testing the *first* trial instead of the last would let
+past-Nyquist trials read out of range; per-trial masking would make σ per-trial
+rather than per-chunk, a much larger change for a 0.8% effect.
+
+**NOT IMPLEMENTED — Scott's call**, because it changes which candidates are
+reported and the equivalence pins have to be re-run with it.
+
 #### 220 files end to end: 19m11s -> 15m34s, and it is NOT I/O bound
 
 Scott's real workload, `hypatia`'s RTX 4000 SFF Ada, 220 NGC6624 DMs in one
