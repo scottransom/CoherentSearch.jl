@@ -384,7 +384,13 @@ GPU** (§4.13; `CPU_DEFAULT_BLOCKSIZE`/`GPU_DEFAULT_BLOCKSIZE`, resolved in both
 worse it hurt. This is deliberately **one constant, not a per-device rule**:
 deriving it was DECLINED (§4.11) and the A100 refutes the fitted
 `0.5 x L2 / 2912 B` rule by a factor of 32 (predicts 6868 for its 40 MB of L2,
-measures 262144, because occupancy on 108 SMs beats L2 residency). 65536 is
+measures 262144). **The discriminator is the L2:DRAM bandwidth RATIO, not L2
+capacity** (§4.13, measured on the Ada's probe): the Ada's L2 serves 574 GB/s
+against 240 GB/s of DRAM — **2.39x**, with cuFFT rows running at 157-239% of
+DRAM, impossible from memory — so residency is worth **2.32x** to it; the A100
+has the same 40 MB but 1683 GB/s of DRAM, never exceeds it, and is instead
+**2.21x** worse at the SMALL end because 108 SMs cannot be filled. Two
+mechanisms, opposite directions, near-equal size. 65536 is
 within **1.14x** of the optimum on all six cards. **The one card it costs
 anything is the RTX 4000 SFF Ada — pass `--blocksize 8192` there** (1.13x).
 `gpu_search_report.jl` still sweeps from 2048 and *recommends*, reporting the
