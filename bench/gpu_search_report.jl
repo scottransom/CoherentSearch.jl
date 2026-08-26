@@ -68,17 +68,47 @@ println("="^78)
 # (gpu_design.md §4.13).  Every card classified so far has been on someone
 # else's machine.
 const _LOADAVG = try
-    strip(first(split(read("/proc/loadavg", String))))
+    parse(Float64, first(split(read("/proc/loadavg", String))))
 catch
-    "?"
+    NaN
 end
-@printf("host   : %s   julia %s   %d thread(s)   %d cores   load %s\n",
-        gethostname(), VERSION, Threads.nthreads(), Sys.CPU_THREADS, _LOADAVG)
-if _LOADAVG != "?" && parse(Float64, _LOADAVG) > 0.5 * Sys.CPU_THREADS
-    @warn "This host is busy; the timings below will be slow and the phase table " *
-          "may be meaningless (`gpu_timing!` brackets phases with a synchronise, " *
-          "which measures scheduler latency on a saturated machine).  Re-run when " *
-          "it is quiet, and quote the load with any number you report." load=_LOADAVG cores=Sys.CPU_THREADS
+# Cores THIS PROCESS may run on, which on a scheduled node is the allocation and
+# not the machine.  `Sys.CPU_THREADS` reports the whole node either way.
+const _NCPU_ALLOWED = try
+    spec = strip(split(first(filter(l -> startswith(l, "Cpus_allowed_list:"),
+                                    eachline("/proc/self/status"))), ":")[2])
+    sum(map(split(spec, ",")) do r
+        p = split(r, "-")
+        length(p) == 2 ? parse(Int, p[2]) - parse(Int, p[1]) + 1 : 1
+    end)
+catch
+    Sys.CPU_THREADS
+end
+const _SCHEDULED = any(haskey(ENV, k) for k in
+                       ("SLURM_JOB_ID", "PBS_JOBID", "LSB_JOBID", "SGE_TASK_ID"))
+@printf("host   : %s   julia %s   %d thread(s)   %d cores%s   load %s\n",
+        gethostname(), VERSION, Threads.nthreads(), Sys.CPU_THREADS,
+        _NCPU_ALLOWED == Sys.CPU_THREADS ? "" : " ($(_NCPU_ALLOWED) allocated)",
+        isnan(_LOADAVG) ? "?" : string(_LOADAVG))
+# Judge the load against the cores we may actually use.  On a scheduled node the
+# load average is a property of the WHOLE machine and mostly reflects other
+# people's jobs, which cgroup cpuset isolation keeps off our cores -- so warning
+# on it there is a false alarm, and a false alarm teaches you to ignore the real
+# one.  What other jobs still share is memory bandwidth and last-level cache, so
+# say that instead of claiming the numbers are worthless.
+if !isnan(_LOADAVG) && _LOADAVG > 0.5 * Sys.CPU_THREADS && _SCHEDULED
+    @info "Busy node, but this looks like a batch allocation: the load average " *
+          "covers the whole machine, and your cores are cpuset-isolated from it. " *
+          "Device phases are unaffected; `scan` may still be slowed by shared " *
+          "memory bandwidth and LLC.  Sanity check: if the instrumented total " *
+          "below comes in BELOW the clean total, the phase table is measuring " *
+          "scheduler latency and should be discarded." load=_LOADAVG node_cores=Sys.CPU_THREADS allocated=_NCPU_ALLOWED
+elseif !isnan(_LOADAVG) && _LOADAVG > 0.5 * _NCPU_ALLOWED
+    @warn "This host is busy and the cores are NOT reserved for this job; the " *
+          "timings below will be slow and the phase table may be meaningless " *
+          "(`gpu_timing!` brackets phases with a synchronise, which measures " *
+          "scheduler latency on a saturated machine).  Re-run when it is quiet, " *
+          "and quote the load with any number you report." load=_LOADAVG cores=_NCPU_ALLOWED
 end
 @printf("file   : %s   N=%d  T=%.1f s  amps=%.2f GiB\n",
         basename(fftfile), ft.N, ft.T, length(ft.amps) * 8 / 2^30)

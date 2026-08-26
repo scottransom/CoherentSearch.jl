@@ -2557,6 +2557,62 @@ than the 2048 it replaced (which costs this card **1.91x**, and the A100 5.55x),
 so the default stands — but the number quoted for it is now **~1.2x** and should
 be treated as provisional until the other cards are re-swept.
 
+#### 220 files end to end: 19m11s -> 15m34s, and it is NOT I/O bound
+
+Scott's real workload, `hypatia`'s RTX 4000 SFF Ada, 220 NGC6624 DMs in one
+invocation at `--blocksize 8192`, measured first-output to last-output:
+
+| | total | per file | |
+|---|---|---|---|
+| 2026-08-25 | 1151 s (19m11s) | 5.232 s | |
+| 2026-08-26 | **934 s (15m34s)** | **4.245 s** | **1.232x** |
+
+**Three outcomes were pre-registered before the run** from yesterday's per-file
+decomposition (5.232 s = 3.994 s of search + 1.238 s of read/upload/write):
+958 s if the single-file 1.28x carried, 1046 s if only the overlap's
+phase-table-bounded 1.135x was real, 1151 s if the job was I/O bound. **Measured
+934 s — 2.5% better than the most optimistic of the three**, so the I/O worry
+(§0.5's "in throughput mode the limit becomes I/O, not the GPU") does not bite
+on this host, and the improvement carries into throughput mode in full.
+
+Implied search per file is **3.008 s** against the single-file report's 3.117 s
+— slightly *better*, which is the right direction: start-up and plans are
+amortised over 220 files and `_ChunkIO` is pinned once instead of 440 times.
+
+**Attribution, stated carefully.** This is 1.232x on the *job*, not 1.232x
+attributable to the overlap. The 2026-08-25 baseline ran through a CUDA
+environment that has since been rebuilt and an unrecorded load, and the phase
+table bounds the overlap itself at ~1.135x on this card. The controlled
+measurement is still `fitzroy`'s worktree A/B (1.205x at blocksize 131072). What
+934 s establishes is the end-to-end wall clock on a real workload, which is the
+number that matters for planning a survey.
+
+#### The busy-host warning was wrong on an HPC node, and a false alarm is worse than none
+
+The load warning added above fired on OzSTAR, where it should not have. It
+compared the load average against `Sys.CPU_THREADS` — **the whole node** — when
+Slurm had given Scott a cgroup allocation. Other people's jobs inflate a shared
+node's load average while being cpuset-isolated from his cores, so the warning
+was a false alarm; and a false alarm teaches you to ignore the real one, which
+is exactly the instrument this was added to provide.
+
+It now counts the cores the process may actually run on (`Cpus_allowed_list`
+from `/proc/self/status`), prints `N cores (M allocated)` when they differ, and
+detects a batch allocation from `SLURM_JOB_ID` / `PBS_JOBID` / `LSB_JOBID` /
+`SGE_TASK_ID`. Under a scheduler it downgrades to an `@info` that says what is
+actually true there — **device phases are unaffected, and only `scan` is exposed,
+through shared memory bandwidth and LLC rather than through scheduling** — and
+hands over the concrete self-check from the `usnea` episode: *if the instrumented
+total comes in below the clean total, the phase table is measuring scheduler
+latency; discard it.* Off a scheduler the original warning stands, now judged
+against the allocation rather than the machine. All three branches tested.
+
+**The general lesson, and it is the same one twice in two days.** `usnea` taught
+that a shared node's load makes timings meaningless; OzSTAR teaches that the same
+raw number means something different when a scheduler owns the node. **Load
+average is a property of a machine, and what you need is a property of your
+allocation.**
+
 #### The sweep now runs to 1048576, and the GTX 1080's optimum is bracketed at last
 
 Extended for the A100, whose sweep was still improving 1.04x at the top row and

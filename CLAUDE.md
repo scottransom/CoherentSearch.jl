@@ -414,6 +414,9 @@ instrumented total ever comes in BELOW the clean total, the phase table is
 measuring the host's scheduler, not the GPU — discard it. **`download` + `scan` are now OVERLAPPED with the next
 chunk's device work** (§4.13): double-buffered `out`/`hostm`, a separate copy
 stream gated by an event, pinned host memory, candidates byte-identical.
+**On Scott's real 220-file job (RTX 4000 SFF Ada, `--blocksize 8192`) the wall
+clock went 19m11s -> 15m34s, 1.232x, beating the most optimistic of three
+pre-registered predictions and ruling out the I/O-bound case** (§4.13).
 Measured **1.294x at blocksize 8192 and 1.205x at 131072 on the GTX 1080**, whose
 14.1% host share is the smallest of the modern cards — the A100 and A4000 sit at
 ~31% and should see nearer 1.4x, `hypatia`'s Ada nearer 1.15x. Throughput mode
