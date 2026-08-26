@@ -2449,6 +2449,60 @@ comparison was even like-for-like. A fresh, unshared environment reproduces the
 card to 0.4%, so the answer is yes: the Manifest picks CUDA versions, not kernel
 behaviour, and the §4.8/§4.11 numbers stand.
 
+#### Why two 40 MB cards want opposite blocksizes — MEASURED, and §4.12's answer was half of it
+
+`hypatia`'s rebuilt probe printed the full cuFFT sweep, and its `%DRAM` column
+contains the mechanism. Rows above **100%** are being served faster than the card
+can read DRAM, which is only possible from cache — the probe marks them
+`<- L2-resident`. Verified against the printed figures (15.1 MiB in 0.042 ms is
+377 GB/s, 157% of 240; 21.0 MiB in 0.038 ms is 579 GB/s, 241%):
+
+| Ada, `Nprof` | rungs L2-resident | best eff GB/s | transform stage |
+|---|---|---|---|
+| 16384 | `k = 1,2,3` | 377 (157%) | **0.069 s** |
+| 32768 | `k = 2…6` | 366 (152%) | 0.070 s |
+| 65536 | `k = 3…6` | 456 (190%) | 0.100 s |
+| 131072 | `k = 5,6` | **574 (239%)** | 0.133 s |
+| 262144 | none | 162 (67%) | 0.160 s |
+
+**Residency is lost rung by rung as the chunk grows, and the stage time tracks it
+exactly.** That is the per-rung picture §0.3 hypothesised and §4.9 built
+sub-batching for, now *measured* instead of inferred — and it is the half of the
+premise that §4.10's "the premise it was built on does not [work]" did **not**
+refute. §4.10 was about §4.8's non-transform decomposition having the wrong sign;
+the transform half is confirmed here.
+
+**The discriminator is not L2 capacity — both cards have 40 MB — it is the
+L2:DRAM bandwidth ratio.**
+
+| | L2 | DRAM achieved | best observed | ratio |
+|---|---|---|---|---|
+| RTX 4000 SFF Ada | 40 MB | 240 GB/s | **574 GB/s** | **2.39x DRAM** |
+| A100-SXM4-80GB | 40 MB | **1683 GB/s** | 724 GB/s | **0.43x** — never exceeds |
+
+The A100's worksets fit its L2 just as well; residency simply has nothing to buy
+when DRAM is already **7.0x** the Ada's. So the A100's small-chunk penalty is
+pure occupancy — 108 SMs cannot be filled by 8192 trials — while the Ada's
+large-chunk penalty is cache. **§4.12 attributed the whole difference to SM
+count; that was half the answer.** Both mechanisms are real, they point opposite
+ways, and they are almost exactly equal in size: the **Ada is 2.32x worse at the
+large end** (0.160 vs 0.069 s) and the **A100 is 2.21x worse at the small end**
+(0.064 vs 0.029 s).
+
+**An independent confirmation of `_SUB_L2_FRACTION = 0.5`.** At `Nprof = 131072`
+the `k = 5` rung (25.0 MB) is resident and `k = 4` (31.0 MB) is not, so the
+residency cliff on a 40 MB L2 sits between **0.63x and 0.78x** of it. The
+sub-batch policy targets 0.5x, comfortably inside — which §4.10 had already found
+by sweeping the target directly (a flat 0.25–0.5x plateau). Two unrelated
+measurements, same constant.
+
+**This does NOT reopen deriving `--blocksize`.** The probe now prints the very
+column that would classify a card, which makes the temptation sharper, not
+weaker — and §4.11/§4.12 killed one fitted rule already. The rule that fits all
+six cards is *a card wants a small chunk only if its L2 both holds a rung's
+workset and materially out-runs its DRAM*, which is one card out of six. Scott's
+call stands: measure it, and let `gpu_search_report.jl` recommend.
+
 #### The memory gate no longer double-counts the pool
 
 §4.12's diagnosis, fixed: `_check_device_memory` reclaims **only on the path that
