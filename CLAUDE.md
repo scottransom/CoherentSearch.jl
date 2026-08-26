@@ -11,6 +11,16 @@ for multi-threaded performance and is numerically pinned to the Python original.
   before committing** — Scott is the only developer and this code is pre-release.
 - **Always run the test suite before committing** (`Pkg.test()`), and prefer a
   real end-to-end check when results could move (see the equivalence gate below).
+- **NEVER `git add -A` / `git add .`. Stage explicit paths, and read
+  `git status` before every commit.** The repo root is where Scott parks working
+  notes — pasted probe and report output, scratch `.txt`, one-off scripts — and a
+  blanket `add` sweeps them into the history and then to GitHub, where they are
+  awkward to remove. **This has already happened several times**, most recently
+  six `*_probe.txt` / `*_search_report.txt` files on 2026-08-26. Untracked files
+  in the top level are the default-suspicious case: assume they are Scott's
+  scratch unless he says otherwise, and ask before committing one. If output
+  genuinely needs keeping, the design log's tables are the place for it, not a
+  raw paste.
 - End commit messages with a `Co-Authored-By: Claude <model>` trailer naming the
   model that actually wrote the commit (e.g. `Claude Opus 5`). Commits through
   2026-08-09 say `Opus 4.8`, which was current then — don't copy that trailer

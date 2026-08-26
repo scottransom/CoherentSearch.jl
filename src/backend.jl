@@ -102,7 +102,7 @@ gpu_chunk_boxcar(args...; kwargs...) = chunk_boxcar(require_gpu(), args...; kwar
 
 """
     _region!(backend, ft, params, workspaces, nbins, r_lo, r_hi, lodr,
-             total, Nprof, nchunks, nt; kwargs...) -> Vector{Candidate}
+             total, Nprof, nchunks, nt, cstarts; kwargs...) -> Vector{Candidate}
 
 Run the chunk loop over `[r_lo, r_hi]` on `backend` and return the
 above-`threshold` candidates.  The CPU method is the threaded `_search_region!`

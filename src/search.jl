@@ -1863,7 +1863,8 @@ end
 function _search_region!(ft::FFTFile, params::SearchParams,
                          workspaces::Vector{<:Workspace}, nbins::Integer,
                          r_lo::Real, r_hi::Real, lodr::Real, total::Integer,
-                         Nprof::Integer, nchunks::Integer, nt::Integer;
+                         Nprof::Integer, nchunks::Integer, nt::Integer,
+                         cstarts::AbstractVector{Int};
                          threshold::Real, norm::Union{Nothing,MetricNorm},
                          metricstats::Union{Nothing,MetricStats}, progress::Symbol,
                          dplans::AbstractVector)
@@ -1906,8 +1907,8 @@ function _search_region!(ft::FFTFile, params::SearchParams,
             P = eltype(ws.profs)
             c = t
             while c <= nchunks
-                i0 = (c - 1) * Nprof
-                n = min(Nprof, total - i0)
+                i0 = cstarts[c]
+                n = (c < nchunks ? cstarts[c + 1] : Int(total)) - i0
                 rstart = r_lo + i0 * lodr
                 fill_chunk_profiles!(ws, dplans, ft, params, rstart, lodr, n; t0=i0)
                 rmean = rstart + (n - 1) * lodr / 2
@@ -2219,7 +2220,6 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
         (backend isa CPUBackend ? CPU_DEFAULT_BLOCKSIZE : GPU_DEFAULT_BLOCKSIZE) :
         blocksize
     Nprof = max(1, Int(bs))
-    nchunks = cld(total, Nprof)
 
     # Load saved FFTW wisdom so the (single-threaded, up-front) planning below
     # collapses to a lookup; persist it afterwards so the first run teaches every
@@ -2230,6 +2230,13 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
     # The direct interpolator's phase tables key off the *global* trial index, so
     # they are built once here against `r_lo` and shared read-only by every task.
     dplans = build_direct_plans(params, r_lo)
+    # Chunk boundaries: the regular `Nprof` grid PLUS a forced split wherever the
+    # usable harmonic set changes, so that `ws.filled` -- one flag per harmonic
+    # per chunk -- is right for every trial in the chunk rather than only for its
+    # last one.  See `chunk_starts`; without it, results are not chunk-invariant
+    # in any band where a harmonic crosses Nyquist (gpu_design.md §4.14).
+    cstarts = chunk_starts(dplans, ft, params, total, Nprof)
+    nchunks = length(cstarts)
     # A GPU backend runs the whole band on the device, so it needs exactly one
     # host workspace -- and it needs that one, because `_sigma_sanity_check` is a
     # CPU computation and must stay so: its whole job is to check the analytic
@@ -2289,7 +2296,7 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
         normstats = metricstats === nothing ? MetricStats() : metricstats
         @info "Normalising: measuring per-(k,frequency) noise (pass 1/2)"
         _region!(backend, ft, params, workspaces, nbins, r_lo, r_hi, lodr,
-                 total, Nprof, nchunks, nt;
+                 total, Nprof, nchunks, nt, cstarts;
                  threshold=Inf, norm=nothing, metricstats=normstats, progress=progress,
                  dplans=dplans)
         norm = build_metricnorm(normstats)
@@ -2299,7 +2306,7 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
     # Detection pass.  When normalising, stats were collected in pass 1, so pass 2
     # does not re-collect (metricstats=nothing here).
     cands = _region!(backend, ft, params, workspaces, nbins, r_lo, r_hi, lodr,
-                     total, Nprof, nchunks, nt;
+                     total, Nprof, nchunks, nt, cstarts;
                      threshold=threshold, norm=norm,
                      metricstats=(normalize ? nothing : metricstats), progress=progress,
                      dplans=dplans)

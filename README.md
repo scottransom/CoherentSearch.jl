@@ -598,7 +598,7 @@ The best value is a property of the card and spans **8192 to 262144**. To find
 yours:
 
 ```sh
-julia --project=. bench/gpu_search_report.jl FILE.fft
+julia --project=~/gpuenv bench/gpu_search_report.jl FILE.fft
 ```
 
 Use one of your own `.fft` files, ideally a large one. It sweeps `--blocksize`,
@@ -606,7 +606,7 @@ prints a per-phase breakdown, and ends with a recommendation and the penalty for
 not passing one. Then run searches with that value:
 
 ```sh
-julia --project=. bin/coherent_search.jl --gpu --blocksize 8192 FILE.fft
+julia --project=~/gpuenv bin/coherent_search.jl --gpu --blocksize 8192 FILE.fft
 ```
 
 The search prints the default it used, and warns if you pass `--blocksize 2048`
@@ -671,6 +671,14 @@ but itself and `bench/gpu_probe.jl`.
 
 ```sh
 julia --project=. -e 'using Pkg; Pkg.test()'
+```
+
+Every GPU test is **skipped** in that environment, because CUDA is a weak
+dependency and `--project=.` does not have it — the run says so rather than
+passing silently. To include them, use the environment from the GPU section:
+
+```sh
+julia --project=~/gpuenv -e 'using Pkg; Pkg.test("CoherentSearch")'
 ```
 
 ## Cross-validation against the Python oracle

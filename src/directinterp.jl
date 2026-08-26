@@ -418,6 +418,149 @@ Residue and accumulated integer-bin count of harmonic `dp.h` at *global* trial
 end
 
 """
+    harmonic_fits(dp, ft, params, t) -> Bool
+
+Whether harmonic `dp.h` has usable amplitudes at the **single** global trial `t`:
+its `m`-bin interpolation window must lie inside the amplitude array and its
+Fourier bin must be below Nyquist.
+
+**This is the one definition of "this harmonic is available here."**
+`fill_harmonic_row_direct!` calls it on a chunk's first and last trial (each of
+the three conditions is monotone in `t`, so those two decide the whole chunk),
+and [`harmonic_change_trials`](@ref) bisects on it to find where the answer
+flips.  Keeping both on the same function is deliberate: a boundary finder that
+disagreed with the guard by one trial would reintroduce exactly the bug it
+exists to remove.
+"""
+@inline function harmonic_fits(dp::DirectPlan, ft::FFTFile, params::SearchParams,
+                               t::Integer)
+    m2 = dp.m ÷ 2
+    Nhalf = ft.N ÷ 2
+    namps = length(ft.amps)
+    if dp.P == 0
+        # Slow path's arithmetic, reproduced exactly -- including that its
+        # Nyquist test floors WITHOUT the 1e-15 nudge the window bounds use.
+        r = (dp.rfloor0 + dp.dr0) + t * (dp.h * (params.hidr / params.nharms))
+        rf = floor(Int, r + 1e-15)
+        return (rf + 2 - m2) >= 1 && (rf + 1 + m2) <= namps && floor(Int, r) < Nhalf
+    end
+    res, qint = direct_chunk_state(dp, t)
+    base = dp.rfloor0 + qint + dp.carry[dp.row[res + 1]]
+    return (base + 2 - m2) >= 1 && (base + 1 + m2) <= namps &&
+           (dp.rfloor0 + qint) < Nhalf
+end
+
+# Bisection helpers for a predicate that is monotone over `0:total-1`.
+# Return `total` when the transition does not occur inside the range.
+function _first_true(pred, total::Integer)
+    total >= 1 || return Int(total)
+    pred(0) && return 0
+    pred(total - 1) || return Int(total)
+    lo, hi = 0, Int(total) - 1                    # pred(lo) false, pred(hi) true
+    while hi - lo > 1
+        mid = (lo + hi) >>> 1
+        pred(mid) ? (hi = mid) : (lo = mid)
+    end
+    return hi
+end
+function _first_false(pred, total::Integer)
+    total >= 1 || return Int(total)
+    pred(0) || return 0
+    pred(total - 1) && return Int(total)
+    lo, hi = 0, Int(total) - 1                    # pred(lo) true, pred(hi) false
+    while hi - lo > 1
+        mid = (lo + hi) >>> 1
+        pred(mid) ? (lo = mid) : (hi = mid)
+    end
+    return hi
+end
+
+"""
+    harmonic_change_trials(dplans, ft, params, total) -> Vector{Int}
+
+Global trial indices at which the set of usable harmonics changes — i.e. where
+[`harmonic_fits`](@ref) flips for at least one harmonic.
+
+**Why the chunk loop needs these.** `ws.filled` holds *one flag per harmonic per
+chunk*, and `_analytic_sigma` counts those flags to get the fold's noise scale.
+That is only correct if every trial in the chunk agrees about which harmonics
+fit.  A chunk straddling one of these trials violates the assumption: the guard
+takes the conservative answer, so every trial in the chunk loses a harmonic that
+only the ones above the boundary should have lost.  The result is a search that
+is very slightly shallower there **and, worse, no longer chunk-invariant** —
+move the blocksize and a different set of trials is affected.
+
+Measured before the fix on a 0.1–133.3 Hz search of NGC6624 (12 harmonics cross
+Nyquist inside that band): 0.003% of trials affected at `blocksize = 2048` but
+**1.49% at 1048576**, and the reported candidate count drifted 802 → 810 across
+that range.  The standard 0.1–33.3 Hz band has *no* crossings at all, which is
+why every byte-identical `.cohout` comparison before 2026-08-26 held vacuously.
+See `gpu_design.md` §4.14.
+
+Each of the guard's three conditions is monotone in `t`, so a harmonic is usable
+on one contiguous interval and contributes at most two boundaries — found by
+bisection, not by scanning.  At most `2 * nharms` of them, so the cost is
+`O(nharms · log total)` and the chunk count grows by at most that.
+"""
+function harmonic_change_trials(dplans::AbstractVector, ft::FFTFile,
+                                params::SearchParams, total::Integer)
+    bnds = Int[]
+    total > 1 || return bnds
+    for dp in dplans
+        m2 = dp.m ÷ 2
+        namps = length(ft.amps)
+        Nhalf = ft.N ÷ 2
+        # Split the predicate so each half is monotone in one direction.
+        lo_ok(t) = _hf_lo(dp, params, t, m2) >= 1
+        hi_ok(t) = _hf_hi(dp, params, t, m2) <= namps && _hf_nyq(dp, params, t) < Nhalf
+        a = _first_true(lo_ok, total)     # harmonic becomes usable here
+        b = _first_false(hi_ok, total)    # ...and stops being usable here
+        0 < a < total && push!(bnds, a)
+        0 < b < total && push!(bnds, b)
+    end
+    sort!(bnds)
+    unique!(bnds)
+    return bnds
+end
+
+# The three monotone pieces of `harmonic_fits`, shared with the bisection above.
+@inline function _hf_base(dp::DirectPlan, params::SearchParams, t::Integer)
+    if dp.P == 0
+        r = (dp.rfloor0 + dp.dr0) + t * (dp.h * (params.hidr / params.nharms))
+        return floor(Int, r + 1e-15)
+    end
+    res, qint = direct_chunk_state(dp, t)
+    return dp.rfloor0 + qint + dp.carry[dp.row[res + 1]]
+end
+@inline _hf_lo(dp, params, t, m2) = _hf_base(dp, params, t) + 2 - m2
+@inline _hf_hi(dp, params, t, m2) = _hf_base(dp, params, t) + 1 + m2
+@inline function _hf_nyq(dp::DirectPlan, params::SearchParams, t::Integer)
+    if dp.P == 0
+        return floor(Int, (dp.rfloor0 + dp.dr0) + t * (dp.h * (params.hidr / params.nharms)))
+    end
+    _, qint = direct_chunk_state(dp, t)
+    return dp.rfloor0 + qint
+end
+
+"""
+    chunk_starts(dplans, ft, params, total, Nprof) -> Vector{Int}
+
+First global trial index of each chunk: the regular `Nprof` grid, plus a forced
+boundary wherever [`harmonic_change_trials`](@ref) says the usable harmonic set
+changes.  Extra boundaries only ever *shorten* a chunk, so `n <= Nprof` still
+holds and every buffer sized on `Nprof` is untouched.
+"""
+function chunk_starts(dplans::AbstractVector, ft::FFTFile, params::SearchParams,
+                      total::Integer, Nprof::Integer)
+    total >= 1 || return Int[]
+    s = collect(0:Int(Nprof):(Int(total) - 1))
+    append!(s, harmonic_change_trials(dplans, ft, params, total))
+    sort!(s)
+    unique!(s)
+    return s
+end
+
+"""
     fill_harmonic_row_direct!(ws, dp, ft, params, t0, n)
 
 Fill row `dp.h+1`, columns `1:n`, of `ws.ftprofs` with the exactly-interpolated
@@ -487,13 +630,13 @@ function fill_harmonic_row_direct!(ws::Workspace, dp::DirectPlan{WT}, ft::FFTFil
     # which a harmonic gives up (off the end of the amplitudes, or past Nyquist)
     # must stay a property of the trials actually being searched, not of how the
     # group grid happens to straddle them.
-    res, qint = direct_chunk_state(dp, t0)
-    p0 = dp.row[res + 1]
-    lo_trial = dp.rfloor0 + qint + dp.carry[p0] + 2 - m2
-    resl, qintl = direct_chunk_state(dp, t0 + n - 1)
-    pl = dp.row[resl + 1]
-    hi_trial = dp.rfloor0 + qintl + dp.carry[pl] + 1 + m2
-    (lo_trial >= 1 && hi_trial <= namps && (dp.rfloor0 + qintl) < Nhalf) || return false
+    # Both endpoints, via the shared per-trial predicate.  Each of the three
+    # conditions inside it is monotone in `t`, so testing the first and last
+    # trial is exactly the old "lo from the first, hi and Nyquist from the last"
+    # -- and it is now the SAME code the chunk-boundary finder uses, which is the
+    # point: `harmonic_change_trials` must not be able to drift from this guard.
+    (harmonic_fits(dp, ft, params, t0) &&
+     harmonic_fits(dp, ft, params, t0 + n - 1)) || return false
 
     # --- group grid, anchored to the GLOBAL trial index ----------------------
     # Groups of `V` trials start at global trials 0, V, 2V, …, so which group a
@@ -630,11 +773,8 @@ function _fill_row_direct_slow!(ws::Workspace, dp::DirectPlan, ft::FFTFile,
     dh = h * lodr                        # this harmonic's step per trial
     Nhalf = ft.N ÷ 2
     namps = length(ft.amps)
-    rfirst = hr_lo + t0 * dh
-    rlast = hr_lo + (t0 + n - 1) * dh
-    lo = floor(Int, rfirst + 1e-15) + 2 - m2
-    hi = floor(Int, rlast + 1e-15) + 1 + m2
-    (lo >= 1 && hi <= namps && floor(Int, rlast) < Nhalf) || return false
+    (harmonic_fits(dp, ft, params, t0) &&
+     harmonic_fits(dp, ft, params, t0 + n - 1)) || return false
     amps = ft.amps
     ftprofs = ws.ftprofs
     hrow = h + 1

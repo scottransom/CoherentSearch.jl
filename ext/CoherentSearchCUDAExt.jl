@@ -1086,7 +1086,8 @@ end
 function _region!(::CUDABackend, ft::FFTFile, params::SearchParams,
                   workspaces::Vector, nbins::Integer,
                   r_lo::Real, r_hi::Real, lodr::Real, total::Integer,
-                  Nprof::Integer, nchunks::Integer, nt::Integer;
+                  Nprof::Integer, nchunks::Integer, nt::Integer,
+                  cstarts::AbstractVector{Int};
                   threshold::Real, norm, metricstats, progress::Symbol,
                   dplans::AbstractVector)
     params.sigma === :analytic || error(
@@ -1161,8 +1162,12 @@ function _region!(::CUDABackend, ft::FFTFile, params::SearchParams,
 
     for c in 1:nchunks
         b = 1 + (c - 1) % 2
-        i0 = (c - 1) * Nprof
-        n = min(Nprof, total - i0)
+        # Chunk bounds come from `cstarts`, not from `c * Nprof`: forced splits
+        # at harmonic-availability changes keep `filled` correct for every trial
+        # in the chunk (see `chunk_starts`).  Splits only shorten, so `n <= Nprof`
+        # and every device buffer sized on `Nprof` is unaffected.
+        i0 = cstarts[c]
+        n = (c < nchunks ? cstarts[c + 1] : Int(total)) - i0
         rstart = r_lo + i0 * lodr
         # Zeroed every chunk: the interpolator writes only the harmonics that
         # carry data, and a harmonic that gives up must leave a ZERO row -- which

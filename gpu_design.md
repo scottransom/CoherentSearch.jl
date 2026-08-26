@@ -2625,8 +2625,32 @@ Rejected alternatives: testing the *first* trial instead of the last would let
 past-Nyquist trials read out of range; per-trial masking would make σ per-trial
 rather than per-chunk, a much larger change for a 0.8% effect.
 
-**NOT IMPLEMENTED — Scott's call**, because it changes which candidates are
-reported and the equivalence pins have to be re-run with it.
+**IMPLEMENTED 2026-08-26**, Scott's approval. `harmonic_fits` is now the single
+per-trial definition of "this harmonic is available here";
+`fill_harmonic_row_direct!` calls it on the chunk's first and last trial (each
+condition is monotone in `t`, so those two decide the chunk) and
+`harmonic_change_trials` bisects on it — deliberately the *same* function, since
+a boundary finder that disagreed with the guard by one trial would reintroduce
+the bug. `chunk_starts` merges those boundaries into the regular `Nprof` grid,
+and both backends take `(i0, n)` from it. Splits only ever shorten a chunk, so
+`n <= Nprof` still holds and every buffer sized on `Nprof` is untouched.
+
+**Verified.** PM0063 over 30–40 Hz (harmonic 60 crosses at 33.333 Hz), blocksize
+997 / 2048 / 8192 / 65536 / 131072 / 262144: candidates now **identical at every
+blocksize on both backends**, where before the CPU and GPU alike gave 6/6/6/7.
+The no-crossing band is byte-identical to before the fix. GPU-vs-CPU agrees to
+**1.6e-7** in S/N with frequencies exact and `nharm` identical, i.e. §4.2's
+`Float32` accuracy and no more. **755/755 tests** (up from 747) and the oracle
+pins unmoved at 3.885e-16 / 1.435e-16 / 1.416e-16.
+
+**The regression test asserts its own premise, because the old one did not.**
+`test_search.jl`'s "chunk size does not change the detection" was vacuous for a
+month: it ran in a band with no crossings, so it could not fail. The new testset
+derives its band from the fixture's own Nyquist frequency, **asserts that a
+crossing really is inside it** before testing anything, and checks that every
+boundary `harmonic_change_trials` returns is a genuine flip of `harmonic_fits`
+(so splits are never made for nothing). Without the premise assertion it would
+go quietly vacuous again the first time the fixture changed.
 
 #### 220 files end to end: 19m11s -> 15m34s, and it is NOT I/O bound
 

@@ -616,6 +616,55 @@ if isfile(EXAMPLE_FFT)
         @test (hi - lo) / lo < 0.10
     end
 
+    @testset "chunk invariance holds ACROSS a Nyquist crossing" begin
+        # The pin above was vacuous for a whole month, and this is the one that
+        # would have caught it.  `ws.filled` holds one flag per harmonic per
+        # CHUNK, and the guard in `fill_harmonic_row_direct!` answers for the
+        # chunk's last trial -- so a chunk straddling the fundamental at which a
+        # harmonic crosses Nyquist used to drop that harmonic for every trial in
+        # it, including the ones below the crossing.  `_analytic_sigma` then
+        # counted one harmonic fewer for all of them, and moving the blocksize
+        # moved the result (gpu_design.md §4.14).
+        #
+        # It hid because it needs a crossing INSIDE the search band, and the
+        # standard 0.1-33.3 Hz band has none: harmonic `h` dies at `Nyquist/h`,
+        # so with nharms=60 the first crossing is at `Nyquist/60`, which for the
+        # usual fixtures sits at or above `hifreq`.  So this testset picks its
+        # band FROM the fixture rather than hardcoding one, and asserts the
+        # premise -- that a crossing really is inside it -- before testing the
+        # invariance.  Without that assertion it would silently go vacuous again
+        # the moment the fixture changed.
+        params = SearchParams(nharms=60, m=16, decimations=collect(1:6))
+        nyqf = (ft.N ÷ 2) / ft.T                 # Hz
+        fcross = nyqf / params.nharms            # where harmonic nharms dies
+        lo, hi = 0.9 * fcross, 1.1 * fcross
+        dplans = CoherentSearch.build_direct_plans(params, lo * ft.T)
+        lodr = params.hidr / params.nharms
+        total = floor(Int, (hi * ft.T - lo * ft.T) / lodr) + 1
+        bnds = CoherentSearch.harmonic_change_trials(dplans, ft, params, total)
+        # The premise: at least one harmonic really does change availability here.
+        @test !isempty(bnds)
+        @info "Nyquist crossing inside the test band" nyqf fcross nboundaries=length(bnds)
+
+        # Every boundary must be a genuine flip of `harmonic_fits` for some
+        # harmonic, and never a false one -- otherwise we would be splitting
+        # chunks for nothing.
+        for b in bnds
+            @test any(CoherentSearch.harmonic_fits(dp, ft, params, b) !=
+                      CoherentSearch.harmonic_fits(dp, ft, params, b - 1)
+                      for dp in dplans)
+        end
+
+        # And the payload: identical candidates at every blocksize, including
+        # ones far larger and far smaller than any boundary spacing.
+        key(c) = [(x.freq, x.nharm) for x in c]
+        runs = map((997, 2048, 8192, 65536)) do bs
+            key(search(ft, params; lofreq=lo, hifreq=hi, threshold=6.0,
+                       blocksize=bs, progress=:none, wisdom=false))
+        end
+        @test all(r == runs[1] for r in runs)
+    end
+
     @testset "decimation pass k reproduces the native Hk-harmonic fold" begin
         # The strong equivalence: gathering every k-th of the base nharms=60
         # harmonics and folding must equal a *native* Hk=⌊60/k⌋-harmonic search
