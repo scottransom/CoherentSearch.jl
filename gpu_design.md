@@ -2256,6 +2256,76 @@ is 8192 (§4.11) — 65536 costs it 1.13x. That is the price of a single constan
 and it is inside the 1.14x bound, but anyone running on that card should pass
 `--blocksize 8192` explicitly.
 
+#### Confirmed on the RTX A4000 — and `usnea` is not a benchmarking host
+
+Run on `usnea` (2x RTX A4000, sm_86) against the same NGC6624 file, `cs_base` at
+`cf4dd1b` and `cs_new` at the overlap, in git worktrees under `/tmp/sransom` so
+Scott's checkout was untouched.
+
+**The correctness result is solid and load-independent: 135 candidates on both
+arms, and the candidate files are byte-identical.** That is the overlap verified
+on a second microarchitecture.
+
+**The timing result is not usable, and why is the useful part.** `usnea` is a
+104-core shared machine whose load average oscillated between **31 and 102**
+during the runs, as another user's jobs stopped and restarted. Eight interleaved
+rounds gave:
+
+| | round 1..8 |
+|---|---|
+| `cf4dd1b` | 6.91 / 5.41 / 4.84 / **4.57** / 12.97 / 5.38 / 6.11 / 6.65 s |
+| overlap | 5.43 / 3.70 / 3.68 / **3.68** / 4.60 / 4.14 / 3.76 / 5.48 s |
+
+Minima — the least-disturbed run of each arm — give **4.569 vs 3.681 s, 1.241x**,
+which sits sensibly between `fitzroy`'s measured 1.205x and the ~1.4x the
+recorded host share predicted. **Treat it as an estimate, not a measurement.**
+
+Two things are worth keeping anyway:
+
+- **The overlapped arm is markedly more robust to host load.** Its min-to-max
+  spread over the eight rounds is **1.49x** against the baseline's **2.84x**,
+  which is exactly what hiding host work behind device work should do.
+- **`gpu_timing!` is meaningless on a saturated host, and says so loudly enough
+  to be a check.** `_gpt` brackets each phase with `CUDA.synchronize()`, which
+  spins then yields — and on a 104-core box at load 102 the yield measures
+  scheduler latency, not GPU work. It produced `interp` differing **2.8x**
+  between two arms whose interpolator is byte-identical, and an *instrumented*
+  total (4.261 s) **below** the same arm's clean total (4.979 s), which is
+  impossible. **If an instrumented total ever comes in under the clean total,
+  the phase table is measuring the host's scheduler — throw it away and check
+  `uptime`.**
+
+#### §4.12's A4000 phase table is CONTAMINATED by host load — do not quote its `scan`
+
+This is the correction the run above forces, and it retracts a claim I made in
+§4.12. That section reported `usnea`'s scan at **12.54 ns/trial against
+`gina4`'s 3.54 — "a 3.5x host spread, wider than §4.8's 1.75x"** — and used it to
+argue the host term is a large and irreducible property of the machine.
+
+**The baseline code at `cf4dd1b`, re-run on the same host and the same file
+today, reached 4.569 s against the recorded report's 5.476 s "clean total".** The
+recorded run was therefore ~1.2x slow, and the phase table taken with it — where
+`scan` is 22.6% of wall clock — is inflated by whatever that host was carrying.
+`usnea` is a **shared NRAO compute node**, not a workstation; nothing in the
+report records the load, and nothing in the harness would have shown it.
+
+Consequences, in order of how much they matter:
+
+- **The "3.5x host spread" is retracted.** §4.8's 1.75x between `spare2` and
+  `hypatia` was corroborated against those hosts' own CPU search arms and stands;
+  this one was not corroborated against anything and should not be quoted.
+- **The A4000's 51.9 ns/trial and its 5.476 s are upper bounds**, not the card's
+  number. Its true figure is at or below 43.3 ns/trial.
+- **`download` + `scan` = "~31% of wall clock" is safe for the A100 and shaky for
+  the A4000.** `gina4` is an OzSTAR node and could have been loaded too, but its
+  scan is the *fastest* measured, which is the direction load cannot fake.
+- **`gpu_search_report.jl` should print `uptime` / load average in its header**,
+  next to the host name. Every card classified so far has been on someone else's
+  machine, and this is the one property of those machines that moves the numbers
+  and was never recorded. That is the same lesson as CLAUDE.md's standing rule
+  about checking `uptime` on `fitzroy` before timing — applied to hosts nobody
+  thought of as desktops.
+
 #### The memory gate no longer double-counts the pool
 
 §4.12's diagnosis, fixed: `_check_device_memory` reclaims **only on the path that

@@ -395,8 +395,13 @@ can't be guessed.** **Throughput mode is fixed (§4.6):** `GPUChunk`/
 per file 1.73 s -> 0.79 s. Amplitudes are still freed per file. **The 1.25x prediction was wrong in
 direction (0.960x), because §4.8's non-transform decomposition had the wrong
 sign; do not re-use that column.** The GPU report now labels phases
-`:device`/`:transfer`/`:host` — **`scan` is host-CPU work and has now moved 3.5x between
-two hosts** (§4.12), so classify a card on the device column only. **`download` + `scan` are now OVERLAPPED with the next
+`:device`/`:transfer`/`:host` — **`scan` is host-CPU work** (§4.8's 1.75x
+between two hosts is corroborated and stands; §4.12's "3.5x" is RETRACTED — that
+A4000 report was taken on a 104-core shared node at load ~100 and reads ~1.2x
+slow, §4.13), so classify a card on the device column only, and **check the load
+average, which `gpu_search_report.jl` now prints and warns on**. If an
+instrumented total ever comes in BELOW the clean total, the phase table is
+measuring the host's scheduler, not the GPU — discard it. **`download` + `scan` are now OVERLAPPED with the next
 chunk's device work** (§4.13): double-buffered `out`/`hostm`, a separate copy
 stream gated by an event, pinned host memory, candidates byte-identical.
 Measured **1.294x at blocksize 8192 and 1.205x at 131072 on the GTX 1080**, whose

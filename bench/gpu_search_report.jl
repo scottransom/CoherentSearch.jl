@@ -61,7 +61,25 @@ total = max(0, floor(Int, (hi * ft.T - lo * ft.T) / lodr) + 1)
 println("="^78)
 @printf("device : %s  sm_%s  SMs=%d  clock=%.3f GHz  L2=%.1f MB  mem %.2f/%.2f GiB free\n",
         CUDA.name(dev), string(cap), sms, clk, l2 / 2^20, free / 2^30, tot / 2^30)
-@printf("host   : %s   julia %s   %d thread(s)\n", gethostname(), VERSION, Threads.nthreads())
+# The load average is in the header because it is the one property of the host
+# that moves these numbers and was never recorded.  `usnea`'s A4000 report was
+# taken at a load average of ~100 on 104 cores and reads ~1.2x slow, with its
+# host-side `scan` share inflated well past anything the card explains
+# (gpu_design.md §4.13).  Every card classified so far has been on someone
+# else's machine.
+const _LOADAVG = try
+    strip(first(split(read("/proc/loadavg", String))))
+catch
+    "?"
+end
+@printf("host   : %s   julia %s   %d thread(s)   %d cores   load %s\n",
+        gethostname(), VERSION, Threads.nthreads(), Sys.CPU_THREADS, _LOADAVG)
+if _LOADAVG != "?" && parse(Float64, _LOADAVG) > 0.5 * Sys.CPU_THREADS
+    @warn "This host is busy; the timings below will be slow and the phase table " *
+          "may be meaningless (`gpu_timing!` brackets phases with a synchronise, " *
+          "which measures scheduler latency on a saturated machine).  Re-run when " *
+          "it is quiet, and quote the load with any number you report." load=_LOADAVG cores=Sys.CPU_THREADS
+end
 @printf("file   : %s   N=%d  T=%.1f s  amps=%.2f GiB\n",
         basename(fftfile), ft.N, ft.T, length(ft.amps) * 8 / 2^30)
 @printf("search : %.4f-%.4f Hz  nharms=%d maxdecim=%d  ->  %d trial fundamentals\n",
