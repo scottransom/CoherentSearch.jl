@@ -1,0 +1,58 @@
+usnea:~/git/CoherentSearch.jl$ julia --project=/users/sransom/.gpuprobe/env bench/gpu_search_report.jl /tmp/sransom/NGC6624_16L_DM87.40_red.fft 
+==============================================================================
+device : NVIDIA RTX A4000  sm_8.6.0  SMs=48  clock=1.560 GHz  L2=4.0 MB  mem 15.40/15.60 GiB free
+host   : usnea   julia 1.12.7   1 thread(s)
+file   : NGC6624_16L_DM87.40_red.fft   N=345600000  T=26459.4 s  amps=1.29 GiB
+search : 0.1000-33.3333 Hz  nharms=60 maxdecim=6  ->  105519959 trial fundamentals
+==============================================================================
+
+candidates above S/N 6: 135
+      0.1699323 Hz   S/N   7.057   nharm  60
+      0.2160158 Hz   S/N   6.343   nharm  60
+      0.2235954 Hz   S/N   7.806   nharm  60
+      0.2360172 Hz   S/N   8.746   nharm  60
+      0.2450950 Hz   S/N   6.289   nharm  60
+
+blocksize sweep (timing OFF -- these are the honest totals):
+  blocksize    wall (s)    ns/trial   cands
+       2048      21.419       203.0     135
+       4096      12.875       122.0     135
+       8192       7.969        75.5     135
+      16384       6.648        63.0     135
+      32768       9.197        87.2     135
+      65536       5.731        54.3     135
+     131072       5.476        51.9     135
+     262144       6.137        58.2     135
+  best: blocksize 131072 at 5.476 s
+
+------------------------------------------------------------------------------
+RECOMMENDATION for this card:  --blocksize 131072
+  Not passing --blocksize gets the CPU default of 2048, which on this
+  card costs 3.91x (21.419 s against 5.476 s).
+  Neighbouring rows: 65536 -> 1.05x, 262144 -> 1.12x
+------------------------------------------------------------------------------
+
+per-phase breakdown at blocksize 131072 (timing ON -- read the SHARES;
+the synchronisation this needs inflates the total, so take that from above):
+                                  share of  share of
+  phase       where      time (s)     total    device
+  zero       device      0.1623      2.8%      3.9%
+  interp     device      0.6818     11.6%     16.5%
+  transpose  device      0.8061     13.8%     19.5%
+  transform  device      1.4614     25.0%     35.3%
+  boxcar     device      1.0247     17.5%     24.8%
+  download   transfer    0.3974      6.8%         -
+  scan       host        1.3232     22.6%         -
+  = device               4.1363     70.6%
+  = host+pcie             1.7206     29.4%
+  TOTAL                  5.8569   (instrumented; clean total was 5.476 s)
+  NOTE: `scan` is this HOST's CPU and `download` is PCIe -- neither is a
+        property of the card.  Compare cards on the device column.
+
+==============================================================================
+PASTE THIS BLOCK BACK:
+  NVIDIA RTX A4000 | sm_8.6.0 | 48 SMs | 1.56 GHz | L2 4 MB | 15.6 GiB
+  NGC6624_16L_DM87.40_red.fft | 105519959 trials | best blocksize 131072 | 5.476 s | 51.9 ns/trial | 135 cands
+  phases (of total):  zero 2.8%  interp 11.6%  transpose 13.8%  transform 25.0%  boxcar 17.5%  download 6.8%  scan 22.6%
+  phases (of device): zero 3.9%  interp 16.5%  transpose 19.5%  transform 35.3%  boxcar 24.8%   [device 70.6% of instrumented]
+==============================================================================

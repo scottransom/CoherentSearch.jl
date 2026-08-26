@@ -354,24 +354,38 @@ optimisation below (1.84x vs 1.26x on the same code and the same data).
 (`ext/CoherentSearchCUDAExt.jl`, CUDA under `[weakdeps]`), so a CPU-only user
 downloads nothing and `src/search.jl` is untouched. **`gpu_design.md` is the
 running log — read it before touching any of this**; it keeps the wrong turns in
-on purpose. Headlines: GTX 1080 is 1.24-1.30x fitzroy's 20-core Xeon with
-byte-identical candidates on PM0063, and an RTX 2080 Super and an RTX 4000 SFF
-Ada are both **~2.7x** it on the 105M-trial NGC6624 file with identical
-candidates (§4.8); the workload wants **SMs, not FLOPs and not bandwidth** — the
-two 48-SM cards tie to 3.9% while differing 1.8x in FP32, 1.8x in bandwidth and
-10x in L2; `--blocksize` is a per-device parameter worth 1.2-2.3x and the cards
-want opposite ends of the range. The **transform is the largest phase on every
-card measured** (31-38.5%) — the predicted drop to ~18% did not happen, which is
-why **per-rung transform sub-batching** (§4.9) was tried. **It is SCORED and it
+on purpose. **Six cards are now measured, 6 to 108 SMs, all reporting
+byte-identical candidates** (§4.8, §4.12). On the 105M-trial NGC6624 file, against
+fitzroy's 20-core Xeon (11.82 s): **A100-SXM4-80GB 5.94x**, RTX 4000 SFF Ada
+2.96x, RTX 2080 Super 2.65x, RTX A4000 2.16x, GTX 1080 1.24x, **RTX A400 0.66x —
+the first card measured that LOSES to the CPU.**
+**Two headline verdicts have been retired by the A100 (§4.12) — do not quote
+them:** (a) *"above ~48 SMs the workload does not care what you buy"* was three
+cards that all had 48 SMs; at fixed SM count that still holds (the three 48-SM
+cards span 12% while differing 1.8x in FP32, 1.8x in bandwidth and 10x in L2),
+but across SM counts it scales near-linearly and **`SMs x clock` under-predicts
+both extremes by ~40%** (the 6-SM A400 is 1.9x better per SM, the 108-SM A100
+1.4x). (b) *"the transform is the largest phase on every card"* — on both 40 MB
+L2 cards the **boxcar** now leads (A100 34.3% device against the transform's
+32.2%), and the boxcar is the one phase that tracks `SMs x clock` and not
+bandwidth (A100 gains 4.20x against a 4.39x SM line while having **7.10x** the
+DRAM). **Optimise the boxcar, not the transform.** `--blocksize` is a per-device
+parameter worth 1.2-5.6x and the cards want opposite ends of the range. Per-rung
+transform sub-batching (§4.9) was tried for the transform. **It is SCORED and it
 is 1.000x on all three cards** (§4.10): the mechanism works (1.166x at blocksize
 262144 on the Ada) but the Ada's optimum blocksize is 16384, where it does not
 engage, and the other two cards' gates decline. Its value is robustness — the
 Ada's blocksize cliff falls 1.21x -> 1.06x. **The Ada's real optimum is
 blocksize 8192, not 16384** (§4.11): 37.9 ns/trial, ~2.96x fitzroy's 20 cores,
 the best number any card here has produced. **But `--blocksize` defaults to 2048
-even under `--gpu`, which costs 1.62-1.65x on the 1080.** Deriving it per-device
-was DECLINED (§4.11) — the rule fits three cards and the middle of the L2 range
-is unmeasured. Instead `gpu_search_report.jl` sweeps from 2048 and *recommends*,
+even under `--gpu`, and that costs 1.37x (A400) to 3.91x (A4000) to 5.55x
+(A100) — the bigger the card, the worse the default hurts (§4.12).** Deriving it
+per-device was DECLINED (§4.11) and the A100 vindicates that: the fitted
+`0.5 x L2 / 2912 B` rule predicts blocksize 6868 for its 40 MB of L2 and the
+measured optimum is **262144, a factor of 32 out**, because occupancy on 108 SMs
+beats L2 residency. §4.12 proposes a flat GPU default of **65536** instead —
+worst case 1.14x across all six cards — which is Scott's call and not
+implemented. Instead `gpu_search_report.jl` sweeps from 2048 and *recommends*,
 `--gpu` warns when the default is left in place, and the README has a GPU
 section. The governing rule, Scott's: **automate what can't hurt, measure what
 can't be guessed.** **Throughput mode is fixed (§4.6):** `GPUChunk`/
@@ -380,8 +394,10 @@ can't be guessed.** **Throughput mode is fixed (§4.6):** `GPUChunk`/
 per file 1.73 s -> 0.79 s. Amplitudes are still freed per file. **The 1.25x prediction was wrong in
 direction (0.960x), because §4.8's non-transform decomposition had the wrong
 sign; do not re-use that column.** The GPU report now labels phases
-`:device`/`:transfer`/`:host` — **`scan` is host-CPU work and moved 1.75x between
-two hosts**, so classify a card on the device column only. `bench/gpu_probe_setup.sh` classifies a new host in
+`:device`/`:transfer`/`:host` — **`scan` is host-CPU work and has now moved 3.5x between
+two hosts** (§4.12), so classify a card on the device column only. **On the two
+fast cards `download` + `scan` is ~31% of wall clock**, which makes overlapping
+them with the next chunk's device work (~1.4x) the largest single item left. `bench/gpu_probe_setup.sh` classifies a new host in
 one command. **fitzroy's GPU drives Scott's desktop — prefer another host for
 anything large.**
 

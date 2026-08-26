@@ -1839,6 +1839,328 @@ the whole point of it — died with `MethodError: no method matching name(::Floa
 the GTX 1080, but only as far as the phase table. **Validate a script to its last
 line of output, not to the part you changed.**
 
+### 4.12 Three more cards — 6 to 108 SMs — and the two headline verdicts both break
+
+`bench/gpu_probe.jl` + `bench/gpu_search_report.jl` on `NGC6624_16L_DM87.40_red.fft`
+(the §4.8 file: 1.29 GiB, 105,519,959 trials, 0.1–33.3 Hz, nharms 60, maxdecim 6),
+run 2026-08-26 by Scott on three new hosts. Raw output in `{ozstar_A100,
+usnea_A4000, rocinante_A400}_{probe,search_report}.txt`.
+
+| | **RTX A400** | **RTX A4000** | **A100-SXM4-80GB** |
+|---|---|---|---|
+| host | `rocinante` | `usnea` | `gina4` (OzSTAR) |
+| arch / SMs x cores | Ampere GA107, **6 x 128** | Ampere GA104, 48 x 128 | Ampere GA100, **108 x 64** |
+| SMs x clock | **10.6** | 74.9 | **152.3** |
+| FP32 achieved | 2388 GFLOP/s | 16663 | 16905 |
+| bandwidth achieved | **90 GB/s** | 381 | **1683** |
+| L2 | **1 MB** | 4 MB | **40 MB** |
+| device memory | **3.67 GiB** | 15.6 | 79.3 |
+| **best `--blocksize`** | 65536 *(capped, see below)* | 131072 | **262144** |
+| clean total | **17.850 s** | 5.476 s | **1.990 s** |
+| ns per trial | 169.2 | 51.9 | **18.9** |
+| candidates | **135** | **135** | **135** |
+| vs fitzroy `-t 20` (11.82 s) | **0.66x — slower** | 2.16x | **5.94x** |
+
+**Correctness first, again: 135 candidates on all three, and the printed top five
+agree with each other, with the three cards of §4.8 and with fitzroy's CPU digit
+for digit.** That is now **six cards across five microarchitectures** (sm_61,
+sm_75, sm_80, sm_86 x2, sm_89) agreeing on a 105.5M-trial blind search. §5's
+batch-invariance pin has stopped being a worry.
+
+#### Per-phase ns/trial, all six cards, at each card's own best blocksize
+
+Shares converted to ns/trial so the phases can be compared across cards rather
+than within one. The GTX 1080 row is §4.8's (PM0063 shares on an NGC6624 total —
+read it as ±10–20%); the RTX 4000 Ada row is its **16384** run, so it is the one
+directly comparable to §4.8 and *not* its 8192 optimum.
+
+| card | SMs | SMxclk | L2 | BW | blocksize | zero | interp | transp | xform | boxcar | dload | scan | **device** | **total** |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| RTX A400 | 6 | 10.6 | 1 MB | 90 | 65536 | 5.45 | 31.81 | 28.45 | 54.21 | 41.48 | 2.35 | 5.43 | **161.4** | **169.2** |
+| GTX 1080 | 20 | 34.7 | 2 MB | 237 | 262144 | 2.68 | 16.49 | 13.82 | 41.23 | 17.67 | 6.96 | 8.14 | **91.9** | **107.1** |
+| RTX A4000 | 48 | 74.9 | 4 MB | 381 | 131072 | 1.54 | 6.46 | 7.64 | 13.85 | 9.71 | 3.77 | 12.54 | **39.2** | **51.9** |
+| RTX 2080 Super | 48 | 87.1 | 4 MB | 431 | 262144 | 1.31 | 5.33 | 6.85 | 13.11 | 7.83 | 2.62 | 5.20 | **34.4** | **42.3** |
+| RTX 4000 Ada | 48 | 74.9 | 40 MB | 239 | 16384 | 1.42 | 6.92 | 3.74 | 13.43 | 9.52 | 2.65 | 2.97 | **35.0** | **40.7** |
+| **A100 80GB** | 108 | 152.3 | 40 MB | 1683 | 262144 | **0.31** | **2.02** | **1.79** | **3.96** | **4.21** | 2.10 | 3.54 | **12.29** | **18.86** |
+
+Device-only shares:
+
+| card | zero | interp | transpose | transform | boxcar |
+|---|---|---|---|---|---|
+| RTX A400 | 3.4% | 19.7% | 17.6% | **33.6%** | 25.7% |
+| GTX 1080 | 2.9% | 17.9% | 15.0% | **44.9%** | 19.2% |
+| RTX A4000 | 3.9% | 16.5% | 19.5% | **35.3%** | 24.8% |
+| RTX 2080 Super | 3.8% | 15.5% | 19.9% | **38.1%** | 22.7% |
+| RTX 4000 Ada (16384) | 4.1% | 19.7% | 10.7% | **38.3%** | 27.2% |
+| RTX 4000 Ada (8192) | 5.4% | 24.3% | 14.4% | 26.3% | **29.6%** |
+| **A100 80GB** | 2.5% | 16.4% | 14.6% | 32.2% | **34.3%** |
+
+#### VERDICT 1 IS DEAD: "above ~48 SMs this workload does not care what you buy"
+
+§0.4 and §0.46 stated it in its strongest form and §4.8 promoted it to a
+"hardware lesson" on the strength of a three-way tie. **The tie was three cards
+that all had 48 SMs.** The A100 is **2.80–3.19x** the 48-SM cluster on device
+time (12.29 ns/trial against 34.4–39.2) on **2.25x** their SM count. The claim
+was never about a plateau in SMs; it was about a plateau in *everything else*,
+and only the A100 could show that by moving SM count instead.
+
+The corrected statement, and it is a better one because it now spans **18x in SM
+count** rather than one point:
+
+- **At fixed SM count the card really does not matter.** The three 48-SM cards
+  span **12%** of device time (34.4 / 35.0 / 39.2 ns/trial) while differing by
+  **1.8x in FP32, 1.8x in bandwidth and 10x in L2.** That half of §0.4 survives
+  intact and is now the *only* half.
+- **Across SM counts it scales close to linearly in SMs, and both ends beat the
+  line.** Device throughput **per SM**, in trials/ns/SM: A400 **1.03e-3**,
+  GTX 1080 5.44e-4, A4000 5.31e-4, 2080 Super 6.05e-4, Ada 5.95e-4, A100
+  **7.53e-4**. Four cards from Pascal to Ada spanning 20–48 SMs sit inside
+  **±7%** of each other; the 6-SM A400 is **1.9x** better per SM and the 108-SM
+  A100 is **1.4x** better per SM.
+
+**So `SMs x clock` under-predicts at both extremes**, by 46% (A400) and **41%**
+(A100), while landing within 6–18% on the middle four. Bandwidth is the reverse:
+it nails the A100 (7.10x predicted, 7.47x measured) and is hopeless on the Ada
+(1.01x predicted, 2.62x measured). **Neither model fits six cards, which is
+§0.46's verdict re-confirmed with three times the evidence — buy on SM count, but
+do not expect the last 40% from it.**
+
+#### VERDICT 2 IS DEAD: "the transform is the target on every card measured"
+
+§4.8's second scored prediction ended "the transform is still the target on every
+card measured", and §4.11 already had the Ada at 8192 contradicting it.
+**The A100 confirms the reversal on a second card, and by a different route:**
+transform 32.2% of device against the **boxcar's 34.3%.**
+
+Both cards where the boxcar leads have **40 MB of L2**, which is the whole
+mechanism: the transform is the only phase that responds to cache, so the cards
+that make it cheap are the cards where something else becomes the target. And the
+something else is the boxcar, which §4.8 finding (4) established tracks
+`SMs x clock` because its cost is a serial dependency chain through **shared
+memory**. **The A100 is the sharpest test that finding has had and it passes:**
+boxcar speedup over the GTX 1080 is **4.20x** against `SMs x clock`'s 4.39x
+(**4.5% error**) while the A100 has **7.10x** the bandwidth. A phase that gains
+4.2x on 7.1x the DRAM is not DRAM-bound. Compare the other phases' speedup over
+the 1080:
+
+| phase | A400 | A4000 | 2080S | Ada | **A100** | A100 vs SMxclk (4.39x) |
+|---|---|---|---|---|---|---|
+| zero | 0.49x | 1.74x | 2.05x | 1.89x | 8.65x | +97% |
+| interp | 0.52x | 2.55x | 3.09x | 2.38x | **8.17x** | **+86%** |
+| transpose | 0.49x | 1.81x | 2.02x | 3.69x | 7.72x | +76% |
+| transform | 0.76x | 2.98x | 3.15x | 3.07x | **10.42x** | **+137%** |
+| **boxcar** | 0.43x | 1.82x | 2.26x | 1.86x | **4.20x** | **−4%** |
+
+**The boxcar is the one phase the A100's memory system cannot help**, and that is
+exactly why it is now the largest one. **Anyone optimising the GPU path next
+should work on the boxcar, not the transform** — that is a reversal of §4.8's
+recorded advice and the reason it reversed is measured, not argued.
+
+The transform's 10.42x is the one phase that beats *both* simple models (4.39x
+SMs, 7.10x bandwidth). The probe explains it: cuFFT's batched C2R runs at
+**43–50% of DRAM peak on every card measured** (A100 43%, A4000 49%, A400 50%),
+so the stage tracks achieved bandwidth with a roughly constant efficiency, and
+the A100 is the first card whose bandwidth jump is large enough for that to show.
+
+#### The `--blocksize` derived rule of §4.11 is REFUTED, by a factor of 32
+
+§4.11 fitted `0.5 x L2 / 2912 B` to three cards, landed on all three measured
+optima, and Scott declined to implement it. **The A100 says do not:**
+
+| card | L2 | rule predicts | measured optimum |
+|---|---|---|---|
+| GTX 1080 | 2 MB | 344 → below floor, fall back large | 262144 ✓ |
+| RTX A400 | 1 MB | 172 → below floor, fall back large | ≥65536 ✓ |
+| RTX A4000 | 4 MB | 687 → below floor, fall back large | 131072 ✓ |
+| RTX 2080 Super | 4 MB | 687 → below floor, fall back large | 262144 ✓ |
+| RTX 4000 SFF Ada | 40 MB | **6868** | **8192** ✓ |
+| **A100 80GB** | **40 MB** | **6868** | **262144** ✗ **(32x off)** |
+
+**Two cards with identical L2 want opposite ends of the range**, and the A100's
+small-blocksize end is not merely suboptimal but catastrophic — 8192 reads
+**36.7 ns/trial against 18.9**, a **1.94x** cliff, where on the Ada 8192 *was*
+the optimum. So the second axis the one-parameter rule ignores is **SM count**:
+at 8192 trials the A100 has 76 trials per SM and cannot fill 108 SMs, and
+occupancy beats residency once the machine is big enough. **`automate what can't
+hurt, measure what can't be guessed` was the right call and this is the
+measurement that proves it** — a rule fitted to three cards was wrong on the
+fourth in the family it was fitted to.
+
+**Related: the A100's sweep is monotone to the top of the range, so its optimum
+is not bracketed.** 131072 → 262144 is still gaining 1.04x. The sweep should be
+extended to 524288 and 1048576 there; at 2912 B/trial that is 1.5 and 3.0 GiB of
+workspace against 79 GiB of device memory, so nothing stops it.
+
+#### The default `--blocksize 2048` hole is much worse than §4.11 measured, and there IS a constant
+
+§4.11 measured the untuned penalty at **1.65x** on the GTX 1080 and used it to
+argue for a warning rather than a default. Across six cards the penalty is:
+
+| card | default 2048 | best | **penalty** |
+|---|---|---|---|
+| RTX A400 | 24.459 s | 17.850 | 1.37x |
+| GTX 1080 | 224.5 ns/tr | 136.1 | 1.65x |
+| RTX A4000 | 21.419 s | 5.476 | **3.91x** |
+| **A100 80GB** | **11.049 s** | **1.990** | **5.55x** |
+
+**The bigger the card, the worse the default hurts** — which is the opposite of
+harmless, and it means the flagship result of this track (5.94x fitzroy's 20
+cores) is 1.07x fitzroy's 20 cores for a user who does not read the warning.
+
+**But a fitted per-device rule is not the only alternative, and the sweeps
+already contain a constant that is safe on all six cards.** Cost of a flat
+`--blocksize 65536`, each card against its own measured best:
+
+| card | 65536 | best | penalty |
+|---|---|---|---|
+| RTX A400 | 17.850 s | 17.850 (65536) | **1.00x** |
+| GTX 1080 | ~140 ns/tr (interp.) | 136.1 | ~1.03x |
+| RTX A4000 | 5.731 s | 5.476 | 1.05x |
+| RTX 2080 Super | 45.5 ns/tr | 42.3 | 1.08x |
+| RTX 4000 SFF Ada | 42.9 ns/tr | 37.9 | 1.13x |
+| **A100 80GB** | 2.265 s | 1.990 | **1.14x** |
+
+**Worst case 1.14x, across 6–108 SMs and 1–40 MB of L2, against 1.37–5.55x
+today.** That is not a fitted rule — it is one constant, chosen because it is
+never far from any measured optimum, and it fails safe: 65536 needs 0.18 GiB of
+workspace, which fits on the smallest card here (the A400, where 131072 does
+not). It also leaves the sweep-and-recommend workflow exactly as it is for anyone
+who wants the last 14%. **Proposed, not implemented — this is Scott's call under
+the same rule as §4.11**, and the question it turns on is whether a constant that
+can cost 1.14x counts as "can't hurt".
+
+#### The memory gate double-counts pooled memory, and it cost the A400 two sweep rows
+
+The A400 run skipped 131072 and 262144 with *"needs about 1.64 GiB but only
+1.77 GiB free"* — and 1.64 < 1.77, so the message reads as self-contradictory
+until you find the `0.90 * free` margin (1.64 > 1.593). **The deeper problem is
+that both sides of that comparison are wrong in the same direction.**
+`_check_device_memory` computes `need` **including the 1.29 GiB of amplitudes**,
+and compares it against `CUDA.memory_info()`'s free — which, by the second sweep
+row, already **excludes** the amplitudes and the cached chunk workspace, because
+§4.6 moved `CUDA.reclaim()` out to `release_backend!` and the report calls
+`search` sixteen times in one process. So on the third row the gate is charging
+for the amplitudes twice. Actual new demand at 131072 was ~0.35 GiB against
+1.77 GiB free.
+
+- The probe reports **3.44 GiB free** on this card and the gate saw **1.77**.
+  The 1.67 GiB difference is the pool: amplitudes 1.29 + a 65536 workspace 0.18 +
+  context.
+- **The §4.6 throughput fix and this gate interact, and nothing tested the pair.**
+  The gate was written for a single search per process; §4.6 made many searches
+  per process the normal case.
+- Fix: compare against `free + CUDA.cached_memory()` (bytes the pool holds but is
+  not using), or `CUDA.reclaim()` before the check. The first is better — the
+  second throws away exactly the caching §4.6 added.
+- One thing the episode *validates*: the gate's own arithmetic reproduces §4.11's
+  per-trial footprint independently. `1.64 − 1.29 = 0.35 GiB` at 131072 is
+  **2870 B/trial** and `2.00 − 1.29 = 0.71 GiB` at 262144 is **2907 B/trial**,
+  against §4.11's hand-counted **2912 B**. Two derivations, three digits.
+
+**So the A400's "best blocksize 65536" is a ceiling, not an optimum** — its sweep
+was still improving monotonically (24.459 / 21.289 / 19.671 / 18.646 / 18.130 /
+17.850) when it ran out of rows. Re-run it after the gate is fixed.
+
+#### The host side is now a third of the run on the two fast cards
+
+`download` + `scan` as a fraction of wall clock: **A100 31.5%** (2.10 + 3.54 of
+18.86 ns/trial), **A4000 31.4%** (3.77 + 12.54 of 51.9), against the A400's
+**4.6%** and the GTX 1080's 14.1%. It is exactly the arithmetic you would expect —
+the device got 8x faster and the host did not — but it has crossed the line where
+it is the **largest single item left**, bigger than any remaining device phase:
+
+- Overlapping the download and host scan of chunk `i` with the device work of
+  chunk `i+1` (double-buffer `out` and `hostm`, one extra host thread) would hide
+  essentially all of it: **~1.40x on the A100 and ~1.46x on the A4000**, against
+  the ~1.17x that the *entire* sub-batching effort produced in its best case.
+- **The scan remains a host property and the spread is enormous**: `usnea`
+  12.54 ns/trial against `gina4`'s 3.54 — **3.5x**, on the same code and the same
+  work, which is a wider spread than §4.8's 1.75x and a reminder that a card's
+  total ns/trial is partly a statement about the machine it is in. On the A4000
+  the host scan alone is **22.6% of wall clock**.
+- The download runs at **11.4 GB/s** (A100, 24 B/trial) and 10.2 GB/s (A400),
+  i.e. pageable-memory PCIe, not card speed. `hostm` is a plain
+  `Matrix{Float32}`; pinning it is worth roughly 2x on that phase (~5% end to end
+  on the A100) and is a two-line change. Overlapping makes it free instead, so do
+  the overlap first.
+
+#### §0.5's pre-registered A4000 predictions, scored — 4 hits, 1 untested
+
+1. **Achieved bandwidth ~385 GB/s — HIT.** Measured **381 GB/s** (85% of the
+   448 peak, and 1% off the prediction). The four-card bandwidth-efficiency band
+   is now 74–94%.
+2. **No probe row above 100% of DRAM, `Nprof` preferring the large end — HIT**,
+   with one qualification: the probe tops out at 50% and the transform stage is
+   *flat* from 65536 to 262144 (0.116 / 0.117 / 0.117 s) rather than monotone, and
+   the in-search optimum is an interior 131072. Direction right, "monotone" wrong.
+3. **Sub-batching worth 1.00x — UNTESTED.** `bench/gpu_subbatch_bench.jl` was not
+   run. With 4 MB of L2 the `:auto` gate will decline to split at all
+   (`bytes * _SUB_MIN_COLS = 968 x 16384 = 15.9 MB > 2 MB` target), so this is a
+   prediction of 1.000x by construction, not by measurement.
+4. **Transform stage ~0.112 s — HIT, 3.6% out.** Measured **0.116 s**.
+   **And this is the outcome §0.5 pre-registered a decision on.** The RTX 4000 Ada
+   does this stage in **0.071 s** on 40 MB of L2 and 239 GB/s; the A4000 needs
+   **0.116 s** on 4 MB and 381 GB/s. So **for the transform stage a large L2 is
+   worth more than 1.6x the DRAM bandwidth, and §0.3's per-rung sub-batching was
+   the right thing to build.** §0.5 committed to dropping it if the A4000 came in
+   at or below 0.071 s; it came in at 1.63x that.
+5. **Interpolation matches the Ada rather than the 2080 Super — HIT on the
+   ranking.** In-search, each card at its own blocksize: A4000 **6.46**, Ada
+   **6.92**, 2080 Super **5.33** ns/trial. So `A4000 ≈ Ada < 2080 Super`, which is
+   §0.46's **explanation 1** — the interpolator is issue/latency-bound and
+   cores/SM is what buys it, with L2 irrelevant.
+   - **But do not close §0.46 on this.** The comparison is at three different
+     blocksizes and interp improves monotonically with chunk size (§4.4), so the
+     Ada's 6.92 at 16384 is worth ~5.6 at the A4000's 131072 — i.e. the Ada may
+     be ~1.15x ahead at matched blocksize, which is the *other* branch.
+   - **And the A100 does not fit either branch.** Its interp is **3.20x** the
+     A4000's on **1.125x** the total FP32 cores (6912 vs 6144) and **2.03x** the
+     `SMs x clock`. Cores/SM cannot produce 3.20x from 1.125x. What the A100 has
+     is more resident-warp capacity per SM (GA100's 64 against GA10x's 48) and
+     40 MB of L2, both of which reduce effective load latency — consistent with
+     §4.1's latency-bound diagnosis and with neither of §0.46's two candidates as
+     stated.
+   - **`bench/gpu_interp_bench.jl` at a fixed `Nprof = 65536` is the instrument
+     that settles this and it was not run on any of the three new cards.** It is
+     a one-minute run. Until it is, §0.46 stays open.
+
+#### Two data quality notes
+
+- **The A4000's 32768 row is an outlier and should be re-run.** The sweep reads
+  21.419 / 12.875 / 7.969 / 6.648 / **9.197** / 5.731 / 5.476 / 6.137 — every
+  other row is smooth and that one is 1.6x out of line, on a host with **two**
+  A4000s where a second tenant is plausible. Nothing in the analysis above leans
+  on it.
+- **No `--cpu` arm was run on any of the three hosts**, so the "x one core"
+  column cannot be quoted for any of them, and §0.46's warning that this column
+  must not travel applies with force: three hosts have already differed by 2.4x
+  per core. All the CPU ratios above are against **fitzroy's** 20-core Xeon at
+  11.82 s.
+
+#### What this run makes the next work
+
+In value order, all of it measured rather than modelled:
+
+1. **Overlap the download and host scan with the next chunk's device work** —
+   ~1.40x on the A100, ~1.46x on the A4000, and it grows with every faster card.
+   This is now the largest single item on any modern card.
+2. **Run `bench/gpu_subbatch_bench.jl` on the A100.** It is the first card that
+   has 40 MB of L2 *and* runs at a large blocksize, which is precisely the
+   configuration §4.10 measured the mechanism helping in (1.166x on the Ada at
+   262144). The A100 report above already ran with `:auto` engaged — the
+   L2-derived target splits `k=1` into ~12 blocks of 21665 columns — so the
+   1.990 s **includes** whatever sub-batching is worth there, and the `:off`
+   control is missing. If it is worth >1.05x, sub-batching stops being a
+   robustness feature and becomes a speed win on the largest cards.
+   `_SUB_MIN_COLS = 16384` was also tuned on a 48-SM card and is 152 columns per
+   SM on 108; sweep it.
+3. **Extend the A100 blocksize sweep to 524288 and 1048576** — its optimum is not
+   bracketed and 262144 is still gaining 1.04x.
+4. **Fix the memory gate's pool double-count**, then re-run the A400 at 131072
+   and 262144.
+5. **Work the boxcar, not the transform**, for anyone optimising device kernels.
+6. **Run `bench/gpu_interp_bench.jl` on all three new cards** to close §0.46.
+
 
 ---
 

@@ -1,0 +1,57 @@
+==============================================================================
+device : NVIDIA RTX A400  sm_8.6.0  SMs=6  clock=1.762 GHz  L2=1.0 MB  mem 3.44/3.67 GiB free
+host   : rocinante   julia 1.12.7   1 thread(s)
+file   : NGC6624_16L_DM87.40_red.fft   N=345600000  T=26459.4 s  amps=1.29 GiB
+search : 0.1000-33.3333 Hz  nharms=60 maxdecim=6  ->  105519959 trial fundamentals
+==============================================================================
+
+candidates above S/N 6: 135
+      0.1699323 Hz   S/N   7.057   nharm  60
+      0.2160158 Hz   S/N   6.343   nharm  60
+      0.2235954 Hz   S/N   7.806   nharm  60
+      0.2360172 Hz   S/N   8.746   nharm  60
+      0.2450950 Hz   S/N   6.289   nharm  60
+
+blocksize sweep (timing OFF -- these are the honest totals):
+  blocksize    wall (s)    ns/trial   cands
+       2048      24.459       231.8     135
+       4096      21.289       201.8     135
+       8192      19.671       186.4     135
+      16384      18.646       176.7     135
+      32768      18.130       171.8     135
+      65536      17.850       169.2     135
+     131072    SKIPPED: This search needs about 1.64 GiB on the GPU but only             1.77 GiB of 3.67 GiB is free.
+     262144    SKIPPED: This search needs about 2.0 GiB on the GPU but only             1.77 GiB of 3.67 GiB is free.
+  best: blocksize 65536 at 17.850 s
+
+------------------------------------------------------------------------------
+RECOMMENDATION for this card:  --blocksize 65536
+  Not passing --blocksize gets the CPU default of 2048, which on this
+  card costs 1.37x (24.459 s against 17.850 s).
+  Neighbouring rows: 32768 -> 1.02x, 16384 -> 1.04x
+------------------------------------------------------------------------------
+
+per-phase breakdown at blocksize 65536 (timing ON -- read the SHARES;
+the synchronisation this needs inflates the total, so take that from above):
+                                  share of  share of
+  phase       where      time (s)     total    device
+  zero       device      0.5746      3.2%      3.4%
+  interp     device      3.3568     18.8%     19.7%
+  transpose  device      3.0015     16.8%     17.6%
+  transform  device      5.7198     32.0%     33.6%
+  boxcar     device      4.3767     24.5%     25.7%
+  download   transfer    0.2477      1.4%         -
+  scan       host        0.5731      3.2%         -
+  = device              17.0293     95.4%
+  = host+pcie             0.8207      4.6%
+  TOTAL                 17.8501   (instrumented; clean total was 17.850 s)
+  NOTE: `scan` is this HOST's CPU and `download` is PCIe -- neither is a
+        property of the card.  Compare cards on the device column.
+
+==============================================================================
+PASTE THIS BLOCK BACK:
+  NVIDIA RTX A400 | sm_8.6.0 | 6 SMs | 1.76 GHz | L2 1 MB | 3.7 GiB
+  NGC6624_16L_DM87.40_red.fft | 105519959 trials | best blocksize 65536 | 17.850 s | 169.2 ns/trial | 135 cands
+  phases (of total):  zero 3.2%  interp 18.8%  transpose 16.8%  transform 32.0%  boxcar 24.5%  download 1.4%  scan 3.2%
+  phases (of device): zero 3.4%  interp 19.7%  transpose 17.6%  transform 33.6%  boxcar 25.7%   [device 95.4% of instrumented]
+==============================================================================

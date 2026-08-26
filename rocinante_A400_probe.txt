@@ -1,0 +1,93 @@
+CUDA toolchain: 
+- runtime 13.3.0, artifact installation
+- driver 595.91.7 for 13.3
+- compiler 13.3.73, artifact installation
+
+CUDA libraries: 
+- cuBLAS: 13.6.0
+- cuSPARSE: 12.8.2
+- cuSOLVER: 12.2.6
+- cuFFT: 12.3.0
+- cuRAND: 10.4.3
+- CUPTI: 2026.2.1 (API 13.3.1)
+- NVML: 13.0.0+595.91.7
+
+Julia packages: 
+- CUDACore: 6.3.0
+- GPUArrays: 11.5.13
+- GPUCompiler: 2.4.0
+- KernelAbstractions: 0.9.42
+- CUDA_Driver_jll: 13.3.1+0
+- CUDA_Compiler_jll: 0.5.1+0
+- CUDA_Runtime_jll: 0.24.1+0
+- NVPTX_LLVM_Backend_jll: 22.1.7+1
+
+Toolchain:
+- Julia: 1.12.7
+- LLVM: 18.1.7
+
+1 device:
+  0: NVIDIA RTX A400 (sm_86, 3.490 GiB / 3.998 GiB available)
+     compiles to sm_86 / PTX 9.3 (LLVM: sm_86 / PTX 9.0)
+device: NVIDIA RTX A400  sm_8.6.0  SMs=6  clock=1.762 GHz  cores/SM=128
+L2    : 1.0 MB   <- the knee in the cuFFT sweep below should sit here
+memory: 3.44 GiB free of 3.67 GiB   bus 64-bit @ 6.001 GHz
+peak  : FP32 2706 GFLOP/s   bandwidth 96 GB/s
+FP32 FMA kernel :   0.675 ms ->   2388 GFLOP/s  (88% of peak)
+device copy     :   5.971 ms ->     90 GB/s     (94% of peak)
+
+cuFFT batched C2R, swept over Nprof   (L2 = 1.0 MB)
+  Nprof    k  nbins   workset       ms   ns/out-bin   vs FFTW   eff GB/s   %DRAM
+    16384  1    120    15.1 MB    0.365     0.18560    11.0x         43      48%
+    16384  2     60     7.6 MB    0.192     0.19508    10.5x         42      46%
+    16384  3     40     5.1 MB    0.130     0.19872    10.3x         41      46%
+    16384  4     30     3.9 MB    0.104     0.21242     9.6x         39      43%
+    16384  5     24     3.1 MB    0.082     0.20980     9.8x         40      44%
+    16384  6     20     2.6 MB    0.071     0.21679     9.4x         39      43%
+    16384  ---> whole six-rung transform stage for the reference workload: 0.482 s
+
+    32768  1    120    30.2 MB    0.714     0.18168    11.3x         44      49%
+    32768  2     60    15.2 MB    0.376     0.19101    10.7x         43      47%
+    32768  3     40    10.2 MB    0.256     0.19526    10.5x         42      47%
+    32768  4     30     7.8 MB    0.196     0.19891    10.3x         42      46%
+    32768  5     24     6.2 MB    0.158     0.20036    10.2x         42      46%
+    32768  6     20     5.2 MB    0.135     0.20640     9.9x         41      45%
+    32768  ---> whole six-rung transform stage for the reference workload: 0.468 s
+
+    65536  1    120    60.5 MB    1.418     0.18033    11.4x         45      50%
+    65536  2     60    30.5 MB    0.738     0.18760    10.9x         43      48%
+    65536  3     40    20.5 MB    0.494     0.18827    10.9x         44      48%
+    65536  4     30    15.5 MB    0.385     0.19573    10.5x         42      47%
+    65536  5     24    12.5 MB    0.309     0.19645    10.4x         42      47%
+    65536  6     20    10.5 MB    0.261     0.19926    10.3x         42      47%
+    65536  ---> whole six-rung transform stage for the reference workload: 0.460 s
+
+   131072  1    120   121.0 MB    2.818     0.17917    11.4x         45      50%
+   131072  2     60    61.0 MB    1.454     0.18493    11.1x         44      49%
+   131072  3     40    41.0 MB    0.976     0.18613    11.0x         44      49%
+   131072  4     30    31.0 MB    0.753     0.19158    10.7x         43      48%
+   131072  5     24    25.0 MB    0.602     0.19149    10.7x         44      48%
+   131072  6     20    21.0 MB    0.510     0.19463    10.5x         43      48%
+   131072  ---> whole six-rung transform stage for the reference workload: 0.454 s
+
+   262144  1    120   242.0 MB    5.623     0.17876    11.5x         45      50%
+   262144  2     60   122.0 MB    2.903     0.18454    11.1x         44      49%
+   262144  3     40    82.0 MB    1.934     0.18447    11.1x         44      49%
+   262144  4     30    62.0 MB    1.491     0.18955    10.8x         44      49%
+   262144  5     24    50.0 MB    1.192     0.18945    10.8x         44      49%
+   262144  6     20    42.0 MB    1.006     0.19188    10.7x         44      49%
+   262144  ---> whole six-rung transform stage for the reference workload: 0.451 s
+
+BEST Nprof for the transform stage: 262144 at 0.451 s  (CPU -t 20 spends ~0.51 s here, so 1.1x)
+
+fused direct DFT vs cuFFT, k=1 fold (nbins=120, nharms+1=61)
+  Nprof      DFT ms  ns/bin    cuFFT ms  ns/bin   cuFFT/DFT   rel err
+    65536    10.489  1.3337       1.419  0.1804       7.39x   3.3e-07
+   262144    39.683  1.2615       5.631  0.1790       7.05x   2.7e-07
+  (cuFFT/DFT < 1 means cuFFT wins.  rel err is against cuFFT, and ~3e-7 is
+   Float32 machine precision -- the DFT is correct, just not competitive.)
+
+==============================================================================
+Paste this line back with the card's name -- it is the whole classification:
+  NVIDIA RTX A400 | sm_8.6.0 | 2388 GFLOP/s | 90 GB/s | L2 1 MB
+==============================================================================
