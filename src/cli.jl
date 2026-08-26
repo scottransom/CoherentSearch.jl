@@ -394,7 +394,12 @@ function write_candidates(cands::Vector{Candidate}, outfile::AbstractString, thr
     # `Ducy(%)` is the best-fitting boxcar's duty cycle, defined as riptide's
     # `rseek` defines it (width / profile bins) so the two are directly
     # comparable; `-` means it was never measured (see `measure_ducy`).
-    header = ["#       'S/N'      Frequency (Hz)        Period (ms)    #Harm  Ducy(%)"]
+    # The leading column is the 1-based RANK, and the header must say so: it did
+    # not, and awk-ing `$2` for the frequency (it is the S/N) is then an easy and
+    # silent mistake to make -- one that produced a confident, entirely wrong
+    # reading of a real 220-file search on 2026-08-25.  `#Num` occupies exactly
+    # the `%-4d` the rank is printed in, so the columns still line up.
+    header = ["#Num    'S/N'      Frequency (Hz)        Period (ms)    #Harm  Ducy(%)"]
     lines = [@sprintf("%-4d  %8.2f  %18.12f  %18.12f   %3d   %6s",
                       i, c.metric, c.freq, 1000.0 / c.freq, c.nharm,
                       isnan(c.ducy) ? "-" : @sprintf("%.2f", 100 * c.ducy))

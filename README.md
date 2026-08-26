@@ -266,9 +266,13 @@ Two collapses run on the candidate list, both on by default:
 ### Candidate output format
 
 ```
-#       'S/N'      Frequency (Hz)        Period (ms)    #Harm  Ducy(%)
+#Num    'S/N'      Frequency (Hz)        Period (ms)    #Harm  Ducy(%)
 1        11.92      7.118536329269    140.478316573069    32    14.06
 ```
+
+**The first column is the rank, not the S/N** — so in `awk` the S/N is `$2` and
+the frequency is `$3`.  (The header used to omit the rank column, which made
+`$2` look like the frequency.  It is not.)
 
 `#Harm` is the harmonic count that found the candidate (`k = nharms ÷ #Harm`
 identifies the decimation). `Ducy(%)` is the duty cycle of the best-fitting
