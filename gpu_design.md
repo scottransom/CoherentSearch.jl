@@ -1143,6 +1143,33 @@ a multi-file run rather than rebuilt and freed per call. Only the amplitude
 upload is genuinely per-file, and §7.2's prefetch would overlap that with the
 previous file's search.
 
+**MEASURED 2026-08-25, and it is bigger than the TODO implies — `CUDA.reclaim()`
+is the cost, not the rebuild.** The CLI shares one `SearchCache` across files but
+`_region!` builds and frees everything per call, so each file pays (GTX 1080,
+isolated):
+
+| per file | |
+|---|---|
+| **`CUDA.reclaim()`** | **0.362 s** |
+| `GPUChunk` build + free | 0.073 s @ 262144, 0.133 s @ 8192 |
+| `GPUInterpPlan` build | 0.004 s |
+| amplitude upload, 188 MB | 0.042 s |
+
+Sum ~0.51 s, confirmed end to end: PM0063 through the CLI at `--blocksize 262144`
+is **25.13 s for one file and 30.33 s for four — 1.73 s marginal** against a
+~1.14 s search, i.e. **~0.6 s of pure per-file overhead.**
+
+**At 220 files that is ~2 minutes of overhead**, which can approach or exceed the
+search time itself when each file is small. The upload — the one part that is
+genuinely per-file — is negligible at 0.042 s; **the fixable part is ~92% of it**.
+`reclaim()` alone is ~70%, and it exists for §4.6's display-GPU reason: without it
+the desktop does not get its memory back. On a headless compute card it buys
+nothing per file and should run once per invocation.
+
+So the throughput fix is two changes, not one: cache the chunk and plans across
+files (the original TODO), *and* move `reclaim()` out of `_region!` to the end of
+the run — or make it conditional on the device driving a display.
+
 ### 4.7 Classifying a new card in one command
 
 ```sh
