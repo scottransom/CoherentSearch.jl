@@ -560,43 +560,136 @@ end
 # Stage 2: the boxcar gate.
 #
 # One thread per trial, the profile's wrapped prefix sum staged in shared memory.
-# `profs` is `(Nprof, nbins)`, so `profs[trial, i]` for consecutive trials is
-# contiguous: the load is coalesced with no transpose, and the shared array is
-# indexed `[(i-1)*B + tid]` so the per-width scan is bank-conflict free too.
-#
 # This is `_boxcar_psum!` + `_boxcar_scan` with the zero baseline, in the same
 # operation order per profile.  DC is held at zero so the profile mean is already
 # ~0 and the `delta*S_tot` term is the rounding-level correction the CPU applies.
+#
+# **THE STAGING LOAD IS NOT COALESCED, A COMMENT HERE USED TO CLAIM IT WAS, AND
+# COALESCING IT IS A LOSS.  Do not re-guess this one (gpu_design.md §4.15).**
+#
+# The comment removed from here read: "`profs` is `(Nprof, nbins)`, so
+# `profs[trial, i]` for consecutive trials is contiguous".  It WAS -- until §4.2
+# measured cuFFT transforming dimension 1 1.75-1.88x faster than dimension 2 and
+# the layout flipped to `(nbins, Nprof)`.  In column-major that makes
+# `profs[i, j]`, with `j` the trial and consecutive threads holding consecutive
+# `j`, a stride-`nbins` gather: 32 separate sectors per warp per phase bin, of
+# which 4 bytes each are wanted.  The rationale was carried forward and never
+# re-derived -- the same failure as the stale `GPUChunk` comment about "the
+# answer to (2)", in the other direction.
+#
+# **So the comment was wrong and the code is right.**  `_bc_stage!(..., Val(true))`
+# reads the block's `B` columns as `B` contiguous runs and transposes them into
+# shared, cutting L1 transactions ~8x.  Measured on a GTX 1080 over all six
+# rungs, variant 3 at `B = 32`, bit-exact to the shipped path:
+#
+#     per-thread gather, stride B       0.1297 s   <- ships
+#     per-thread gather, stride B+1     0.1363 s   padding alone, 1.05x
+#     coalesced,         stride B+1     0.2003 s   **1.55x SLOWER**
+#
+# The gather's re-requests were already L1 hits -- a warp's 32 columns are 15 kB,
+# well inside L1 -- so the transaction count was never what the phase was paying.
+# What coalescing ADDS is the loop shape it forces: `nbins` is not a multiple of
+# `B` at any rung (120/60/40/30/24/20 against 32), so one flat 126-iteration
+# stream with good ILP becomes a 32-trip outer loop over columns around a 3-4
+# trip inner one, plus a `sync_threads()`.  That costs 1.47x; the odd shared
+# stride the transpose needs costs the other 1.05x.
+#
+# **This is positive evidence for §4.12's reading of the boxcar**, not just a
+# dead end: an 8x cut in memory transactions changing nothing confirms the phase
+# is issue-bound rather than memory-bound, which is why it tracks `SMs x clock`
+# and not bandwidth.  Optimising it means removing WORK, not improving access.
+#
+# The coalesced path stays in the build behind `Val{COAL}`, defaulting OFF.  It
+# costs nothing (Julia specialises it only if the bench asks), and it lets
+# `bench/gpu_boxcar_bench.jl` re-test the verdict on a card with a larger L1 in
+# ONE process -- rather than across a checkout, where a precompile difference
+# could masquerade as the effect.
+#
+# Both staging paths are **bit-exact** to each other, deliberately: the wrap
+# region is materialised in shared (slots `nbins+1 .. nbins+wmax` copy slots
+# `1 .. wmax`) and the prefix reads each slot before overwriting it, so the
+# running accumulation is the identical sequence of adds in the identical order.
+# Folding the wrap arithmetically instead -- `ps[i] = stot + ps[i-nbins]`, which
+# would also shrink shared by `wmax/(nbins+wmax)` -- re-associates the sum and is
+# NOT bit-exact.  That is a separate experiment, not something to smuggle in here.
 # ---------------------------------------------------------------------------
+
+"""
+    _bc_stage!(ps, profs, j0, n, nbins, wmax, tid, Val(B), Val(COAL)) -> Bool
+
+Stage this block's `B` profile columns into shared as the wrapped raw sequence,
+returning whether this thread's own column is live.  Callers must treat a
+`true` from `COAL` as "a `sync_threads()` has happened".
+"""
+@inline function _bc_stage!(ps, profs, j0::Int32, n::Int32, nbins::Int32,
+                            wmax::Int32, tid::Int32, ::Val{B},
+                            ::Val{COAL}) where {B,COAL}
+    S = Int32(COAL ? B + 1 : B)
+    live = (j0 + tid) <= n
+    @inbounds if COAL
+        # Coalesced: `b` outer walks columns (contiguous in `profs`), `i` inner is
+        # strided by `B` so the warp reads 32 consecutive floats per step.  No
+        # integer division -- computing `(i, b)` from a flat index would cost one
+        # `divrem` by a runtime `nbins` per element, which is not free on a GPU.
+        for b in Int32(0):(Int32(B) - Int32(1))
+            col = j0 + b + Int32(1)
+            goff = (col - Int32(1)) * nbins
+            hot = col <= n
+            i = tid
+            while i <= nbins
+                ps[i * S + b + Int32(1)] = hot ? profs[goff + i] : 0.0f0
+                i += Int32(B)
+            end
+        end
+        sync_threads()
+        # The wrap, copied within this thread's own column: shared-to-shared,
+        # stride 1 across threads, and it is what keeps the prefix bit-exact.
+        for i in Int32(1):wmax
+            ps[(nbins + i) * S + tid] = ps[i * S + tid]
+        end
+    else
+        for i in Int32(1):(nbins + wmax)
+            idx = i > nbins ? i - nbins : i
+            ps[i * S + tid] = live ? profs[idx, j0 + tid] : 0.0f0
+        end
+    end
+    return live
+end
+
+"""Shared-memory floats one boxcar block needs, for the launch's `shmem`."""
+@inline _bc_shmem(nbins, wmax, B, COAL) =
+    (Int(nbins) + Int(wmax) + 1) * (COAL ? Int(B) + 1 : Int(B))
+
 function _boxcar_kernel!(out, profs, n::Int32, nbins::Int32, wmax::Int32,
-                         widths, nw::Int32, invsigma::Float32, ::Val{B}) where {B}
+                         widths, nw::Int32, invsigma::Float32, ::Val{B},
+                         ::Val{COAL}) where {B,COAL}
     tid = threadIdx().x
-    j = (blockIdx().x - Int32(1)) * Int32(B) + tid          # trial
-    ps = CuDynamicSharedArray(Float32, (Int(nbins) + Int(wmax) + 1) * B)
-    live = j <= n
+    j0 = (blockIdx().x - Int32(1)) * Int32(B)
+    j = j0 + tid                                            # trial
+    S = Int32(COAL ? B + 1 : B)
+    ps = CuDynamicSharedArray(Float32, _bc_shmem(nbins, wmax, B, COAL))
+    live = _bc_stage!(ps, profs, j0, n, nbins, wmax, tid, Val(B), Val(COAL))
+    live || return nothing                                  # AFTER the stage's sync
     @inbounds begin
+        # In-place prefix: each slot is read before it is overwritten, so this is
+        # the same running accumulation, in the same order, as the pre-staging
+        # version -- hence bit-exact.
         ps[tid] = 0.0f0
         acc = 0.0f0
         for i in Int32(1):(nbins + wmax)
-            idx = i > nbins ? i - nbins : i                 # wrap: a boxcar may straddle phase 0
-            # `profs` is (nbins, Nprof), so profs[idx, j] for the block's B
-            # consecutive trials is a contiguous B-element run -- coalesced with no
-            # transpose.  This is the GPU form of the CPU's `_bc_transpose!`, and
-            # it costs nothing because the prefix sum needed shared memory anyway.
-            acc += live ? profs[idx, j] : 0.0f0
-            ps[i * B + tid] = acc
+            acc += ps[i * S + tid]
+            ps[i * S + tid] = acc
         end
-        live || return nothing
-        stot = ps[nbins * B + tid] - ps[tid]
+        stot = ps[nbins * S + tid] - ps[tid]
         best = -Inf32
         for wi in Int32(1):nw
             w = widths[wi]
             duty = Float32(w) / Float32(nbins)
             invsw = invsigma / sqrt(Float32(w) * (1.0f0 - duty))
-            m = ps[w * B + tid] - ps[tid]                   # finite seed, as on the CPU
+            m = ps[w * S + tid] - ps[tid]                   # finite seed, as on the CPU
             for p in Int32(2):nbins
-                o = (p - Int32(1)) * B + tid
-                d = ps[o + w * B] - ps[o]
+                o = (p - Int32(1)) * S + tid
+                d = ps[o + w * S] - ps[o]
                 m = ifelse(d > m, d, m)
             end
             c = (m - duty * stot) * invsw
@@ -668,26 +761,27 @@ end
 
 function _boxcar_fused_kernel!(out, profs, n::Int32, nbins::Int32, wmax::Int32,
                                widths, invsigma::Float32, ::Val{B},
-                               ::Val{NW}) where {B,NW}
+                               ::Val{NW}, ::Val{COAL}) where {B,NW,COAL}
     tid = threadIdx().x
-    j = (blockIdx().x - Int32(1)) * Int32(B) + tid
-    ps = CuDynamicSharedArray(Float32, (Int(nbins) + Int(wmax) + 1) * B)
-    live = j <= n
+    j0 = (blockIdx().x - Int32(1)) * Int32(B)
+    j = j0 + tid
+    S = Int32(COAL ? B + 1 : B)
+    ps = CuDynamicSharedArray(Float32, _bc_shmem(nbins, wmax, B, COAL))
+    live = _bc_stage!(ps, profs, j0, n, nbins, wmax, tid, Val(B), Val(COAL))
+    live || return nothing                                  # AFTER the stage's sync
     @inbounds begin
         ps[tid] = 0.0f0
         acc = 0.0f0
         for i in Int32(1):(nbins + wmax)
-            idx = i > nbins ? i - nbins : i
-            acc += live ? profs[idx, j] : 0.0f0
-            ps[i * B + tid] = acc
+            acc += ps[i * S + tid]
+            ps[i * S + tid] = acc
         end
-        live || return nothing
         # width offsets in shared-array units, hoisted out of the phase loop
-        ws = ntuple(i -> widths[i] * Int32(B), Val(NW))
-        stot = ps[nbins * B + tid] - ps[tid]
+        ws = ntuple(i -> widths[i] * S, Val(NW))
+        stot = ps[nbins * S + tid] - ps[tid]
         m = ntuple(i -> ps[ws[i] + tid] - ps[tid], Val(NW))   # finite seed, as on the CPU
         for p in Int32(2):nbins
-            o = (p - Int32(1)) * Int32(B) + tid
+            o = (p - Int32(1)) * S + tid
             m = _bc_upd(m, ps, o, ps[o], ws, Val(NW))
         end
         best = -Inf32
@@ -705,30 +799,33 @@ end
 
 const _GPU_BC_B = 32          # trials per block; see bench/gpu_boxcar_bench.jl
 const _GPU_BC_VARIANT = 3     # 1 = per-width scan, 2 = register sliding, 3 = width-fused
+const _GPU_BC_COALESCED = false  # measured 1.55x SLOWER on a GTX 1080; see above
 
 function gpu_boxcar!(out, profs::CuMatrix, n::Integer,
                      nbins::Integer, widths::CuVector{Int32}, wmax::Integer,
                      invsigma::Real; B::Integer = _GPU_BC_B,
-                     variant::Integer = _GPU_BC_VARIANT)
+                     variant::Integer = _GPU_BC_VARIANT,
+                     coalesced::Bool = _GPU_BC_COALESCED)
     if variant == 2
         @cuda threads = B blocks = cld(n, B) _boxcar_slide_kernel!(
             out, profs, Int32(n), Int32(nbins), widths,
             Int32(length(widths)), Float32(invsigma))
         return out
     end
-    shmem = (Int(nbins) + Int(wmax) + 1) * Int(B) * sizeof(Float32)
+    shmem = _bc_shmem(nbins, wmax, B, coalesced) * sizeof(Float32)
+    C = coalesced ? Val(true) : Val(false)
     if variant == 3
         nw = length(widths)
         nw <= 8 || return gpu_boxcar!(out, profs, n, nbins, widths, wmax, invsigma;
-                                      B = B, variant = 1)
+                                      B = B, variant = 1, coalesced = coalesced)
         _bcf_launch!(out, profs, n, nbins, wmax, widths, invsigma, shmem,
-                     Val(Int(B)), Val(nw))
+                     Val(Int(B)), Val(nw), C)
         return out
     end
-    B == 32 ? _bc_launch!(out, profs, n, nbins, wmax, widths, invsigma, shmem, Val(32)) :
-    B == 64 ? _bc_launch!(out, profs, n, nbins, wmax, widths, invsigma, shmem, Val(64)) :
-    B == 128 ? _bc_launch!(out, profs, n, nbins, wmax, widths, invsigma, shmem, Val(128)) :
-    B == 256 ? _bc_launch!(out, profs, n, nbins, wmax, widths, invsigma, shmem, Val(256)) :
+    B == 32 ? _bc_launch!(out, profs, n, nbins, wmax, widths, invsigma, shmem, Val(32), C) :
+    B == 64 ? _bc_launch!(out, profs, n, nbins, wmax, widths, invsigma, shmem, Val(64), C) :
+    B == 128 ? _bc_launch!(out, profs, n, nbins, wmax, widths, invsigma, shmem, Val(128), C) :
+    B == 256 ? _bc_launch!(out, profs, n, nbins, wmax, widths, invsigma, shmem, Val(256), C) :
     throw(ArgumentError("unsupported boxcar block size $B"))
     return out
 end
@@ -737,17 +834,17 @@ end
 # from it in the inner loop, and with a runtime `Int` they are not folded.  Same
 # trap `_BC_BATCH` and `DIRECT_GROUP_V` document on the CPU side.
 @inline function _bcf_launch!(out, profs, n, nbins, wmax, widths, invsigma, shmem,
-                              ::Val{B}, ::Val{NW}) where {B,NW}
+                              ::Val{B}, ::Val{NW}, ::Val{COAL}) where {B,NW,COAL}
     @cuda threads = B blocks = cld(n, B) shmem = shmem _boxcar_fused_kernel!(
         out, profs, Int32(n), Int32(nbins), Int32(wmax), widths,
-        Float32(invsigma), Val(B), Val(NW))
+        Float32(invsigma), Val(B), Val(NW), Val(COAL))
 end
 
 @inline function _bc_launch!(out, profs, n, nbins, wmax, widths, invsigma, shmem,
-                             ::Val{B}) where {B}
+                             ::Val{B}, ::Val{COAL}) where {B,COAL}
     @cuda threads = B blocks = cld(n, B) shmem = shmem _boxcar_kernel!(
         out, profs, Int32(n), Int32(nbins), Int32(wmax), widths,
-        Int32(length(widths)), Float32(invsigma), Val(B))
+        Int32(length(widths)), Float32(invsigma), Val(B), Val(COAL))
 end
 
 # --- stage-2 equivalence entry points --------------------------------------

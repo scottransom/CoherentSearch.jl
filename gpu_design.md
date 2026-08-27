@@ -3010,22 +3010,29 @@ roughly 7x of shared-bandwidth headroom. `bench/gpu_transpose_bench.jl` prints a
 **%copy** column precisely so this is checked rather than assumed: at ~100% the
 stage is still DRAM-bound and the speedup *is* the traffic ratio.
 
-**Measured on the GTX 1080** (`bench/gpu_transpose_bench.jl`, PM0063, min of 5,
-values verified equal to the per-rung kernel's on every row):
+**Measured on two cards** (`bench/gpu_transpose_bench.jl`, min of 5, values
+verified equal to the per-rung kernel's on every row):
 
-| `Nprof` | per-rung ns/trial | %copy | fused ns/trial | %copy | **speedup** |
-|---|---|---|---|---|---|
-| 65536 | 10.889 | 99% | 7.889 | 95% | **1.380x** |
-| 131072 | 10.944 | 98% | 7.703 | 98% | **1.421x** |
-| 262144 | 10.598 | 102% | 7.700 | 98% | **1.376x** |
+| card | `Nprof` | per-rung ns/trial | %copy | fused ns/trial | %copy | **speedup** |
+|---|---|---|---|---|---|---|
+| GTX 1080 (PM0063) | 65536 | 10.889 | 99% | 7.889 | 95% | **1.380x** |
+| | 131072 | 10.944 | 98% | 7.703 | 98% | **1.421x** |
+| | 262144 | 10.598 | 102% | 7.700 | 98% | **1.376x** |
+| RTX A4000 (NGC6624) | 65536 | 6.809 | 94% | 4.820 | 92% | **1.413x** |
+| | 131072 | 6.544 | 97% | 4.579 | 97% | **1.429x** |
+| | 262144 | 6.384 | 100% | 4.471 | 100% | **1.428x** |
 
-**Predicted 1.43x from the traffic ratio alone; measured 1.376-1.421x.** The
-%copy column is the reason to believe the prediction rather than the number:
-both kernels sit at 95-102% of the device copy, so the stage is still purely
-DRAM-bound and the bank conflicts cost ~2%, not the 1.6x the transaction count
-would suggest if shared memory were the limit. It also confirms the traffic
-model on a **third** card, an architecture (Pascal, 2 MB L2) with nothing in
-common with the two it was derived from.
+**Predicted 1.43x from the traffic ratio alone; measured 1.376-1.429x, and the
+A4000 lands on the prediction to 0.2%.** The %copy column is the reason to
+believe the prediction rather than the number: both kernels sit at 92-102% of
+each card's device copy, so the stage stays purely DRAM-bound and the even-`k`
+bank conflicts cost ~2%, not the 1.6x their transaction count would imply if
+shared memory were the limit.
+
+It also confirms the traffic model on a **third** architecture — Pascal, 2 MB of
+L2, nothing in common with the two it was derived from — and the A4000's
+per-rung 6.384 ns/trial at 262144 independently corroborates the **6.29** derived
+from that card's search-report shares at 1048576.
 
 Projected onto the two cards that matter, where it lands 1:1 on wall clock
 because both are now device-bound: **A4000 transpose 6.29 -> 4.49 ns/trial** and
@@ -3101,6 +3108,70 @@ report from each.
   "chunk-invariant" as byte-identity of the *file* rather than of the search: it
   is 1e-13 relative, and fixing it would mean computing `r` from the global trial
   index instead of the chunk offset.
+
+#### The boxcar's staging load is NOT coalesced, and coalescing it is 1.55x SLOWER
+
+This one is recorded at length because the *hypothesis* was well-founded, the
+*comment in the source was genuinely wrong*, and the fix still lost — which is
+a more useful combination than a win.
+
+**The comment was wrong.** `_boxcar_kernel!` carried: *"`profs` is
+`(Nprof, nbins)`, so `profs[trial, i]` for consecutive trials is contiguous: the
+load is coalesced with no transpose."* It was true when written and stopped being
+true at §4.2, when cuFFT was measured transforming dimension 1 1.75-1.88x faster
+than dimension 2 and the layout flipped to `(nbins, Nprof)`. In column-major that
+makes `profs[i, j]` — `j` the trial, consecutive threads holding consecutive `j` —
+a **stride-`nbins` gather**: 32 separate sectors per warp per phase bin, 4 wanted
+bytes in each. Nobody re-derived the rationale when the layout moved. That is the
+same failure as the stale `GPUChunk` comment above, in the other direction, and
+it is the second one this section found.
+
+**The fix works and costs 1.55x.** `_bc_stage!` reads the block's `B` columns as
+`B` contiguous runs and transposes them into shared, cutting L1 transactions
+~8x. GTX 1080, all six rungs, variant 3 at `B = 32`, every arm **bit-exact** to
+the others:
+
+| staging | shared row stride | stage (s) | |
+|---|---|---|---|
+| per-thread gather | `B` | **0.1297** | ships |
+| per-thread gather | `B+1` | 0.1363 | the padding alone, **1.05x** |
+| coalesced | `B+1` | 0.2003 | **1.55x slower** |
+
+The middle row is what makes this a decomposition rather than a null result: the
+odd shared stride that the transpose requires (the staging write walks the phase
+axis, where the scan walks the trial axis, so one of them conflicts unless the
+stride is odd) is a minor 1.05x, and **the load restructuring itself is 1.47x**.
+
+**Why.** The gather's re-requests were always L1 hits — a warp's 32 columns are
+15 kB, well inside L1 — so the transaction count was never what the phase paid
+for. What coalescing *adds* is the loop shape it forces: `nbins` is not a
+multiple of `B` at any rung (120 / 60 / 40 / 30 / 24 / 20 against 32), so one
+flat 126-iteration stream with good ILP becomes a 32-trip outer loop over columns
+around a 3-4 trip inner one, plus a `sync_threads()`. Computing `(i, b)` from a
+flat index instead would need a `divrem` by a runtime `nbins` per element, which
+is worse again.
+
+**This is positive evidence, not just a dead end.** §4.12 concluded from the
+A100's phase table that the boxcar is the one phase its memory system cannot
+help, and inferred issue-boundedness from the fact that it tracks `SMs x clock`
+and not bandwidth. An 8x cut in memory transactions changing nothing but the
+loop overhead is a direct test of that inference, and it passes. **Optimising the
+boxcar means removing WORK, not improving access** — which rules out the whole
+family of layout and access-pattern ideas and points at the width bank, the
+prefix sum's serial chain, and the gate threshold instead.
+
+The coalesced path stays in the build behind `Val{COAL}`, defaulted **off**: it
+costs nothing (Julia specialises it only if asked) and `bench/gpu_boxcar_bench.jl`
+now A/Bs the two **in one process**, so the verdict can be re-tested on a card
+with a larger L1 without a checkout whose precompile difference could masquerade
+as the effect. `test_gpu.jl` pins the two staging paths bit-exact to each other,
+in both boxcar variants, at three chunk lengths.
+
+**A caution for whoever revisits this.** The obvious next step — folding the wrap
+arithmetically (`ps[i] = stot + ps[i-nbins]`, which also shrinks shared by
+`wmax/(nbins+wmax)` and so raises occupancy) — re-associates the running sum and
+is **not** bit-exact. It may well be worth it, but it has to be scored against
+candidate churn near the threshold, not slipped in as a free win.
 
 #### What NOT to try on the transpose, checked before writing anything
 

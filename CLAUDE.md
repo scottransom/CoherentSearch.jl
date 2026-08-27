@@ -467,6 +467,18 @@ exposed 1.7% and 1.9%), so every device nanosecond is 1:1 on wall clock.**
 `cufftPlanMany`): at `istride = k` each element costs its own 32 B sector, so
 every rung re-reads the whole column and the traffic comes out no better — the
 device-memory saving is real, the speed saving is zero (§4.15).
+**And do NOT coalesce the boxcar's staging load — MEASURED 1.55x SLOWER
+(§4.15).** The comment claiming it was already coalesced *was* wrong (§4.2's
+layout flip made `profs[i, j]` a stride-`nbins` gather and nobody re-derived the
+rationale), but fixing it loses: the gather's re-requests were L1 hits all along
+— a warp's 32 columns are 15 kB — so cutting L1 transactions **8x** bought
+nothing, while the loop shape it forces costs 1.47x (`nbins` is not a multiple
+of `B` at any rung) and the odd shared stride another 1.05x. **Read this as
+positive evidence for §4.12's diagnosis**: the boxcar is issue-bound, so
+optimising it means removing WORK, not improving access — which rules out the
+whole family of layout and access-pattern ideas. The path stays behind
+`Val{COAL}`, defaulted off, and `bench/gpu_boxcar_bench.jl` A/Bs both in ONE
+process so a bigger-L1 card can re-test it.
 **`bin/parallel_search.py` fills a whole machine** — it PARTITIONS the file list
 across N invocations (one per GPU with `--gpu`, one per core otherwise) rather
 than running one process per file, because start-up and the cached device

@@ -108,6 +108,44 @@ else
     end
 
     # ------------------------------------------------------------------
+    # Coalesced boxcar staging (gpu_design.md 4.15).  Reading the tile through
+    # coalesced loads instead of a per-thread stride-`nbins` gather changes the
+    # ACCESS PATTERN and nothing else: the wrap is materialised in shared and the
+    # prefix reads each slot before overwriting it, so the running accumulation
+    # is the identical sequence of adds.  BIT-EXACT is therefore the right pin,
+    # and it is what would catch the tempting `ps[i] = stot + ps[i-nbins]`
+    # shortcut, which re-associates the sum and is not.
+    #
+    # Both boxcar variants are covered: variant 3 ships, variant 1 is the
+    # fallback whenever a rung has more than 8 widths, and they share the staging
+    # helper -- so a bug in it would reach production through either.
+    # ------------------------------------------------------------------
+    @testset "coalesced boxcar staging is bit-exact, k=$k" for k in 1:4
+        E = Base.get_extension(CoherentSearch, :CoherentSearchCUDAExt)
+        gc = E.GPUChunk(Float32, params, 1024)
+        plans = build_direct_plans(Float32, params, r_lo)
+        gp = E.GPUInterpPlan(plans)
+        d_amps = CUDA.CuArray(ft.amps)
+        i = findfirst(==(k), gc.ks)
+        for n in (1024, 999, 37)           # 999 and 37 leave a partial last block
+            E.gpu_fill_ftprofs!(gc.ftprofs, gp, d_amps, ft, 0, n)
+            E.fill_stacks!(gc, n)
+            E.transform!(gc, i)
+            res = map(((v, c),) -> begin
+                          o = CUDA.zeros(Float32, n)
+                          E.gpu_boxcar!(o, gc.profs[i], n, 2gc.Hk[i], gc.widths[i],
+                                        gc.hwidths[i][end], 0.7; variant = v,
+                                        coalesced = c)
+                          Array(o)
+                      end, ((1, false), (1, true), (3, false), (3, true)))
+            @test res[2] == res[1]                       # variant 1: coalesced == not
+            @test res[4] == res[3]                       # variant 3: coalesced == not
+            @test res[3] == res[1]                       # and the two variants agree
+            @test all(isfinite, res[4]) && any(!=(0.0f0), res[4])
+        end
+    end
+
+    # ------------------------------------------------------------------
     # The fused transpose (gpu_design.md 4.15).  Reading `ftprofs` once for all
     # six rungs instead of once per rung is a pure re-indexing -- no arithmetic
     # at all -- so the two kernels must agree BIT-EXACTLY, not within the 1e-5

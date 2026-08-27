@@ -10,6 +10,16 @@
 #   variant 2  no shared memory: per width, slide the window keeping the running
 #              sum in a register.  Re-reads the profile ~2*nwidths times, betting
 #              those are L1 hits and that occupancy is worth more.
+#   variant 3  as 1, with the subtracted prefix term hoisted out of the width
+#              loop.  This is what ships.
+#
+# Variants 1 and 3 are additionally run with and without the COALESCED staging
+# load (`gpu_design.md` 4.15).  Both are in one build precisely so the A/B is a
+# kwarg rather than a checkout -- this file's standing lesson about precompile
+# differences masquerading as effects.  The coalesced arm reads the block's B
+# columns as B contiguous runs and transposes into shared (row stride B+1, hence
+# the slightly larger shared figure); the other is the per-thread stride-nbins
+# gather that shipped until then, and the two are bit-exact to each other.
 #
 # Timings are summed over all six rungs and scaled to the reference workload, so
 # the numbers are directly comparable with bench/gpu_pipeline_bench.jl's boxcar
@@ -45,27 +55,33 @@ println("device : ", CUDA.name(CUDA.device()))
 println("Nprof  : ", Nprof, "   rungs: ", gc.ks)
 println("widths : ", [length(w) for w in gc.hwidths], "   wmax: ", [w[end] for w in gc.hwidths])
 println("\nboxcar over all six rungs, scaled to the reference workload:")
-println("  variant   B     stage (s)   shared/block")
+println("  variant  coal    B     stage (s)   shared/block")
 
-allrungs(B, v) = () -> for i in eachindex(gc.ks)
+allrungs(B, v, c) = () -> for i in eachindex(gc.ks)
     Ext.gpu_boxcar!(out, gc.profs[i], Nprof, 2gc.Hk[i], gc.widths[i],
-                    gc.hwidths[i][end], 1.0f0; B = B, variant = v)
+                    gc.hwidths[i][end], 1.0f0; B = B, variant = v, coalesced = c)
 end
+shbytes(B, v, c) = v == 2 ? 0 :
+    Ext._bc_shmem(2 * gc.Hk[1], gc.hwidths[1][end], B, c) * 4
 
 # correctness: every configuration must agree with the shipped one
 const REFVALS = Ref{Union{Nothing,Vector{Float32}}}(nothing)
-for (v, Bs) in ((1, (32, 64)), (2, (32, 64)), (3, (32, 64)))
-    for B in Bs
-        v != 2 && (Int(2 * gc.Hk[1]) + gc.hwidths[1][end] + 1) * B * 4 > 48000 && continue
-        f = allrungs(B, v)
+for (v, Bs, coals) in ((1, (32, 64), (false, true)),
+                       (2, (32, 64), (false,)),
+                       (3, (32, 64), (false, true)))
+    for B in Bs, c in coals
+        shbytes(B, v, c) > 48000 && continue
+        f = allrungs(B, v, c)
         f(); CUDA.synchronize()
         got = Array(out)
         REFVALS[] === nothing && (REFVALS[] = got)
         r = REFVALS[]
+        # Variants 1 and 3 and both staging paths are BIT-EXACT to each other, so
+        # anything but 0.0 here is a bug, not a tolerance.  (Variant 2 sums in a
+        # different order and is the one row allowed to differ.)
         agree = maximum(abs.(got .- r)) / maximum(abs, r)
         t = bestof(f)
-        sh = v == 2 ? 0 : (Int(2 * gc.Hk[1]) + gc.hwidths[1][end] + 1) * B * 4
-        @printf("     %d    %3d    %8.4f      %6d B   (agrees to %.1e)\n",
-                v, B, t * reps, sh, agree)
+        @printf("     %d     %-5s %3d    %8.4f      %6d B   (agrees to %.1e)\n",
+                v, c, B, t * reps, shbytes(B, v, c), agree)
     end
 end
