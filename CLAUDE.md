@@ -467,7 +467,10 @@ exposed 1.7% and 1.9%), so every device nanosecond is 1:1 on wall clock.**
 `cufftPlanMany`): at `istride = k` each element costs its own 32 B sector, so
 every rung re-reads the whole column and the traffic comes out no better — the
 device-memory saving is real, the speed saving is zero (§4.15).
-There is still no multi-GPU support *inside* one
+**`bin/parallel_search.py` fills a whole machine** — it PARTITIONS the file list
+across N invocations (one per GPU with `--gpu`, one per core otherwise) rather
+than running one process per file, because start-up and the cached device
+workspace are per-invocation. There is still no multi-GPU support *inside* one
 invocation.
 
 ## CPU performance work (the optimisation phase is CLOSED)

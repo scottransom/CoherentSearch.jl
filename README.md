@@ -160,6 +160,44 @@ for f in files
 end
 ```
 
+### Using a whole machine: `bin/parallel_search.py`
+
+One invocation uses **one CPU thread per chunk-parallel worker, and exactly one
+GPU**. To fill a many-core box or a multi-GPU node, run several independent
+invocations over disjoint slices of the file list — which is what this does:
+
+```sh
+# 6 GPUs, one job per card
+bin/parallel_search.py --gpu -j 6 NGC6624_*_red.fft -- --blocksize 262144
+
+# a whole CPU socket, one single-threaded process per core
+bin/parallel_search.py -j 20 --outdir cands *.fft -- --threshold 8
+
+# resume after an interruption
+bin/parallel_search.py --gpu -j 6 --skip-existing --outdir cands *.fft
+```
+
+Everything after `--` is passed to `bin/coherent_search.jl` unchanged. Add `-n`
+to print the commands without running them.
+
+It **partitions** the file list rather than running one process per file: the
+whole point of the section above is that start-up (and, on the GPU, the ~6 s
+CUDA load plus the cached device workspace and cuFFT plans) is paid once per
+*invocation*, so `parallel ::: *.fft` throws all of it away. Files are dealt to
+the least-loaded job by size, largest first, so a heterogeneous glob does not
+leave one job running long after the others finish; `--split block` keeps each
+job's slice contiguous instead.
+
+With `--gpu` each job gets its own device through `CUDA_VISIBLE_DEVICES`
+(`--gpus 0,2,3` to choose); there is no multi-GPU support *inside* a single
+invocation. On the CPU, `-t 1` and one job per core is the deployment model the
+performance work targets — see `Summary_and_Future_Work.md` §3.1.
+
+One sharp edge it handles for you: a job that happened to receive exactly one
+file would write its candidates to **stdout** per the table above. When that can
+happen and no `--outdir` was given, the launcher supplies one, so every input
+gets its `.cohout` regardless of how the list was split.
+
 ### Multi-frequency search by harmonic decimation
 
 `--maxdecim k` (default `6`; `1` disables it) additionally folds every trial
