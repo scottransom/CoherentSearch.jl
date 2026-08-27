@@ -621,11 +621,17 @@ wants **262144** and is nearly 2x slower at 8192. Cards with a small L2 cannot
 hold the working set at any chunk size, so only occupancy and launch
 amortisation are left and bigger always wins.
 
-Measured optima: RTX 4000 Ada 8192, RTX A4000 131072, RTX 2080 Super 262144,
-GTX 1080 262144, A100 262144, RTX A400 65536 or above (its sweep was capped by
-device memory). **If you are on an RTX 4000 SFF Ada, pass `--blocksize 8192`** —
-it is the one measured card the 65536 default costs anything worth having
-(1.22x).
+Measured optima: RTX 4000 Ada 8192, RTX 2080 Super 262144, GTX 1080 262144,
+RTX A400 65536 or above (its sweep was capped by device memory), and — re-run on
+quiet hosts with the sweep extended to 1048576 — **RTX A4000 1048576** and
+**A100 1048576**, both still gaining slightly at the top row.
+
+**If you are on an RTX 4000 SFF Ada, pass `--blocksize 8192`** (65536 costs it
+1.22x). On the two big cards the default costs 1.10x (A4000) and 1.19x (A100),
+and **262144 gets both to within 1.05x** while still fitting a 4 GB card — so if
+you do not want to sweep, `--blocksize 262144` is a better guess than the default
+on anything with 40+ SMs and enough memory (~1.1 GiB of workspace on top of your
+`.fft`).
 
 ### What the GPU path does and does not support
 

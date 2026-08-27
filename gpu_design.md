@@ -1883,6 +1883,13 @@ directly comparable to §4.8 and *not* its 8192 optimum.
 | RTX 4000 Ada | 48 | 74.9 | 40 MB | 239 | 16384 | 1.42 | 6.92 | 3.74 | 13.43 | 9.52 | 2.65 | 2.97 | **35.0** | **40.7** |
 | **A100 80GB** | 108 | 152.3 | 40 MB | 1683 | 262144 | **0.31** | **2.02** | **1.79** | **3.96** | **4.21** | 2.10 | 3.54 | **12.29** | **18.86** |
 
+**SUPERSEDED FOR TWO ROWS — see §4.15.** Both the A4000 and the A100 have since
+been re-run on quiet hosts with the §4.13 overlap: **32.2 and 11.6 ns/trial**,
+against the 51.9 and 18.86 here. The A4000 row in particular was taken on a
+104-core node at load 31-102 and §4.13 already retracted its `scan`; the whole
+row is an upper bound, not the card. The four other rows are still the best
+figures available for their cards but are all pre-overlap.
+
 Device-only shares:
 
 | card | zero | interp | transpose | transform | boxcar |
@@ -2786,6 +2793,333 @@ live allocations as available, and it returns `missing` on a device without a
 stream-ordered allocator. `reclaim`-then-measure is exact and needs no such
 assumption. `out` being double-buffered is also now in `need`.
 
+
+### 4.15 Two cards re-measured on quiet hosts, §0.46 closed, and the two saturated phases fixed
+
+Scott re-ran the A4000 on `bla0` (load 0.48) and the A100 on `gina8`, both on
+current master — i.e. with §4.13's overlap and §4.14's Nyquist fix — and ran
+`bench/gpu_interp_bench.jl` on the A4000, the A100 and the A400. Between them
+those four runs retire one recorded row, close one open question, score one
+prediction, and hand the next two optimisations a traffic model.
+
+#### The A4000's recorded row was contamination, and the real card is 1.6x better
+
+| | §4.12 (`usnea`, load 31–102) | **`bla0`, quiet** |
+|---|---|---|
+| best `--blocksize` | 131072 | **1048576** |
+| clean total | 5.476 s | **3.398 s** |
+| ns/trial | 51.9 | **32.2** |
+| vs fitzroy `-t 20` (11.82 s) | 2.16x | **3.48x** |
+| candidates | 135 | 135 |
+
+§4.13 retracted that report's `scan` column and bounded the card "at or below
+43.3 ns/trial". It is **32.2**, past even the corrected bound. The old sweep was
+also non-monotone with a 1.6x outlier at 32768; the clean one is monotone and
+flattening (9.561 / 5.520 / 4.741 / 4.402 / 4.059 / 3.754 / 3.576 / 3.477 /
+3.424 / 3.398 s from 2048 to 1048576). **Replace the A4000 row of §4.12's
+six-card table with this one; do not average them.**
+
+#### The A100 on current master: 11.6 ns/trial, and a prediction scored
+
+Run over 0.1–133.3 Hz (423.0M trials) rather than the reference band, which
+costs ≲0.5% per trial — crossings only begin at 108.9 Hz and only touch `interp`
+— so the columns are comparable:
+
+| | §4.12 (`gina4`) | **`gina8`, today** |
+|---|---|---|
+| at matched blocksize 262144 | 18.86 ns/trial | **12.19** — 1.547x |
+| best blocksize | 262144 (unbracketed) | **1048576** |
+| best ns/trial | 18.86 | **11.645** |
+| vs fitzroy `-t 20` (112.0 ns/trial) | 5.94x | **9.62x** |
+
+**Pre-registered before the run: 12.3–13 ns/trial and 8.5–9x. Measured 11.6 and
+9.6x — under-predicted by ~7%**, in the direction of the overlap doing better
+than its phase-table bound suggested.
+
+Decomposing the 1.547x at matched blocksize: the overlap's bound here is
+`1/(1 − 0.275) = 1.379x` and it achieves **1.353x**, i.e. **98.1% of what is
+available**. The residual 1.14x is not attributable — `gina4`'s load was never
+recorded and this is a different node — and should not be quoted as the
+overlap's value. Same caveat §4.13 put on the Ada's 1.28x.
+
+**§4.14's fix is verified in the configuration that exposed the bug.** 802
+candidates at *every* blocksize from 2048 to 1048576, where the pre-fix A100 run
+gave 802 / 804 / 805 / **810**. That was the one card and the one band that could
+falsify it.
+
+#### Both cards are now DEVICE-bound: the overlap has been run out
+
+| | device (instrumented) | clean total | host exposed |
+|---|---|---|---|
+| RTX A4000 | 3.3399 s | 3.398 s | **1.7%** |
+| A100 80GB | 4.8334 s | 4.926 s | **1.9%** |
+
+`download` + `scan` are 28.8% and 27.5% of the instrumented totals and are
+essentially entirely hidden. **Everything left converts 1:1 to wall clock, and
+all of it is device kernels.**
+
+#### The traffic model, and why it is trustworthy
+
+Per-phase ns/trial from each report's shares, against the bytes each phase must
+move. The probe's `gbs` counts read **and** write (`2*4n/t`), so these are
+directly comparable with its device-copy figure:
+
+| phase | bytes/trial | A4000 ns | A4000 achieved | A100 ns | A100 achieved |
+|---|---|---|---|---|---|
+| zero | 488 | 1.26 | **388 GB/s (102%)** | 0.266 | **1833 GB/s (109%)** |
+| interp | 488 | 4.50 | 108 GB/s (28%) | 1.764 | 277 GB/s (16%) |
+| transpose | 2448 | 6.29 | **389 GB/s (102%)** | 1.678 | **1459 GB/s (87%)** |
+| transform | 2400 | 12.49 | 192 GB/s (49%) | 3.916 | 613 GB/s (36%) |
+| boxcar | 1200 | 7.12 | 169 GB/s (43%) | 3.801 | 316 GB/s (19%) |
+
+(`zero` writes 61 columns; `transpose` reads 153 and writes 153;
+`transform` reads 153 rows and writes `sum(2Hk) = 294` floats; `boxcar` reads
+those 294.)
+
+**Two independent checks say the model is right rather than fitted.** `zero` and
+`transpose` are completely different kernels and land on the *same* number,
+102% of copy, on the A4000 — and the `transform` row reproduces §4.12's
+independently-measured "cuFFT runs at 43–50% of DRAM on every card" without
+being told it. A pure write exceeding a copy benchmark is expected, not an error.
+
+So the phases split into three kinds, and each wants a different kind of work:
+
+- **`zero` and `transpose` are DRAM-saturated.** No kernel tuning can help; the
+  only lever is moving fewer bytes. Both are fixed below.
+- **`transform` moves ~2x the minimum bytes.** That is cuFFT's, not ours — the
+  likely mechanism is a separate C2R fold pass. Worth a probe (time a C2C of
+  length `Hk` against the shipped C2R of `2Hk`) before anyone writes a kernel.
+- **`boxcar` and `interp` are issue/latency-bound**, at 16–43% of DRAM. §4.12
+  already established the boxcar tracks `SMs x clock`; this is the same finding
+  from the traffic side.
+
+**One recorded verdict needs softening.** §4.12's "optimise the boxcar, not the
+transform" was read off the A100 at 262144. At its true optimum the two are
+**tied** (transform 34.3% of device, boxcar 33.3%), and on the 4 MB-L2 A4000 the
+transform leads clearly (39.5% against 22.5%). The honest statement is *the
+boxcar and the transform are tied on the 40 MB cards and the transform leads on
+the small-L2 ones* — both are targets, and neither is the whole story on any card.
+
+#### §0.46 CLOSES: it is cores/SM, with L2 worth about 8%
+
+The A4000 was designed as a two-way discriminator against the Ada — same SMs
+(48), same clock (1.56 GHz), same cores/SM (128), **4 MB of L2 against 40 MB**.
+The two branches predicted 0.0992 ns (a tie: cores/SM, L2 irrelevant) or
+0.1248 ns (the `SMs x clock` line: L2 is the whole story).
+
+| card | SMs×clk | cores/SM | L2 | ns/(harm,trial) @65536 | per SM×clk |
+|---|---|---|---|---|---|
+| RTX A400 | 10.6 | 128 | 1 MB | 0.6425 | **0.147** |
+| GTX 1080 | 34.7 | 128 | 2 MB | 0.2695 | 0.107 |
+| RTX 2080 Super | 87.1 | 64 | 4 MB | 0.1112 | **0.103** |
+| **RTX A4000** | **74.9** | **128** | **4 MB** | **0.1075** | 0.124 |
+| RTX 4000 SFF Ada | 74.9 | 128 | 40 MB | 0.0992 | 0.135 |
+| A100 80GB | 152.3 | 64 | 40 MB | 0.0470 | 0.140 |
+
+**Measured 0.1075 — 8.4% above the Ada and 13.9% below the L2 line.**
+Explanation 1 wins: issue width per SM is what buys the interpolator, and 10x
+the L2 is worth ~8%, not the 26% the other branch required. That is consistent
+with §4.1's latency-bound diagnosis (lower load latency helps, a little).
+
+**A caveat that matters for how this table is read.** `Nprof = 65536`
+under-fills the large cards, so the fixed-`Nprof` column — the right *controlled*
+comparison — is the wrong *card* comparison. Going to 262144 the A100 gains
+1.36x (0.0470 → 0.0346) and the A4000 1.08x (0.1075 → 0.0999), while the A400
+gains 0.8% (0.6425 → 0.6372). The A400 corroborates §4.12's whole-search result
+from the small end: at 6 SMs it is the most efficient card per `SMs x clock` on
+interpolation too, 1.42x the 1080's.
+
+**The isolated bench predicts the in-search phase, which is worth recording
+given how many microbenchmarks in this project have inverted in situ.** A4000
+in-search `interp` 6.46 ns/trial ÷ 60 harmonics = **0.1077** against the bench's
+**0.1075** at the same order of `Nprof` (0.2%); A100 2.02/60 = **0.0337**
+against **0.0346** at 262144 (2.6%). `gpu_interp_bench.jl` is a valid card
+classifier, not just a kernel timing.
+
+#### The `--blocksize` default: 65536 is now costing 1.19x, and there is a better constant
+
+| card | 65536 costs | 262144 costs | measured optimum |
+|---|---|---|---|
+| RTX A4000 (quiet) | 1.10x | **1.02x** | 1048576 |
+| A100 80GB | **1.19x** | **1.05x** | 1048576 |
+| RTX 4000 SFF Ada | 1.22x | ~1.23x | 8192 |
+
+**Both re-measured cards want the top of the sweep and neither is bracketed**
+(the A100 still gains 1.01x from 524288 to 1048576). 1048576 cannot be the
+default — at the ~4.1 kB/trial of §4.13 that is 4.3 GiB of workspace, which the
+3.67 GiB A400 cannot hold at all. **262144 (1.07 GiB) can**, and it is within
+1.05x on both re-measured cards where 65536 is within 1.19x. Not changed here,
+because three of the six cards have not been re-swept post-overlap and the Ada
+is unaffected either way (it wants 8192 and needs an explicit flag regardless) —
+but it is the next default to propose, and the evidence for it is two cards
+rather than the one that set 65536.
+
+#### Zeroing only the inactive columns
+
+`fill!(gc.ftprofs, 0)` wrote all 61 columns every chunk at the card's full write
+bandwidth. Almost none of it was needed:
+
+- `_interp_kernel!` writes **every** trial `1:n` of every **active** harmonic —
+  its store is masked to `1 <= jcol <= n`, and since §4.14 `harmonic_fits` is
+  uniform over a chunk, so an active harmonic's column is fully overwritten.
+- Column 1 is DC. **Nothing in the extension ever writes it**, so it is zero from
+  `CUDA.zeros` in the `GPUChunk` constructor and stays zero for the life of the
+  cached workspace.
+- Columns past `n` are never read (the transpose guards `t <= n`, the boxcar
+  `j <= nvalid <= n`).
+
+What is left is the harmonics that gave up on *this* chunk — in the standard
+0.1–33.3 Hz band, **none**. `_active_harmonics` is now computed in `_region!`
+and passed to both `_zero_inactive!` and `gpu_fill_ftprofs!`, so it is derived
+once rather than twice.
+
+**Projected 4.0% of A4000 device time and 2.3% of the A100's**, both of which
+are 1:1 on wall clock now that the cards are device-bound.
+
+**The test asserts the premise, not the output.** A search producing the same
+candidates would pass even if the reasoning were wrong for a band nobody tried.
+So `test_gpu.jl` poisons a buffer with `-999-999i`, runs `_zero_inactive!` plus
+the fill, and requires the result to equal a fresh `CUDA.zeros` run — at two
+`r_lo`, one with every harmonic active and one (`r_lo = 1700` on the fixture,
+where harmonic 20 crosses Nyquist and 19 does not) with some inactive. It
+**asserts that split** rather than assuming it, exactly as §4.14's regression
+test does, because otherwise the second arm would go quietly vacuous.
+
+#### Fusing the six transpose passes into one
+
+The per-rung kernel read `ftprofs` once **per rung**: `sum(Hk+1) = 153` of its 61
+columns, 2.5x over, plus 153 rows written — 2448 B/trial, at 102% and 87% of the
+two cards' copy bandwidth. Reading each column **once** into a shared tile and
+writing every rung's rows from it moves `61 + 153 = 1712 B`, **1.43x less**, and
+collapses six kernel launches per chunk into one — which matters most at a small
+`--blocksize`, where there are tens of thousands of chunks (the Ada's optimum of
+8192 is 12,881 of them on the reference file).
+
+The tile is `(T+1) x (nharms+1)` = 16.1 kB at `T = 32`, which is exactly what the
+per-rung kernel already used for rung 1, so peak shared memory is unchanged and
+occupancy stays thread-limited rather than shared-limited on both GA10x and GA100.
+
+**The `+1` row padding is load-bearing and only half works here, which is worth
+stating because it is the one place the fusion is not free.** A 64-bit shared
+access is conflict-free when the element stride is odd. The per-rung write reads
+with stride `T+1 = 33`; the fused write reads rung `k`'s row `rr` from tile
+column `(rr-1)*k + 1`, i.e. stride `33k`, odd only for odd `k`. So `k = 2, 4, 6`
+take 2-, 4- and 2-way conflicts on their 31, 16 and 11 rows — about 1.6x the
+shared transactions on the write phase, spent on a kernel limited by DRAM with
+roughly 7x of shared-bandwidth headroom. `bench/gpu_transpose_bench.jl` prints a
+**%copy** column precisely so this is checked rather than assumed: at ~100% the
+stage is still DRAM-bound and the speedup *is* the traffic ratio.
+
+**Measured on the GTX 1080** (`bench/gpu_transpose_bench.jl`, PM0063, min of 5,
+values verified equal to the per-rung kernel's on every row):
+
+| `Nprof` | per-rung ns/trial | %copy | fused ns/trial | %copy | **speedup** |
+|---|---|---|---|---|---|
+| 65536 | 10.889 | 99% | 7.889 | 95% | **1.380x** |
+| 131072 | 10.944 | 98% | 7.703 | 98% | **1.421x** |
+| 262144 | 10.598 | 102% | 7.700 | 98% | **1.376x** |
+
+**Predicted 1.43x from the traffic ratio alone; measured 1.376-1.421x.** The
+%copy column is the reason to believe the prediction rather than the number:
+both kernels sit at 95-102% of the device copy, so the stage is still purely
+DRAM-bound and the bank conflicts cost ~2%, not the 1.6x the transaction count
+would suggest if shared memory were the limit. It also confirms the traffic
+model on a **third** card, an architecture (Pascal, 2 MB L2) with nothing in
+common with the two it was derived from.
+
+Projected onto the two cards that matter, where it lands 1:1 on wall clock
+because both are now device-bound: **A4000 transpose 6.29 -> 4.49 ns/trial** and
+**A100 1.678 -> 1.199**. With the zeroing above, the pair is **~1.11x end to end
+on the A4000 and ~1.07x on the A100** -- to be scored on the next report from
+each, not claimed here.
+
+**Pinned bit-exactly, not to a tolerance.** Both kernels only copy — there is no
+arithmetic anywhere in either — so anything short of equality is an indexing bug,
+and the index map is the thing most likely to be off by one. `test_gpu.jl` runs
+the per-rung kernel, poisons every destination, runs the fused one, and requires
+equality on all six rungs at `n = 1024, 999, 37`.
+
+**A Julia trap, recorded because it produced a confusing failure.** The
+rung loop is unrolled by recursing on `Base.tail`, and the base case was first
+written with its trailing arguments untyped:
+
+```julia
+@inline _tr_write!(::Tuple{}, ::Tuple{}, ::Tuple{}, tile, t0, n, tx, ty, ::Val) = nothing
+```
+
+against a recursive method taking `t0::Int32, n::Int32, tx::Int32, ty::Int32`.
+At the empty tuple the two are **ambiguous** — one is more specific in arguments
+1–3, the other in 5–9 — and the kernel fails to compile with
+`unsupported call to an unknown function (call to jl_f_throw_methoderror)`,
+which reads like a GPU limitation and is ordinary Julia dispatch. Both methods
+now carry identical types beyond the tuples.
+
+#### End to end, measured: 1.07x on the GTX 1080 — and that is the FLOOR
+
+Warm in-process A/B against a worktree at `925fcd5`, PM0063 at the reference
+band, min of 3 per invocation, three interleaved rounds, **7 candidates in every
+arm**:
+
+| blocksize | base (3 rounds) | new (3 rounds) | **speedup** |
+|---|---|---|---|
+| 65536 | 0.6564 / 0.6536 / 0.6507 | 0.6124 / 0.6062 / 0.6107 | **1.070x** |
+| 262144 | 0.6315 / 0.6331 / 0.6911 | 0.5908 / 0.5938 / 0.6393 | **1.066x** |
+
+Round-to-round scatter is under 1% except round 3 at 262144, where *both* arms
+rise together and the ratio holds (1.081x) — which is what a real effect looks
+like against host interference.
+
+**Predicted ~1.07x for this card from its §4.12 phase shares** (zero 2.68 +
+transpose 13.82 of 107.1 ns/trial, the transpose cut by the measured 1.40x).
+Measured 1.066-1.070x.
+
+**The 1080 is the FLOOR, not the headline.** `zero + transpose` is 15.4% of its
+total against 18.6% on the A4000 and 16.9% on the A100 — and, more importantly,
+those two cards are now device-bound where the 1080 still has 14% of host
+exposed, so the same device saving is worth more there. The A4000 and A100
+projections above (~1.11x, ~1.07x) stand as predictions to be scored on the next
+report from each.
+
+#### Correctness for both changes
+
+- **755/755** CPU tests (`src/` is untouched) and **252/252** GPU tests on the
+  GTX 1080, up from 230 -- 18 new asserts for the fused transpose and 4 for the
+  zeroing.
+- **`.cohout` byte-identical to HEAD** in four configurations: PM0063 over
+  0.1-33.3 Hz (no Nyquist crossing) and over **30-40 Hz** (harmonic 60 crosses
+  at 2000/60 = 33.333 Hz, so eleven cross inside the band and the
+  inactive-harmonic path of `_zero_inactive!` is actually exercised), each at
+  blocksize 8192 and 65536.
+- **One pre-existing wrinkle found while doing this, and it is NOT from these
+  changes.** In the no-crossing band the 8192 and 65536 candidate files differ by
+  **one ulp in the printed Fourier bin** of a single candidate
+  (3841.827588148316 vs ...17) -- identically in both arms, so it predates them.
+  The cause is host-side: `rf = k * (rstart + (j-1)*lodr)` with
+  `rstart = r_lo + i0*lodr`, so a trial reached through different chunk
+  boundaries accumulates its `r` differently in the last bit. S/N, `nharm` and
+  frequency to 12 decimals are unaffected. Worth knowing before anyone quotes
+  "chunk-invariant" as byte-identity of the *file* rather than of the search: it
+  is 1e-13 relative, and fixing it would mean computing `r` from the global trial
+  index instead of the chunk offset.
+
+#### What NOT to try on the transpose, checked before writing anything
+
+**Giving cuFFT strided rung inputs** — the CPU's `DecimBuf` trick (worth
+1.36–1.60x there, 2026-08-16), expressed through `cufftPlanMany`'s
+`istride`/`idist` rather than the high-level plan that refuses a strided view.
+It would delete five of the six stack buffers, 736 B/trial of device memory. **It
+does not save any traffic and should not be built.** At `istride = k` the reads
+land ≥32 B apart for `k >= 4`, so every element costs its own sector: each rung
+re-reads essentially the whole 488 B column, six rungs read ~2880 B, against the
+2936 B that the current transpose-plus-transform pair already moves. The
+capacity saving is real; the speed saving is zero.
+
+**Having the interpolator write the rung stacks directly**, which the comment
+above `GPUChunk` proposes as "the answer to (2)". The stacks are in cuFFT's
+`(Hk+1, Nprof)` layout, so a store indexed by trial is the same 32-way scatter
+that §4.2 measured at **2.54–2.65x** on the interp kernel; writing them
+transposed instead would need the transpose back. The comment predates the
+transpose kernel and is stale.
 
 ---
 

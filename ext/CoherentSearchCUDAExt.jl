@@ -245,6 +245,36 @@ function _active_harmonics(gp::GPUInterpPlan, ft::FFTFile, t0::Integer, n::Integ
     return act
 end
 
+# ---------------------------------------------------------------------------
+# Zero only what the interpolator will NOT overwrite.
+#
+# `fill!(ftprofs, 0)` wrote all `nharms+1` columns every chunk, and measured
+# **4.0% of device time on an RTX A4000 and 2.3% on an A100** at 388 and
+# 1833 GB/s respectively -- i.e. it ran at the card's full DRAM write bandwidth,
+# so the only way to make it cheaper is to move fewer bytes (gpu_design.md
+# §4.15).  Almost all of it was redundant:
+#
+#  - `_interp_kernel!` writes EVERY trial `1:n` of every ACTIVE harmonic's
+#    column (the store is masked to `1 <= jcol <= n`, and `harmonic_fits` is now
+#    uniform over a chunk thanks to §4.14's forced splits), so those columns need
+#    no pre-zeroing.
+#  - Column 1 is the DC row.  Nothing in this file ever writes it, so it is zero
+#    from `CUDA.zeros` in the `GPUChunk` constructor and stays that way for the
+#    life of the cached workspace.
+#  - Columns beyond `n` are never read: the transpose kernel guards `t <= n` and
+#    the boxcar guards `j <= nvalid <= n`.
+#
+# What is left is the columns of harmonics that gave up on THIS chunk and may
+# hold the previous chunk's values -- in the standard 0.1-33.3 Hz band, none.
+# ---------------------------------------------------------------------------
+function _zero_inactive!(ftp::CuMatrix, act::Vector{Bool}, n::Integer)
+    z = zero(eltype(ftp))
+    @inbounds for h in eachindex(act)
+        act[h] || fill!(view(ftp, 1:Int(n), h + 1), z)
+    end
+    return ftp
+end
+
 """
     gpu_fill_ftprofs!(ftp, gp, amps, namps, N, t0, n; groups_per_block=8)
 
@@ -253,9 +283,14 @@ trials starting at global trial `t0`.  Returns the host `filled` flags.
 """
 function gpu_fill_ftprofs!(ftp::CuMatrix, gp::GPUInterpPlan, amps::CuVector,
                            ft::FFTFile, t0::Integer, n::Integer;
-                           groups_per_block::Int = 8, transposed::Bool = true)
+                           groups_per_block::Int = 8, transposed::Bool = true,
+                           act::Union{Nothing,Vector{Bool}} = nothing)
     V = DIRECT_GROUP_V
-    act = _active_harmonics(gp, ft, t0, n)
+    # `act` is a pure function of `(gp, ft, t0, n)`, and `_region!` needs it
+    # BEFORE this call in order to zero only the columns this one will not
+    # write, so it computes it once and passes it in.  Recomputed here when a
+    # caller (the stage-1 entry points, the benches) does not.
+    act = act === nothing ? _active_harmonics(gp, ft, t0, n) : act
     any(act) || return act
     tfirst = fld(t0, V) * V
     tlast = fld(t0 + n - 1, V) * V + V - 1
@@ -776,11 +811,98 @@ end
 # on the reference workload -- a gather doing exactly what the CPU deleted in
 # 2026-08-16 for the same reason.
 # ---------------------------------------------------------------------------
+# **FUSED ACROSS RUNGS (gpu_design.md §4.15).**  The per-rung kernel below reads
+# `ftprofs` once PER RUNG, so a six-rung ladder reads `sum(Hk+1) = 153` of its 61
+# columns -- 2.5x over -- and writes 153 rows: **2448 B per trial.**  Measured, it
+# ran at **389 GB/s on an RTX A4000 (102% of that card's device copy) and
+# 1459 GB/s on an A100 (87%)**, i.e. the kernel is DRAM-saturated and the only
+# lever is moving fewer bytes.  Reading each column ONCE into a shared tile and
+# writing every rung's rows from it moves `61 + 153 = 1712 B` per trial, **1.43x
+# less**, and it also collapses six kernel launches per chunk into one -- which
+# matters most at a small `--blocksize`, where there are tens of thousands of
+# chunks (the Ada's optimum is 8192, i.e. 12881 chunks on the reference file).
+#
+# The tile is `(T+1) x (nharms+1)`, 16.1 kB at `T = 32, nharms = 60` -- the SAME
+# size the per-rung kernel already used for rung 1, so peak shared use is
+# unchanged and occupancy stays thread-limited rather than shared-limited.
+#
+# **The `+1` row padding is load-bearing and only half works here.**  A 64-bit
+# shared access is conflict-free when the element stride is odd; the per-rung
+# write reads with stride `T+1 = 33` and is clean.  The fused write reads rung
+# `k`'s row `rr` from tile column `(rr-1)*k + 1`, i.e. stride `33k`, which is odd
+# only for odd `k` -- so `k = 2, 4, 6` take a 2-, 4- and 2-way conflict on their
+# 31, 16 and 11 rows.  That is ~1.6x the shared transactions on the write phase,
+# spent on a kernel with ~7x of shared-bandwidth headroom over the DRAM traffic
+# it is actually limited by.  Measured rather than argued -- see §4.15.
 const _GPU_TR_T = 32          # trials per tile
 
+# Unrolled over the rungs: a runtime index into the `dsts` tuple would spill it
+# to local memory.  Same trap `_bc_upd`'s `NTuple` and `DIRECT_GROUP_V` document.
+@inline function _tr_write_one!(dst, k::Int32, nr::Int32, tile, t0::Int32,
+                                n::Int32, tx::Int32, ty::Int32, ::Val{T}) where {T}
+    @inbounds begin
+        stride = k * (Int32(T) + Int32(1))
+        c = ty
+        while c <= Int32(T)
+            t = t0 + c
+            # write: consecutive threadIdx().x are consecutive ROWS -> coalesced
+            if t <= n && tx <= nr
+                dst[tx, t] = tile[(tx - Int32(1)) * stride + c]
+            end
+            c += blockDim().y
+        end
+    end
+    return nothing
+end
+
+# Both methods must carry the SAME argument types beyond the tuples: with the
+# trailing arguments left untyped on the base case, the two are AMBIGUOUS at the
+# empty tuple (one more specific in args 1-3, the other in args 5-9) and the
+# kernel fails to compile with a `jl_f_throw_methoderror` in the IR.
+@inline _tr_write!(::Tuple{}, ::Tuple{}, ::Tuple{}, tile,
+                   t0::Int32, n::Int32, tx::Int32, ty::Int32,
+                   ::Val{T}) where {T} = nothing
+@inline function _tr_write!(dsts::Tuple, ks::Tuple, nrows::Tuple, tile,
+                            t0::Int32, n::Int32, tx::Int32, ty::Int32,
+                            ::Val{T}) where {T}
+    _tr_write_one!(dsts[1], ks[1], nrows[1], tile, t0, n, tx, ty, Val(T))
+    _tr_write!(Base.tail(dsts), Base.tail(ks), Base.tail(nrows),
+               tile, t0, n, tx, ty, Val(T))
+end
+
+function _transpose_fused_kernel!(dsts::Tuple, src, n::Int32, nharm1::Int32,
+                                  ks::Tuple, nrows::Tuple, ::Val{T}) where {T}
+    tile = CuDynamicSharedArray(eltype(src), (T + 1) * Int(nharm1))
+    t0 = (blockIdx().x - Int32(1)) * Int32(T)
+    tx = threadIdx().x
+    ty = threadIdx().y
+    @inbounds begin
+        # The block is sized `max(T, nharms+1)` in x because the two phases use x
+        # for DIFFERENT axes -- the trial when reading, the row when writing -- so
+        # each must guard against the other's bound.  Getting this wrong is an
+        # out-of-bounds SHARED write, not a wrong answer.
+        if tx <= Int32(T)
+            # read: consecutive threadIdx().x are consecutive TRIALS -> coalesced,
+            # and each column of `ftprofs` is read exactly ONCE for all six rungs.
+            r = ty
+            while r <= nharm1
+                t = t0 + tx
+                v = t <= n ? src[t, r] : zero(eltype(src))
+                tile[(r - Int32(1)) * (T + 1) + tx] = v
+                r += blockDim().y
+            end
+        end
+        sync_threads()
+        _tr_write!(dsts, ks, nrows, tile, t0, n, tx, ty, Val(T))
+    end
+    return nothing
+end
+
+# Kept for `bench/gpu_transpose_bench.jl`'s baseline column and because it is the
+# reference the fused kernel is pinned against.  Not used in the pipeline.
 function _transpose_stack_kernel!(dst, src, n::Int32, nrow::Int32, k::Int32,
                                   ::Val{T}) where {T}
-    tile = CuDynamicSharedArray(ComplexF32, (T + 1) * Int(nrow))
+    tile = CuDynamicSharedArray(eltype(src), (T + 1) * Int(nrow))
     t0 = (blockIdx().x - Int32(1)) * Int32(T)
     tx = threadIdx().x
     ty = threadIdx().y
@@ -814,18 +936,43 @@ function _transpose_stack_kernel!(dst, src, n::Int32, nrow::Int32, k::Int32,
 end
 
 """
-    fill_stacks!(gc, n)
+    fill_stacks!(gc, n; fused = true)
 
 Fill every rung's dense stack (and rung 1's, which is the plain transpose) from
 the transposed `ftprofs`, for `n` trials.
+
+`fused = false` selects the per-rung kernel this replaced, which
+`bench/gpu_transpose_bench.jl` times as the baseline and `test_gpu.jl` pins the
+fused one against **bit-exactly** -- both kernels copy the same values with no
+arithmetic, so anything short of equality is an indexing bug.
 """
-function fill_stacks!(gc::GPUChunk, n::Integer)
+fill_stacks!(gc::GPUChunk, n::Integer; fused::Bool = true) =
+    fused ? _fill_stacks_fused!(gc, n, Val(length(gc.ks))) : _fill_stacks_perrung!(gc, n)
+
+# `Val(length(gc.ks))` costs one dynamic dispatch per chunk (~100 ns) and buys a
+# compile-time-unrolled rung loop; against it, the fusion removes five of the six
+# kernel launches per chunk (~6 us each), so it pays for itself many times over
+# even at the smallest blocksize anyone runs.
+@noinline function _fill_stacks_fused!(gc::GPUChunk, n::Integer,
+                                       ::Val{NK}) where {NK}
+    T = _GPU_TR_T
+    nh1 = size(gc.ftprofs, 2)
+    dsts  = ntuple(i -> gc.cpulayout[i], Val(NK))
+    ks    = ntuple(i -> Int32(gc.ks[i]), Val(NK))
+    nrows = ntuple(i -> Int32(gc.Hk[i] + 1), Val(NK))
+    shmem = (T + 1) * nh1 * sizeof(eltype(gc.ftprofs))
+    @cuda threads = (max(T, nh1), 8) blocks = cld(n, T) shmem = shmem _transpose_fused_kernel!(
+        dsts, gc.ftprofs, Int32(n), Int32(nh1), ks, nrows, Val(T))
+    return gc
+end
+
+function _fill_stacks_perrung!(gc::GPUChunk, n::Integer)
     T = _GPU_TR_T
     for i in eachindex(gc.ks)
         k = gc.ks[i]
         dst = gc.cpulayout[i]
         nrow = gc.Hk[i] + 1
-        shmem = (T + 1) * nrow * sizeof(ComplexF32)
+        shmem = (T + 1) * nrow * sizeof(eltype(gc.ftprofs))
         @cuda threads = (max(T, nrow), 8) blocks = cld(n, T) shmem = shmem _transpose_stack_kernel!(
             dst, gc.ftprofs, Int32(n), Int32(nrow), Int32(k), Val(T))
     end
@@ -1169,11 +1316,15 @@ function _region!(::CUDABackend, ft::FFTFile, params::SearchParams,
         i0 = cstarts[c]
         n = (c < nchunks ? cstarts[c + 1] : Int(total)) - i0
         rstart = r_lo + i0 * lodr
-        # Zeroed every chunk: the interpolator writes only the harmonics that
-        # carry data, and a harmonic that gives up must leave a ZERO row -- which
-        # is also what the DC row (never written) has to be.
-        _gpt(() -> fill!(gc.ftprofs, 0), 1)
-        filled = _gpt(() -> gpu_fill_ftprofs!(gc.ftprofs, gp, d_amps, ft, i0, n), 2)
+        # Only the columns the interpolator will NOT write need zeroing -- the
+        # harmonics that give up on this chunk.  See `_zero_inactive!`; the DC
+        # column is zero from construction and no harmonic that is active here
+        # can leave a stale value behind.  `act` is computed once and handed to
+        # the fill so it is not derived twice.
+        act = _active_harmonics(gp, ft, i0, n)
+        _gpt(() -> _zero_inactive!(gc.ftprofs, act, n), 1)
+        filled = _gpt(() -> gpu_fill_ftprofs!(gc.ftprofs, gp, d_amps, ft, i0, n;
+                                              act = act), 2)
         _gpt(() -> fill_stacks!(gc, n), 3)
         _gpt(4) do
             for i in eachindex(gc.ks)

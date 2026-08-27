@@ -108,6 +108,68 @@ else
     end
 
     # ------------------------------------------------------------------
+    # The fused transpose (gpu_design.md 4.15).  Reading `ftprofs` once for all
+    # six rungs instead of once per rung is a pure re-indexing -- no arithmetic
+    # at all -- so the two kernels must agree BIT-EXACTLY, not within the 1e-5
+    # this file uses elsewhere.  Anything less is an indexing bug, and the index
+    # map (rung `k`'s row `rr` <- harmonic column `(rr-1)*k + 1`) is exactly the
+    # thing most likely to be got wrong by one.
+    # ------------------------------------------------------------------
+    @testset "fused transpose is bit-exact vs per-rung" begin
+        E = Base.get_extension(CoherentSearch, :CoherentSearchCUDAExt)
+        for n in (1024, 999, 37)               # 999 and 37 leave a ragged tile
+            gc = E.GPUChunk(Float32, params, max(n, 1024))
+            plans = build_direct_plans(Float32, params, r_lo)
+            gp = E.GPUInterpPlan(plans)
+            d_amps = CUDA.CuArray(ft.amps)
+            E.gpu_fill_ftprofs!(gc.ftprofs, gp, d_amps, ft, 0, n)
+            E.fill_stacks!(gc, n; fused = false)
+            ref = [Array(x)[:, 1:n] for x in gc.cpulayout]
+            for x in gc.cpulayout                # poison, so a missed row shows
+                fill!(x, Complex{Float32}(-999, 999))
+            end
+            E.fill_stacks!(gc, n; fused = true)
+            for i in eachindex(gc.ks)
+                @test Array(gc.cpulayout[i])[:, 1:n] == ref[i]
+            end
+        end
+    end
+
+    # ------------------------------------------------------------------
+    # Zeroing only the inactive columns (gpu_design.md 4.15) rests on a PREMISE:
+    # that `_interp_kernel!` writes every trial `1:n` of every active harmonic,
+    # so those columns need no pre-zeroing and only the ones that gave up (plus
+    # the never-written DC column) do.  If that ever stops holding, the search
+    # would silently reuse the previous chunk's values -- so the premise is what
+    # is tested here, against a deliberately poisoned buffer, rather than just
+    # the output of one search.
+    #
+    # `r_lo = 1700` is chosen so that harmonic 20 runs past this fixture's
+    # Nyquist and harmonic 19 does not; the testset ASSERTS that split rather
+    # than assuming it, because with every harmonic active it would be testing
+    # only half of what it claims to.
+    # ------------------------------------------------------------------
+    @testset "zeroing only inactive columns, r_lo=$rl" for rl in (r_lo, 1700.0)
+        E = Base.get_extension(CoherentSearch, :CoherentSearchCUDAExt)
+        plans = build_direct_plans(Float32, params, rl)
+        gp = E.GPUInterpPlan(plans)
+        d_amps = CUDA.CuArray(ft.amps)
+        n = 1024
+        act = E._active_harmonics(gp, ft, 0, n)
+        rl == 1700.0 && @test !all(act) && any(act)     # the premise of this arm
+        rl == r_lo   && @test all(act)
+
+        clean = CUDA.zeros(Complex{Float32}, n, params.nharms + 1)
+        E.gpu_fill_ftprofs!(clean, gp, d_amps, ft, 0, n; act = act)
+
+        dirty = CUDA.fill(Complex{Float32}(-999, 999), n, params.nharms + 1)
+        fill!(view(dirty, :, 1), zero(Complex{Float32}))   # DC: zeroed at construction
+        E._zero_inactive!(dirty, act, n)
+        E.gpu_fill_ftprofs!(dirty, gp, d_amps, ft, 0, n; act = act)
+        @test Array(dirty) == Array(clean)
+    end
+
+    # ------------------------------------------------------------------
     # Transform sub-batching (gpu_design.md 4.9).  Splitting a rung's batched
     # transform into column blocks is a SCHEDULING change: every column's
     # transform is independent, so the profiles must come back bit-identical,

@@ -366,9 +366,13 @@ downloads nothing and `src/search.jl` is untouched. **`gpu_design.md` is the
 running log — read it before touching any of this**; it keeps the wrong turns in
 on purpose. **Six cards are now measured, 6 to 108 SMs, all reporting
 byte-identical candidates** (§4.8, §4.12). On the 105M-trial NGC6624 file, against
-fitzroy's 20-core Xeon (11.82 s): **A100-SXM4-80GB 5.94x**, RTX 4000 SFF Ada
-2.96x, RTX 2080 Super 2.65x, RTX A4000 2.16x, GTX 1080 1.24x, **RTX A400 0.66x —
-the first card measured that LOSES to the CPU.**
+fitzroy's 20-core Xeon (11.82 s): **A100-SXM4-80GB 9.62x**, RTX 4000 SFF Ada
+3.79x, **RTX A4000 3.48x**, RTX 2080 Super 2.65x, GTX 1080 1.24x, **RTX A400
+0.66x — the first card measured that LOSES to the CPU.** **The A100 and A4000
+figures are 2026-08-27 re-runs on QUIET hosts with the overlap (§4.15); the
+5.94x and 2.16x that stood here before were 18.86 and 51.9 ns/trial against
+today's 11.6 and 32.2, and the A4000's old row was taken on a 104-core node at
+load 31–102. The other four rows are all pre-overlap and are lower bounds.**
 **Two headline verdicts have been retired by the A100 (§4.12) — do not quote
 them:** (a) *"above ~48 SMs the workload does not care what you buy"* was three
 cards that all had 48 SMs; at fixed SM count that still holds (the three 48-SM
@@ -379,7 +383,11 @@ both extremes by ~40%** (the 6-SM A400 is 1.9x better per SM, the 108-SM A100
 L2 cards the **boxcar** now leads (A100 34.3% device against the transform's
 32.2%), and the boxcar is the one phase that tracks `SMs x clock` and not
 bandwidth (A100 gains 4.20x against a 4.39x SM line while having **7.10x** the
-DRAM). **Optimise the boxcar, not the transform.** `--blocksize` is a per-device
+DRAM). **SOFTENED by §4.15**: read at the A100's *true* optimum (1048576, not
+262144) the two are tied — transform 34.3% of device against boxcar 33.3% — and
+on the 4 MB-L2 A4000 the transform leads clearly (39.5% vs 22.5%). **The boxcar
+and the transform are tied on the 40 MB cards and the transform leads on the
+small-L2 ones; both are targets.** `--blocksize` is a per-device
 parameter worth 1.2-5.6x and the cards want opposite ends of the range. Per-rung
 transform sub-batching (§4.9) was tried for the transform. **It is SCORED and it
 is 1.000x on all three cards** (§4.10): the mechanism works (1.166x at blocksize
@@ -439,6 +447,28 @@ stay comparable; read the clean total for the win. `_ChunkIO` is cached across
 files because `CUDA.pin` is a driver call, not a `malloc`. `bench/gpu_probe_setup.sh` classifies a new host in
 one command. **fitzroy's GPU drives Scott's desktop — prefer another host for
 anything large.**
+**Two device phases were at 100% of DRAM bandwidth and are now cheaper (§4.15,
+2026-08-27), `.cohout` byte-identical in four bands including one with eleven
+Nyquist crossings.** (a) `fill!(ftprofs, 0)` wrote all 61 columns per chunk;
+only the harmonics that *gave up* on that chunk need it (the interpolator
+overwrites every trial of every active one, and DC is never written), which in
+the standard band is **none** — worth ~4% of A4000 device time. (b) The
+transpose read `ftprofs` once per rung, 153 of its 61 columns; one fused kernel
+reads each column once into a shared tile and writes all six rungs from it —
+2448 → 1712 B/trial, **measured 1.376–1.421x on the GTX 1080 against a 1.43x
+traffic prediction, with %copy still 95–98%.** Together, **measured 1.070x /
+1.066x end to end on the GTX 1080** (warm A/B, 3 interleaved rounds, 7
+candidates in every arm) against a ~1.07x prediction from that card's phase
+shares — and the 1080 is the FLOOR, since it has the smallest `zero + transpose`
+share and still has 14% of host exposed. Projected ~1.11x on the A4000 and
+~1.07x on the A100, to be scored on the next report from each; **both cards are now DEVICE-bound (host
+exposed 1.7% and 1.9%), so every device nanosecond is 1:1 on wall clock.**
+**Do NOT try giving cuFFT strided rung inputs** (the CPU's `DecimBuf` trick, via
+`cufftPlanMany`): at `istride = k` each element costs its own 32 B sector, so
+every rung re-reads the whole column and the traffic comes out no better — the
+device-memory saving is real, the speed saving is zero (§4.15).
+There is still no multi-GPU support *inside* one
+invocation.
 
 ## CPU performance work (the optimisation phase is CLOSED)
 
