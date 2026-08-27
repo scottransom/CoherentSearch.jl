@@ -479,6 +479,19 @@ optimising it means removing WORK, not improving access — which rules out the
 whole family of layout and access-pattern ideas. The path stays behind
 `Val{COAL}`, defaulted off, and `bench/gpu_boxcar_bench.jl` A/Bs both in ONE
 process so a bigger-L1 card can re-test it.
+**NEXT SESSION'S WORK is listed in `gpu_design.md` §4.15 "What this makes the
+next work", in value order with the dead ends named.** The top two: (1) overlap
+the **per-file** loop the way §4.13 overlapped the per-chunk one — 1.128 s of the
+4.245 s per file is host/PCIe work done while the device idles, so ~1.33x on a
+real 220-file job, the largest single item anywhere in the GPU path, and the
+place `../PoolQueues.jl` would fit; (2) the **transform**, but **gate it on one
+cheap probe first — time a C2C of length `Hk` against the shipped C2R of `2Hk`**.
+It moves ~2x the minimum bytes (49% of DRAM on the A4000, 36% on the A100) and
+the suspected cause is a separate C2R fold pass; if the probe confirms it the
+fold moves into the fused transpose kernel (which already holds the column in
+shared) for a ~1.19x ceiling, and if it does not, stop — a hand-written batched
+transform was measured at 4.3-4.5x slower than cuFFT in §4.2.
+
 **`bin/parallel_search.py` fills a whole machine** — it PARTITIONS the file list
 across N invocations (one per GPU with `--gpu`, one per core otherwise) rather
 than running one process per file, because start-up and the cached device

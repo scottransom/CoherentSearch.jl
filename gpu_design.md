@@ -3192,6 +3192,70 @@ that §4.2 measured at **2.54–2.65x** on the interp kernel; writing them
 transposed instead would need the transpose back. The comment predates the
 transpose kernel and is stale.
 
+#### What this makes the next work
+
+In value order. Both saturated phases are now fixed and the boxcar's whole
+access-pattern family is ruled out, so the list is much shorter than §4.12's.
+
+1. **Overlap the PER-FILE loop, the way §4.13 overlapped the per-chunk one.**
+   This is the largest single item anywhere in the GPU path and it is not a
+   kernel. §4.13 decomposed a real 220-file job as **4.245 s/file = 3.117 s of
+   search + 1.128 s of read/upload/write**, i.e. **26.6%** of wall clock spent on
+   host and PCIe work while the device is idle — and `CuArray(ft.amps)` is a
+   synchronous 1.29 GiB H2D copy that also forces the whole mmap to fault. Hidden
+   behind the previous file's search that job goes ~934 s → **~700 s, ~1.33x**.
+   A producer task staging file `N+1` into a recycled **pinned** host buffer is
+   the shape; `../PoolQueues.jl` (David MacMahon) is a ready-made pool/queue pair
+   for exactly this, and its buffer recycling matters here because §4.13 already
+   established that `CUDA.pin` is a driver call that must not be paid per file.
+   - **It will do much less for CPU users, and the reason is structural, not
+     effort.** `FFTFile` mmaps, so there is no read call to overlap — pages fault
+     *inside* the search with OS readahead already overlapping them — and neither
+     CPU deployment mode has an idle resource to give a producer task (`-t auto`
+     has every core in the search; one-single-threaded-process-per-DM has every
+     core in some process). Slow or networked storage would flip that, and it is
+     cheap to settle first: time a multi-file CPU run first-pass against
+     second-pass in one process, and the gap is the whole budget a prefetcher
+     could recover. §4.13's incidental figure says it is small here — local `/tmp`
+     to `/dev/shm` bought **0.109 s/file** on a 1.29 GiB file.
+
+2. **The transform, gated on one cheap probe first.** It is the largest device
+   phase on the small-L2 cards (39.5% on the A4000) and tied for largest on the
+   40 MB ones, and the traffic model above says it moves **~2x the minimum
+   bytes** — 49% of DRAM on the A4000, 36% on the A100 — which is cuFFT's
+   overhead, not ours. The suspected mechanism is a **separate C2R fold pass**.
+   - **The probe, before writing any kernel: time a C2C of length `Hk` against
+     the shipped C2R of length `2Hk`** on the same rung stacks. If C2C is
+     ~1.7-2x faster, the fold pass is real.
+   - **If it is**, the fold moves into the fused transpose kernel, which is the
+     natural home for it: that kernel already holds the whole column in shared,
+     which is exactly where `X[j]` and `conj(X[H-j])` both live, so the fold is
+     arithmetic on data already staged. cuFFT then does a plain length-`Hk` C2C,
+     and the boxcar de-interleaves even/odd bins as it stages — free, since it
+     stages anyway. Ceiling **~1.19x end to end on the A4000**.
+   - **If it is not**, stop: the transform is cuFFT's floor and there is nothing
+     to take without writing a batched small-transform kernel, which §4.2's
+     direct-DFT probe already measured at **4.3-4.5x slower** than cuFFT.
+
+3. **Re-sweep `--blocksize` and propose 262144 as the default.** 65536 now costs
+   the A100 1.19x and the A4000 1.10x where 262144 costs 1.05x and 1.02x, and
+   262144 still fits a 3.67 GiB card. Needs the A400 and 2080 Super re-swept
+   post-overlap before it is more than a two-card argument.
+
+4. **Score the two open projections** — ~1.11x (A4000) and ~1.07x (A100) for the
+   zeroing plus fused transpose — on the next `gpu_search_report.jl` from each.
+
+5. **Multi-GPU inside one invocation**, if `bin/parallel_search.py` ever stops
+   being enough. The four `_CACHE_*` refs would need keying by `CuDevice` and one
+   task per device; the multi-process route the launcher takes sidesteps that
+   entirely, which is why it was done first.
+
+**What NOT to spend the next session on**, all measured rather than argued:
+strided cuFFT rung inputs (no traffic saving, §4.15 above), coalescing the boxcar
+staging load (1.55x slower, and it rules out the access-pattern family for that
+phase), having the interpolator write the rung stacks directly (§4.2's 2.54-2.65x
+scatter), and per-rung transform sub-batching (§4.10, scored at 1.000x).
+
 ---
 
 ## 5. Correctness — the fourth pin
