@@ -127,6 +127,11 @@ else
         gp = E.GPUInterpPlan(plans)
         d_amps = CUDA.CuArray(ft.amps)
         i = findfirst(==(k), gc.ks)
+        # The kernels index a per-width normaliser the host builds
+        # (`_boxcar_shape!`), so `invsigma` reaches them folded into that table;
+        # nothing here is truncated, hence the fully-filled one.
+        invsws = E.refresh_invsws!(gc, i, k, gc.Hk[i],
+                                   fill(true, params.nharms), 0.7)
         for n in (1024, 999, 37)           # 999 and 37 leave a partial last block
             E.gpu_fill_ftprofs!(gc.ftprofs, gp, d_amps, ft, 0, n)
             E.fill_stacks!(gc, n)
@@ -134,7 +139,7 @@ else
             res = map(((v, c),) -> begin
                           o = CUDA.zeros(Float32, n)
                           E.gpu_boxcar!(o, gc.profs[i], n, 2gc.Hk[i], gc.widths[i],
-                                        gc.hwidths[i][end], 0.7; variant = v,
+                                        gc.hwidths[i][end], invsws; variant = v,
                                         coalesced = c)
                           Array(o)
                       end, ((1, false), (1, true), (3, false), (3, true)))
