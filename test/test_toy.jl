@@ -76,7 +76,7 @@ end
         @test maximum(abs, prof .- ref) <= 1e-12 * maximum(abs, ref)
 
         # k > 1: the decimated fold must equal the native H_k-harmonic fold of
-        # k*r.  This is the whole claim of `decimation_design.md` §1 — that
+        # k*r.  This is the whole claim of `docs/decimation_design.md` §1 — that
         # every k-th base harmonic *is* the harmonic stack of the multiple —
         # and it is checked here against an independent computation of it.
         for k in 2:6

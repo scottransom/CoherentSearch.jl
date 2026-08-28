@@ -1,4 +1,4 @@
-# The transpose-and-decimate stage, per-rung against fused (`gpu_design.md` §4.15).
+# The transpose-and-decimate stage, per-rung against fused (`docs/gpu_design.md` §4.15).
 #
 #   julia --project=<env with CoherentSearch + CUDA> bench/gpu_transpose_bench.jl [FILE.fft] [Nprof...]
 #

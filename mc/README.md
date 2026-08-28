@@ -1,6 +1,6 @@
 # Detection-efficiency Monte Carlo
 
-Design: `../monte_carlo.md` and `../Summary_and_Future_Work.md` §3.2.
+Design: `../docs/monte_carlo.md` and `../docs/Summary_and_Future_Work.md` §3.2.
 Population and profile model: `mc_profiles.py`. Driver: `mc_simulate.py`.
 Combining and tabulating: `mc_analyze.py`.
 

@@ -242,13 +242,13 @@ function main(argv)
     # the manifest of a CPU-only install and `using CoherentSearch` never pays for
     # it; the cost lands here, once per invocation (~6 s), and a run over many
     # files amortises it to nothing -- which is the deployment mode that matters
-    # (see gpu_design.md §7.2).
+    # (see docs/gpu_design.md §7.2).
     backend = CPUBackend()
     if a["gpu"]
         Symbol(a["sigma"]) === :analytic || error(
             "--gpu currently requires --sigma analytic (the default).  The measured " *
             "scale is a per-chunk MAD and has no device implementation yet; " *
-            "gpu_design.md stage 4.")
+            "docs/gpu_design.md stage 4.")
         a["normalize"] && error("--gpu does not support --normalize yet (it needs the " *
                                 "two-pass per-(k,frequency) statistics); run on the CPU.")
         a["metricstats"] && error("--gpu does not support --metricstats yet; run on the CPU.")
@@ -279,7 +279,7 @@ function main(argv)
         # most; the Ada's own figure moved 1.13x -> 1.22x for that reason, so
         # treat the bound as provisional.  It also fails safe on
         # memory: 65536 needs 0.18 GiB of workspace and fits on the smallest card
-        # here, where 131072 does not.  gpu_design.md §4.12.
+        # here, where 131072 does not.  docs/gpu_design.md §4.12.
         if a["blocksize"] == 0
             a["blocksize"] = GPU_DEFAULT_BLOCKSIZE
             @info "Using the GPU default --blocksize $(GPU_DEFAULT_BLOCKSIZE) " *
@@ -324,7 +324,7 @@ function main(argv)
     # Hand the GPU's cross-file workspace back to the driver.  The device cache
     # is keyed on `(params, Nprof, r_lo)` and deliberately survives the loop
     # above -- rebuilding it per file cost ~0.5 s each, dominated by the
-    # `CUDA.reclaim()` that used to run per file (gpu_design.md §4.6).  A no-op
+    # `CUDA.reclaim()` that used to run per file (docs/gpu_design.md §4.6).  A no-op
     # on the CPU backend.  In a `try`/`finally` so an error mid-batch still
     # releases: this is the only thing that returns device memory to the driver,
     # and on a display GPU that memory is the desktop's.

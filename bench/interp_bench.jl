@@ -72,7 +72,7 @@ bench_direct(out, n, step, m) = CS.finterp_direct!(out, R0, n, step, amps, m)
 # so this arm is a little pessimistic — which does not matter for its only
 # remaining purpose, recording the order-of-magnitude gap that motivated the
 # direct interpolator in the first place.  Do not quote it as a production
-# figure; the settled number is the 3.8x in Summary_and_Future_Work.md.
+# figure; the settled number is the 3.8x in docs/Summary_and_Future_Work.md.
 """FFT-correlation onto a `nb`-per-bin grid, then linear interpolation."""
 function bench_fft_linear(out, n, step, m, nb, lobin, numbins, fftlen)
     grid = finterp_fft(lobin, numbins, nb, amps, m; fftlen=fftlen)

@@ -7,7 +7,7 @@ only if `CUDA.functional()`.
 
 **This module may only add methods on types it owns.**  Redefining a method the
 base module already defined is method overwriting, which Julia rejects during
-precompilation.  Hence `CUDABackend` and dispatch on it.  See `gpu_design.md` §3.4.
+precompilation.  Hence `CUDABackend` and dispatch on it.  See `docs/gpu_design.md` §3.4.
 """
 module CoherentSearchCUDAExt
 
@@ -37,7 +37,7 @@ __init__() = CUDA.functional() && (CoherentSearch._GPU_BACKEND[] = CUDABackend()
 #
 # The CPU's `DirectPlan` is one object per harmonic.  Sixty small device arrays
 # per field would mean sixty kernel launches per chunk; at the large `Nprof` the
-# GPU wants (`gpu_design.md` §3.2) launch overhead is already the most likely way
+# GPU wants (`docs/gpu_design.md` §3.2) launch overhead is already the most likely way
 # this design fails, so the per-harmonic tables are **concatenated once** into
 # flat device vectors with per-harmonic base offsets, and one launch covers the
 # whole (harmonic × trial-group) grid.
@@ -133,7 +133,7 @@ end
 # makes the store one coalesced 256-byte write per warp; the CPU layout would
 # make it a 32-way scatter with a 488-byte stride.  CLAUDE.md records the
 # transposed layout as 2-3x SLOWER for FFTW, which is a CPU result and must not
-# be carried across (`gpu_design.md` §3.3).
+# be carried across (`docs/gpu_design.md` §3.3).
 # ---------------------------------------------------------------------------
 function _interp_kernel!(ftp, amps, namps::Int32, t0::Int64, n::Int32,
                          tfirst::Int64, ngroups::Int32, ::Val{V},
@@ -214,7 +214,7 @@ function _interp_kernel!(ftp, amps, namps::Int32, t0::Int64, n::Int32,
             # TRANSPOSED=false -> (nharms+1, Nprof), the CPU layout: consecutive
             #   lanes are (nharms+1) apart, a 32-way scatter.  Slower here, but it
             #   is the layout cuFFT transforms 1.75-1.88x faster (dim 1 vs dim 2),
-            #   which is the larger phase.  See gpu_design.md.
+            #   which is the larger phase.  See docs/gpu_design.md.
             if TRANSPOSED
                 ftp[jcol, h + 1] = v
             else
@@ -251,7 +251,7 @@ end
 # `fill!(ftprofs, 0)` wrote all `nharms+1` columns every chunk, and measured
 # **4.0% of device time on an RTX A4000 and 2.3% on an A100** at 388 and
 # 1833 GB/s respectively -- i.e. it ran at the card's full DRAM write bandwidth,
-# so the only way to make it cheaper is to move fewer bytes (gpu_design.md
+# so the only way to make it cheaper is to move fewer bytes (docs/gpu_design.md
 # §4.15).  Almost all of it was redundant:
 #
 #  - `_interp_kernel!` writes EVERY trial `1:n` of every ACTIVE harmonic's
@@ -376,7 +376,7 @@ end
 # A rung-`k` column is `(Hk+1)` complex in and `2Hk` real out, so the deep fold
 # carries 968 B per trial and the shallowest 168 B: the deep fold fills L2 with
 # few columns and the shallow ones need many before there is enough parallelism
-# to fill the SMs.  `gpu_design.md` §0.3 measured the per-rung optima spread
+# to fill the SMs.  `docs/gpu_design.md` §0.3 measured the per-rung optima spread
 # across the whole `Nprof` sweep on a 40 MB-L2 card, worth 1.40x on the stage.
 #
 # Nothing forces one batch, though: each rung is a batched transform over
@@ -605,7 +605,7 @@ end
 # ~0 and the `delta*S_tot` term is the rounding-level correction the CPU applies.
 #
 # **THE STAGING LOAD IS NOT COALESCED, A COMMENT HERE USED TO CLAIM IT WAS, AND
-# COALESCING IT IS A LOSS.  Do not re-guess this one (gpu_design.md §4.15).**
+# COALESCING IT IS A LOSS.  Do not re-guess this one (docs/gpu_design.md §4.15).**
 #
 # The comment removed from here read: "`profs` is `(Nprof, nbins)`, so
 # `profs[trial, i]` for consecutive trials is contiguous".  It WAS -- until §4.2
@@ -944,7 +944,7 @@ end
 # transpose sits between them, where a shared-memory tile makes both the read and
 # the write coalesced.
 #
-# **§3.3 of `gpu_design.md` asserted the transposed layout was "almost certainly
+# **§3.3 of `docs/gpu_design.md` asserted the transposed layout was "almost certainly
 # right" for cuFFT. It was verified for CORRECTNESS and never timed against the
 # alternative, and it is wrong.** Recorded as the mistake it was: this file's
 # standing lesson about benchmarking against the shipped kernel rather than the
@@ -955,7 +955,7 @@ end
 # on the reference workload -- a gather doing exactly what the CPU deleted in
 # 2026-08-16 for the same reason.
 # ---------------------------------------------------------------------------
-# **FUSED ACROSS RUNGS (gpu_design.md §4.15).**  The per-rung kernel below reads
+# **FUSED ACROSS RUNGS (docs/gpu_design.md §4.15).**  The per-rung kernel below reads
 # `ftprofs` once PER RUNG, so a six-rung ladder reads `sum(Hk+1) = 153` of its 61
 # columns -- 2.5x over -- and writes 153 rows: **2448 B per trial.**  Measured, it
 # ran at **389 GB/s on an RTX A4000 (102% of that card's device copy) and
@@ -1177,7 +1177,7 @@ function _check_device_memory(ft::FFTFile, params::SearchParams, Nprof::Integer,
     # reads as self-contradictory until you find the 0.90 margin -- when the
     # actual new demand was ~0.35 GiB.  Two rows of that card's sweep were lost
     # to it and its reported optimum is a ceiling, not an optimum
-    # (gpu_design.md §4.12).
+    # (docs/gpu_design.md §4.12).
     #
     # The fix reclaims ONLY on the path that was about to fail, so the normal
     # path still never pays the ~0.36 s.  Reclaiming and re-reading is exact,
@@ -1242,7 +1242,7 @@ end
 # `GPUInterpPlan` 0.004 s — against an amplitude upload of only 0.042 s for a
 # 188 MB file.  So the genuinely per-file part is ~8% of the per-file cost and
 # the cacheable part is ~92%.  End to end that was 1.73 s marginal per file
-# against a ~1.14 s search (gpu_design.md §4.6).
+# against a ~1.14 s search (docs/gpu_design.md §4.6).
 #
 # **`reclaim()` is deliberately NOT here any more.** It returns memory to the
 # *driver* rather than to CUDA.jl's pool, which is what lets a desktop have its
@@ -1383,7 +1383,7 @@ function _region!(::CUDABackend, ft::FFTFile, params::SearchParams,
                   dplans::AbstractVector)
     params.sigma === :analytic || error(
         "the CUDA backend requires sigma = :analytic; the measured scale is a " *
-        "per-chunk MAD with no device implementation yet (gpu_design.md stage 4)")
+        "per-chunk MAD with no device implementation yet (docs/gpu_design.md stage 4)")
     norm === nothing || error("the CUDA backend does not support --normalize yet")
     metricstats === nothing || error("the CUDA backend does not support --metricstats yet")
 
@@ -1402,7 +1402,7 @@ function _region!(::CUDABackend, ft::FFTFile, params::SearchParams,
     # kernels are on the device.  Before this, both were on the critical path:
     # `download` + `scan` measured **31.5% of wall clock on an A100 and 31.4%
     # on an RTX A4000** (against 4.6% on an RTX A400), because the device got
-    # ~8x faster over six cards and the host did not (gpu_design.md §4.12).
+    # ~8x faster over six cards and the host did not (docs/gpu_design.md §4.12).
     # It is the largest single item left on any modern card.
     #
     # Three things make it safe, and all three are needed:

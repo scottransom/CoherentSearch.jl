@@ -57,7 +57,7 @@
 #     https://arxiv.org/pdf/astro-ph/0204349
 #   - The boxcar matched filter: Morello et al. (2020), MNRAS 497, 4654, §5.4;
 #     numerically riptide's `snr1` (`cpp/snr.hpp`).
-#   - Harmonic decimation: `decimation_design.md`.
+#   - Harmonic decimation: `docs/decimation_design.md`.
 
 module ToyCoherentSearch
 
@@ -88,7 +88,7 @@ finely than it needs, which is the price of summing them coherently.
 A decimation-`k` fold inherits this for free: its fundamental `k*r` steps by
 `k*dr`, but its own top harmonic is `H_k = floor(nharms/k)`, so that harmonic
 advances by `H_k * k * dr <= nharms * dr = hidr` — never coarser than the base
-grid (`decimation_design.md` §2a).
+grid (`docs/decimation_design.md` §2a).
 """
 function trial_grid(ft::FFTFile, lofreq::Real, hifreq::Real,
                     nharms::Integer, hidr::Real)
@@ -162,7 +162,7 @@ harmonic stack of the multiple: `H_k = floor(nharms/k)` harmonics, folded into
 `2*H_k` bins, at the cost of one short inverse FFT and no interpolation at all.
 Shallower folds suit faster pulsars, which tend to have wider duty cycles and so
 need fewer harmonics — the same trade riptide's FFA makes by downsampling
-(`decimation_design.md`).
+(`docs/decimation_design.md`).
 
 `nfilled` is how many of the `H_k` stacked harmonics carry data; the rest are
 past Nyquist and stay zero.

@@ -139,7 +139,7 @@ Base.@kwdef struct SearchParams
     boxcar_gatemargin::Float64 = 0.01  # fast path: re-score in Float64 only when the
                                        # Float32 batched gate lands within this of
                                        # `threshold` (see `boxcar_metrics!`)
-    decimations::Vector{Int} = [1]  # harmonic-decimation factors k (see decimation_design.md)
+    decimations::Vector{Int} = [1]  # harmonic-decimation factors k (see docs/decimation_design.md)
     precision::Symbol = :f32   # profile-stage element type — :f32 or :f64 (see `proftype`)
     sigma::Symbol = :analytic  # noise scale: :analytic (closed form) or :measured (MAD)
 end
@@ -170,7 +170,7 @@ end
 The harmonic-decimation factors `k` to search, `1:maxdecim`, keeping only those
 that still leave at least two harmonics (`⌊nharms/k⌋ ≥ 2`) to fold.  `k=1` is the
 ordinary search; `k>1` re-uses the interpolated harmonic amplitudes to fold at
-`k·rf` almost for free (see `decimation_design.md`).
+`k·rf` almost for free (see `docs/decimation_design.md`).
 """
 decimation_set(nharms::Integer, maxdecim::Integer) =
     [k for k in 1:max(1, maxdecim) if fld(nharms, k) >= 2]
@@ -468,7 +468,7 @@ bias it.  Returns `0.0` for a degenerate (flat) block.
 that is the precision of any single reported S/N.  Raise
 `_BOXCAR_SIGMA_SAMPLES` (rms falls as `1/√cap`) if a use needs better; the
 contiguous gather below makes the traffic cheap but the two `_median!` calls are
-`O(cap)`.  See `Summary_and_Future_Work.md` §3.1.
+`O(cap)`.  See `docs/Summary_and_Future_Work.md` §3.1.
 
 The subsample indices depend only on `(nbins, n)`, and `M` enters only through the
 ratio the caller forms (`excess/σ`), so the unnormalised `brfft` and normalised
@@ -2114,7 +2114,7 @@ function _search_region!(ft::FFTFile, params::SearchParams,
                     push!(stats, _block_stats(c, 1, params.nharms, nbins, ngood, flo, fhi, mbuf[1:n]))
                 end
                 # Harmonic-decimation multi-frequency passes (k > 1), re-using the
-                # base harmonic amplitudes already in ws.ftprofs (see decimation_design.md).
+                # base harmonic amplitudes already in ws.ftprofs (see docs/decimation_design.md).
                 for db in ws.decims
                     whist = collect_stats ?
                         hists[db.k][_window_index(wedges[db.k], db.k * rmean / ft.T)] : nothing
@@ -2321,7 +2321,7 @@ interpolation kernels are built once before the parallel region.
 
 `blocksize = 0` (the default) resolves per backend -- `CPU_DEFAULT_BLOCKSIZE`
 (2048) or `GPU_DEFAULT_BLOCKSIZE` (65536).  The two differ by 32x and both are
-measured; see those constants for why, and `gpu_design.md` §4.12 for the sweep
+measured; see those constants for why, and `docs/gpu_design.md` §4.12 for the sweep
 that a GPU user should run to squeeze out the last ~14%.
 
 The `lofreq`/`lobin` precedence matches the Python CLI: `lofreq` is used unless
@@ -2403,7 +2403,7 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
     # usable harmonic set changes, so that `ws.filled` -- one flag per harmonic
     # per chunk -- is right for every trial in the chunk rather than only for its
     # last one.  See `chunk_starts`; without it, results are not chunk-invariant
-    # in any band where a harmonic crosses Nyquist (gpu_design.md §4.14).
+    # in any band where a harmonic crosses Nyquist (docs/gpu_design.md §4.14).
     cstarts = chunk_starts(dplans, ft, params, total, Nprof)
     nchunks = length(cstarts)
     # A GPU backend runs the whole band on the device, so it needs exactly one

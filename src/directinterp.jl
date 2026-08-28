@@ -495,7 +495,7 @@ Nyquist inside that band): 0.003% of trials affected at `blocksize = 2048` but
 **1.49% at 1048576**, and the reported candidate count drifted 802 → 810 across
 that range.  The standard 0.1–33.3 Hz band has *no* crossings at all, which is
 why every byte-identical `.cohout` comparison before 2026-08-26 held vacuously.
-See `gpu_design.md` §4.14.
+See `docs/gpu_design.md` §4.14.
 
 Each of the guard's three conditions is monotone in `t`, so a harmonic is usable
 on one contiguous interval and contributes at most two boundaries — found by

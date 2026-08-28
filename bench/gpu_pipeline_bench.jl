@@ -1,4 +1,4 @@
-# Stage-2 phase timings for the GPU pipeline (`gpu_design.md` §4).
+# Stage-2 phase timings for the GPU pipeline (`docs/gpu_design.md` §4).
 #
 #   julia --project=<env with CoherentSearch + CUDA> bench/gpu_pipeline_bench.jl [FILE.fft] [Nprof...]
 #
@@ -6,7 +6,7 @@
 # transforms, and the six boxcar gates -- and scales each to the reference
 # workload (PM0063 at the riptide bench config, 8,363,442 trial fundamentals), so
 # every column is directly comparable with the CPU's ~1.01 s at `-t 20` on
-# fitzroy and with the projections in `gpu_design.md` §0.4/§0.46.
+# fitzroy and with the projections in `docs/gpu_design.md` §0.4/§0.46.
 #
 # It also times the decimated-stack copy separately, because that copy is a
 # placeholder: cuFFT cannot transform a strided view, so the CPU's in-place

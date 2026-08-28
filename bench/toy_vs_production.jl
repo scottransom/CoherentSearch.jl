@@ -9,7 +9,7 @@
 #
 #   1. TIMING.  Wall clock and per-trial cost for each, at the same parameters
 #      over the same band.  The ratio measures what the whole optimisation
-#      programme in `Summary_and_Future_Work.md` bought, against an
+#      programme in `docs/Summary_and_Future_Work.md` bought, against an
 #      implementation of the same algorithm with none of it.  Run with `-t 1`:
 #      the toy is single-threaded, so a threaded production arm measures the
 #      thread count rather than the code.

@@ -737,7 +737,7 @@ if isfile(EXAMPLE_FFT)
         # harmonic crosses Nyquist used to drop that harmonic for every trial in
         # it, including the ones below the crossing.  `_analytic_sigma` then
         # counted one harmonic fewer for all of them, and moving the blocksize
-        # moved the result (gpu_design.md §4.14).
+        # moved the result (docs/gpu_design.md §4.14).
         #
         # It hid because it needs a crossing INSIDE the search band, and the
         # standard 0.1-33.3 Hz band has none: harmonic `h` dies at `Nyquist/h`,

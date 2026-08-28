@@ -5,7 +5,7 @@
 # `backend` keyword).
 #
 # The extension adds methods here on its own `CUDABackend`; it must never
-# redefine one this module owns.  See `gpu_design.md` §3.4.
+# redefine one this module owns.  See `docs/gpu_design.md` §3.4.
 
 """
     chunk_ftprofs(backend, ft, params, rstart, n; t0=0, weights=Float32)
@@ -17,7 +17,7 @@ matrix — the state of `Workspace.ftprofs` after `fill_chunk_profiles!` and
 *before* the inverse transform, plus the per-harmonic `filled` flags that
 [`_analytic_sigma`](@ref) reads.
 
-This is the stage-1 GPU equivalence gate (`gpu_design.md` §5): the CUDA backend
+This is the stage-1 GPU equivalence gate (`docs/gpu_design.md` §5): the CUDA backend
 must reproduce the CPU backend's result to ~1e-6 at `weights = Float32`.  It is a
 comparison and testing entry point, not the production path — it allocates a
 whole `Workspace` per call.

@@ -5,7 +5,7 @@
 # (`ext/CoherentSearchCUDAExt.jl`, weak dependency on CUDA), so a CPU-only user
 # never downloads, precompiles or loads CUDA — verified, not assumed: with CUDA
 # declared under `[weakdeps]` it does not appear in the user's Manifest at all,
-# and `using CoherentSearch` is unchanged.  See `gpu_design.md` §3.4.
+# and `using CoherentSearch` is unchanged.  See `docs/gpu_design.md` §3.4.
 #
 # **An extension may only add methods on NEW types.**  It must never redefine a
 # method this module already owns — that is method overwriting, which Julia
@@ -131,7 +131,7 @@ const GPU_PHASE_NAMES = ("zero", "interp", "transpose", "transform",
 # it tracks the host CPU and says nothing whatever about the card, yet it was
 # 12.3% of one card's phase table and 7.3% of the other's.  Anyone classifying a
 # GPU from an unlabelled table is reading a property of the machine it was
-# plugged into.  See `gpu_design.md` §4.8, finding (a).
+# plugged into.  See `docs/gpu_design.md` §4.8, finding (a).
 # ---------------------------------------------------------------------------
 
 """
@@ -168,9 +168,9 @@ const _GPU_TIMING = Ref(false)
 #    when the six sweeps were taken; the RTX 4000 SFF Ada re-measured at 1.22x
 #    after the download/scan overlap, which helps small chunks most and so
 #    sharpens that card's preference.  The other five sweeps are pre-overlap and
-#    have not been redone -- gpu_design.md §4.13.)
+#    have not been redone -- docs/gpu_design.md §4.13.)
 #    `bench/gpu_search_report.jl` still sweeps and recommends, for the last 14%.
-#    gpu_design.md §4.11-§4.12.
+#    docs/gpu_design.md §4.11-§4.12.
 # ---------------------------------------------------------------------------
 const CPU_DEFAULT_BLOCKSIZE = 2048
 const GPU_DEFAULT_BLOCKSIZE = 65536
@@ -190,7 +190,7 @@ const _GPU_SUBBATCH = Ref{Any}(:auto)
     gpu_subbatch!(x)
 
 Set the GPU transform sub-batching policy: `:auto` (default, derive from device
-L2), `:off`, or an `Integer` L2 target in bytes.  See `gpu_design.md` §4.9.
+L2), `:off`, or an `Integer` L2 target in bytes.  See `docs/gpu_design.md` §4.9.
 """
 function gpu_subbatch!(x)
     x === :auto || x === :off || x isa Integer ||

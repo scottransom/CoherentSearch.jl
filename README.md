@@ -191,7 +191,7 @@ job's slice contiguous instead.
 With `--gpu` each job gets its own device through `CUDA_VISIBLE_DEVICES`
 (`--gpus 0,2,3` to choose); there is no multi-GPU support *inside* a single
 invocation. On the CPU, `-t 1` and one job per core is the deployment model the
-performance work targets — see `Summary_and_Future_Work.md` §3.1.
+performance work targets — see `docs/Summary_and_Future_Work.md` §3.1.
 
 One sharp edge it handles for you: a job that happened to receive exactly one
 file would write its candidates to **stdout** per the table above. When that can
@@ -231,7 +231,7 @@ julia --project=. -t auto bin/coherent_search.jl FILE.fft \
 > narrow-duty synthetic tests; on real observations, whose harmonic content is
 > bounded by scattering and finite time resolution, the fundamental wins.
 
-See `decimation_design.md` for the derivation that decimation stays correctly
+See `docs/decimation_design.md` for the derivation that decimation stays correctly
 sampled (each `k`'s top harmonic still steps by ≤ `hidr`, and the base input-FFT
 read depth already covers every `k`) and the full bookkeeping.
 
@@ -513,7 +513,8 @@ the detector. Duty cycles are defined identically on both sides too.
 
 One pulsar in one observation says nothing about relative *sensitivity*, and the
 single-detection scatter is much larger than the gap above; that question is
-settled by the injection Monte Carlo described in `Summary_and_Future_Work.md`
+settled by the injection Monte Carlo described in
+`docs/Summary_and_Future_Work.md`
 §3.2, not by this table.
 
 ## The toy search
@@ -704,7 +705,8 @@ functional CUDA device is present, and skips itself when there is not.
 
 `bench/gpu_search_report.jl`'s final block is designed to be pasted back into an
 issue or email. Results from cards we have not seen are genuinely useful: the
-design log (`gpu_design.md`) keeps per-card measurements, and the `--blocksize`
+design log (`docs/gpu_design.md`) keeps per-card measurements, and the
+`--blocksize`
 guidance above is built from only three GPUs so far.
 
 If you want to bootstrap Julia and CUDA.jl on a bare GPU host with no root,
@@ -808,4 +810,4 @@ worth up to ~5% in amplitude at high harmonics with `numbetween=16`.
 `--verbose` prints the trial grid, chunking and interpolation phase-cycle
 lengths.
 
-See `Summary_and_Future_Work.md` and `decimation_design.md` for details.
+See `docs/Summary_and_Future_Work.md` and `docs/decimation_design.md` for details.

@@ -1,4 +1,4 @@
-# Per-rung transform SUB-BATCHING, measured end to end (`gpu_design.md` §4.9).
+# Per-rung transform SUB-BATCHING, measured end to end (`docs/gpu_design.md` §4.9).
 #
 #   julia --project=<env with CoherentSearch + CUDA> bench/gpu_subbatch_bench.jl FILE.fft [--band lo hi]
 #
@@ -10,7 +10,7 @@
 # to 16384, where §4.8 measured every other phase paying 1.42x.  Sub-batching
 # lets each side have what it wants.
 #
-# **The pre-registered prediction this is here to score** (`gpu_design.md` §4.8,
+# **The pre-registered prediction this is here to score** (`docs/gpu_design.md` §4.8,
 # finding (c)), from decomposing the blocksize sweep rather than from a model of
 # the kernels:
 #

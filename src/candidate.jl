@@ -1,7 +1,7 @@
 # Per-candidate pulse-profile reconstruction.
 #
 # This is the "brute-force, high-accuracy" path called for in
-# `Summary_and_Future_Work.md`: for the handful of surviving candidates we do
+# `docs/Summary_and_Future_Work.md`: for the handful of surviving candidates we do
 # not need the throughput-tuned approximations of the search hot loop.  Each
 # harmonic is interpolated once at the candidate's exact Fourier frequency with
 # a wide `fourier_interp` kernel, and a single inverse real FFT folds the

@@ -12,7 +12,7 @@
 # package into the environment, so the scripts that need it (gpu_interp_bench.jl,
 # test/test_gpu.jl) work too.  CUDA is added to that separate environment, never
 # to the repo's own Project.toml -- CUDA is a weak dependency there on purpose,
-# and adding it as a hard one would undo the whole point (gpu_design.md 3.4).
+# and adding it as a hard one would undo the whole point (docs/gpu_design.md 3.4).
 #
 # Only an NVIDIA *driver* is required: CUDA.jl downloads its own toolkit as
 # artifacts, so `nvcc` and a module-loaded CUDA are irrelevant (and a

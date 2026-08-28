@@ -4,7 +4,7 @@
     bin/parallel_search.py [-j N] [--gpu] [OPTIONS] FILE.fft ...  [-- SEARCH ARGS]
 
 The search itself is single-threaded-per-process on the CPU (that is the
-deployment model `Summary_and_Future_Work.md` §3.1 argues for) and
+deployment model `docs/Summary_and_Future_Work.md` §3.1 argues for) and
 single-device-per-process on the GPU (there is no multi-GPU support inside
 `coherent_search.jl`).  Either way the way to use a whole machine is several
 independent invocations over disjoint slices of the file list, and doing that by

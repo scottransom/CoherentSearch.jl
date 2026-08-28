@@ -1,4 +1,4 @@
-# Boxcar-gate tuning for the GPU backend (`gpu_design.md` §4.2).
+# Boxcar-gate tuning for the GPU backend (`docs/gpu_design.md` §4.2).
 #
 #   julia --project=<env with CoherentSearch + CUDA> bench/gpu_boxcar_bench.jl
 #
@@ -14,7 +14,7 @@
 #              loop.  This is what ships.
 #
 # Variants 1 and 3 are additionally run with and without the COALESCED staging
-# load (`gpu_design.md` 4.15).  Both are in one build precisely so the A/B is a
+# load (`docs/gpu_design.md` 4.15).  Both are in one build precisely so the A/B is a
 # kwarg rather than a checkout -- this file's standing lesson about precompile
 # differences masquerading as effects.  The coalesced arm reads the block's B
 # columns as B contiguous runs and transposes into shared (row stride B+1, hence

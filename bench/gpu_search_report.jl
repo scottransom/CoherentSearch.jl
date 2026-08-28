@@ -1,4 +1,4 @@
-# One-command GPU search report, for classifying a new card (`gpu_design.md`).
+# One-command GPU search report, for classifying a new card (`docs/gpu_design.md`).
 #
 #   julia --project=<env with CoherentSearch + CUDA> bench/gpu_search_report.jl FILE.fft [--cpu] [--band lo hi]
 #
@@ -26,7 +26,7 @@
 #    The sweep starts at 2048 because the Ada's in-search
 #    optimum turned out to sit BELOW the standalone probe's knee -- when cuFFT
 #    shares that L2 with the rest of the pipeline the effective knee moves down,
-#    so a sweep that bottoms out at 16384 can miss it (`gpu_design.md` §4.8).
+#    so a sweep that bottoms out at 16384 can miss it (`docs/gpu_design.md` §4.8).
 #  - **`scan` is HOST work and `download` is PCIe; only the five `:device` phases
 #    describe the card.**  The `scan` share moved 1.75x between two hosts purely
 #    because one had a faster CPU, so the breakdown below reports device-only
@@ -65,7 +65,7 @@ println("="^78)
 # that moves these numbers and was never recorded.  `usnea`'s A4000 report was
 # taken at a load average of ~100 on 104 cores and reads ~1.2x slow, with its
 # host-side `scan` share inflated well past anything the card explains
-# (gpu_design.md §4.13).  Every card classified so far has been on someone
+# (docs/gpu_design.md §4.13).  Every card classified so far has been on someone
 # else's machine.
 const _LOADAVG = try
     parse(Float64, first(split(read("/proc/loadavg", String))))
@@ -158,7 +158,7 @@ best = isempty(results) ? (65536, NaN) : results[argmin(last.(results))]
 
 # ---------------------------------------------------------------------------
 # The recommendation.  This is the whole point of the script for a user (as
-# opposed to for `gpu_design.md`): `--blocksize` under `--gpu` defaults to
+# opposed to for `docs/gpu_design.md`): `--blocksize` under `--gpu` defaults to
 # `GPU_DEFAULT_BLOCKSIZE`, which is one constant chosen for its WORST case
 # (within 1.14x of the optimum on all six cards measured), not a per-device rule.
 # This script finds the remaining few percent.
@@ -170,7 +170,7 @@ best = isempty(results) ? (65536, NaN) : results[argmin(last.(results))]
 # a spec sheet settles: the RTX 4000 Ada (40 MB L2, 48 SMs) wants 8192 while the
 # A100 (the same 40 MB, 108 SMs) wants 262144 and is nearly 2x slower at 8192.
 # A rule fitted to the first three cards predicted 6868 for the A100 and was
-# wrong by 32x -- see gpu_design.md §4.11-§4.12 for why this is measured and not
+# wrong by 32x -- see docs/gpu_design.md §4.11-§4.12 for why this is measured and not
 # derived.
 # ---------------------------------------------------------------------------
 if !isempty(results)

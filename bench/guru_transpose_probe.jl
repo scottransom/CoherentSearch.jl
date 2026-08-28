@@ -6,7 +6,7 @@
 # ladder in both precisions against the shipped kernel
 # (`bench/guru_brfft_ladder.jl`), the guru c2r is **0.78x (:f64) / 0.99x (:f32)**
 # on the laptop.  The transpose was instead fixed by blocking its profile axis;
-# see `Summary_and_Future_Work.md` §3.3.
+# see `docs/Summary_and_Future_Work.md` §3.3.
 using FFTW, LinearAlgebra, BenchmarkTools, Printf
 const lib = FFTW.libfftw3
 function guru_c2r(X, yT, flags)

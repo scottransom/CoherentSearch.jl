@@ -320,7 +320,7 @@ optimisation below (1.84x vs 1.26x on the same code and the same data).
   passes. **The `--gpu` kernels take the same per-width table from the host and
   were changed with it, but that path is UNTESTED on a device — verify
   byte-identical candidates on a GPU host before trusting it.** Full account in
-  `Summary_and_Future_Work.md` §3.6.
+  `docs/Summary_and_Future_Work.md` §3.6.
 - **Our S/N IS riptide's S/N as of 2026-08-24 — same statistic, not merely
   comparable.** `_boxcar_scan`, the Python oracle's `snr_metric` and riptide's
   `cpp/snr.hpp:snr1` all correlate the profile against the width-`w` boxcar made
@@ -382,11 +382,11 @@ optimisation below (1.84x vs 1.26x on the same code and the same data).
 - This laptop throttles (`scaling MHz: 67%`); the **threaded** number is the
   least reliable, since back-to-back heavy runs clock the CPU down. Quote `-t 1`.
 
-## GPU support (active track) — see `gpu_design.md`
+## GPU support (active track) — see `docs/gpu_design.md`
 
 **`--gpu` runs a full search as of 2026-08-25.** A package extension
 (`ext/CoherentSearchCUDAExt.jl`, CUDA under `[weakdeps]`), so a CPU-only user
-downloads nothing and `src/search.jl` is untouched. **`gpu_design.md` is the
+downloads nothing and `src/search.jl` is untouched. **`docs/gpu_design.md` is the
 running log — read it before touching any of this**; it keeps the wrong turns in
 on purpose. **Six cards are now measured, 6 to 108 SMs, all reporting
 byte-identical candidates** (§4.8, §4.12). On the 105M-trial NGC6624 file, against
@@ -503,7 +503,7 @@ optimising it means removing WORK, not improving access — which rules out the
 whole family of layout and access-pattern ideas. The path stays behind
 `Val{COAL}`, defaulted off, and `bench/gpu_boxcar_bench.jl` A/Bs both in ONE
 process so a bigger-L1 card can re-test it.
-**NEXT SESSION'S WORK is listed in `gpu_design.md` §4.15 "What this makes the
+**NEXT SESSION'S WORK is listed in `docs/gpu_design.md` §4.15 "What this makes the
 next work", in value order with the dead ends named.** The top two: (1) overlap
 the **per-file** loop the way §4.13 overlapped the per-chunk one — 1.128 s of the
 4.245 s per file is host/PCIe work done while the device idles, so ~1.33x on a
@@ -527,11 +527,13 @@ invocation.
 Scott declared it complete on 2026-08-24, after the AVX-512 scatter fix and the
 `:f32` default. The record below is kept because it is where every measurement
 trap in this project was learned, and those recur — but do not re-open these
-items looking for wins. See `Summary_and_Future_Work.md` (§3) for the roadmap;
+items looking for wins. See `docs/Summary_and_Future_Work.md` (§3) for the
+roadmap;
 the live items are the §3.2 Monte Carlo, the paper, and the GPU track above.
 
 **Planned: a detection-efficiency Monte Carlo against riptide, for a paper**
-(`Summary_and_Future_Work.md` §3.2). Injected Gaussian pulses over the full band
+(`docs/Summary_and_Future_Work.md` §3.2). Injected Gaussian pulses over the
+full band
 and a realistic duty-cycle range at S/N 9–13, scoring detection fraction *and*
 compute cost for both codes. The design constraints are already settled by the
 work recorded here — Gaussian pulses not boxcars, both the `bench` and `matched`
@@ -597,7 +599,7 @@ re-deriving them.
 - **Done (2026-07):** quickselect median in `_profile_snr` (was 41% of runtime →
   7.5%) and a type-stable `Workspace{S,B,D}` (killed hot-loop dynamic `mul!`
   dispatch) — together ~1.6× warm single-thread, results unchanged. See §2 of
-  `Summary_and_Future_Work.md`.
+  `docs/Summary_and_Future_Work.md`.
 - **Done (2026-08-08):** direct `O(m)` interpolation replacing the FFT
   correlation (`src/directinterp.jl`). The interp FFTs — 76% of the chunk fill,
   ~50% of runtime — are gone; **1.64× end-to-end** and ~1e-10 accuracy where the
@@ -909,7 +911,7 @@ re-deriving them.
   whole search on the workstation; it is now 421 µs against 1516 (3.60x), for
   1.36x end-to-end there and ~1.03x on the laptop, candidates byte-identical.**
   The fix is one loop nest: `_bc_transpose!` blocks the **profile** axis by
-  `_BC_TR_BJ = 8`. See `Summary_and_Future_Work.md` §3.3.
+  `_BC_TR_BJ = 8`. See `docs/Summary_and_Future_Work.md` §3.3.
   - **Two recorded diagnoses were wrong, and both had blocked the work.** (a) It
     was not "an L3 bandwidth wall": at `B = 128` the workstation ran it at
     **4.7 GB/s** against the **21 GB/s** that host delivers at the same 2 MB
@@ -1408,7 +1410,8 @@ re-deriving them.
   direct inner loop (measured at `m=32`, default is now 16), the `1.46x` for a
   `Float32` metric kernel (measured against a `Float64` gate, but the shipped gate
   already uses a `Float32` tile), and the smooth-`fftlen` ceiling. When quoting a
-  figure from `Summary_and_Future_Work.md`, check what `m`, `nharms`, `maxdecim`,
+  figure from `docs/Summary_and_Future_Work.md`, check what `m`, `nharms`,
+  `maxdecim`,
   metric and interpolator it was taken under, and re-measure if any have moved.
   The same staleness applies to instructions that name a version or model — say
   what the thing *is* ("the model that wrote the commit"), not today's value.

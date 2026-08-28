@@ -1,4 +1,4 @@
-# Stage-1 gate for the GPU track (`gpu_design.md` §4): the interpolation kernel,
+# Stage-1 gate for the GPU track (`docs/gpu_design.md` §4): the interpolation kernel,
 # GPU against CPU, on the production plan tables and a real `.fft`.
 #
 #   julia --project=<env-with-CoherentSearch+CUDA> bench/gpu_interp_bench.jl [FILE.fft]
@@ -9,7 +9,7 @@
 #
 # The CPU arm is single-threaded on purpose HERE -- it is the per-core cost the
 # kernel is being compared against -- but the headline ratio that matters is
-# against `-t 20`, and the script prints both.  §0.1 of `gpu_design.md` records
+# against `-t 20`, and the script prints both.  §0.1 of `docs/gpu_design.md` records
 # the one time that distinction was got wrong.
 #
 # TRAP: a wall-clock timer around a CUDA launch measures the LAUNCH, not the
@@ -42,7 +42,7 @@ function load_or_synth(path)
         return FFTFile(path), basename(path)
     end
     # PM0063's geometry, so every ns/(harmonic,trial) here is comparable to the
-    # numbers recorded in gpu_design.md.
+    # numbers recorded in docs/gpu_design.md.
     N, dt = 8388608, 0.00025
     T = N * dt
     # Normalised noise: mean power 1 means Re and Im each have variance 1/2.
@@ -121,5 +121,5 @@ nt = Threads.nthreads()
 println()
 println("Against one CPU core the ratio above is the honest per-core number.")
 @printf("Against a 20-core socket, divide by 20: that is the comparison that\n")
-@printf("matters (gpu_design.md 0.1).  This run had %d Julia thread%s.\n",
+@printf("matters (docs/gpu_design.md 0.1).  This run had %d Julia thread%s.\n",
         nt, nt == 1 ? "" : "s")

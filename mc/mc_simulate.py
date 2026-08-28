@@ -4,8 +4,8 @@ mc_simulate.py -- detection-efficiency Monte Carlo for CoherentSearch.jl.
 
 Injects von-Mises-cored pulsars drawn from the MeerKAT TPA width population into
 white noise, hands the SAME noise realisation to four codes, and records what
-each one recovers.  Design settled in `monte_carlo.md` and
-`Summary_and_Future_Work.md` 3.2; the population and profile model live in
+each one recovers.  Design settled in `docs/monte_carlo.md` and
+`docs/Summary_and_Future_Work.md` 3.2; the population and profile model live in
 `mc_profiles.py`.
 
   prepfold          folds at the KNOWN period (`-nosearch`) -- the reference a

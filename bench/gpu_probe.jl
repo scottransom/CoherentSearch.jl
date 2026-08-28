@@ -14,7 +14,7 @@
 #      measured and accuracy-checked against cuFFT.
 #
 # (3) exists because the staged GPU pipeline is transform-dominated (see
-# `gpu_design.md` §2), so "can we beat cuFFT at n=120?" is the load-bearing
+# `docs/gpu_design.md` §2), so "can we beat cuFFT at n=120?" is the load-bearing
 # question for the whole design.  On a GTX 1080 the answer is a clear NO — the
 # DFT is ~3.5x slower despite using only 5% of the FP32 peak, i.e. it is
 # shared-memory/latency bound, not FLOP bound.  Re-run it on any new card before

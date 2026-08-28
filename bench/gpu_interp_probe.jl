@@ -1,4 +1,4 @@
-# What limits the GPU interpolation kernel?  (`gpu_design.md` §4, stage 1)
+# What limits the GPU interpolation kernel?  (`docs/gpu_design.md` §4, stage 1)
 #
 #   julia --project=<env with CoherentSearch + CUDA> bench/gpu_interp_probe.jl
 #

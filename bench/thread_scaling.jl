@@ -19,7 +19,7 @@
 # is actually deployed multi-threaded.  Production pulsar searches are commonly
 # run one single-threaded process per DM, in which case the figure that governs
 # throughput is the `-t 1` CPU-seconds column, not the speedup curve.  See §3 of
-# Summary_and_Future_Work.md.
+# docs/Summary_and_Future_Work.md.
 
 using CoherentSearch
 using Base.Threads: nthreads

@@ -1,4 +1,4 @@
-# GPU backend tests — the stage-1 equivalence gate of `gpu_design.md` §5.
+# GPU backend tests — the stage-1 equivalence gate of `docs/gpu_design.md` §5.
 #
 # **Skipped unless CUDA is loadable AND functional.**  CUDA is a weak dependency,
 # so an ordinary `Pkg.test()` does not have it and these are silently skipped;
@@ -108,7 +108,7 @@ else
     end
 
     # ------------------------------------------------------------------
-    # Coalesced boxcar staging (gpu_design.md 4.15).  Reading the tile through
+    # Coalesced boxcar staging (docs/gpu_design.md 4.15).  Reading the tile through
     # coalesced loads instead of a per-thread stride-`nbins` gather changes the
     # ACCESS PATTERN and nothing else: the wrap is materialised in shared and the
     # prefix reads each slot before overwriting it, so the running accumulation
@@ -151,7 +151,7 @@ else
     end
 
     # ------------------------------------------------------------------
-    # The fused transpose (gpu_design.md 4.15).  Reading `ftprofs` once for all
+    # The fused transpose (docs/gpu_design.md 4.15).  Reading `ftprofs` once for all
     # six rungs instead of once per rung is a pure re-indexing -- no arithmetic
     # at all -- so the two kernels must agree BIT-EXACTLY, not within the 1e-5
     # this file uses elsewhere.  Anything less is an indexing bug, and the index
@@ -179,7 +179,7 @@ else
     end
 
     # ------------------------------------------------------------------
-    # Zeroing only the inactive columns (gpu_design.md 4.15) rests on a PREMISE:
+    # Zeroing only the inactive columns (docs/gpu_design.md 4.15) rests on a PREMISE:
     # that `_interp_kernel!` writes every trial `1:n` of every active harmonic,
     # so those columns need no pre-zeroing and only the ones that gave up (plus
     # the never-written DC column) do.  If that ever stops holding, the search
@@ -213,7 +213,7 @@ else
     end
 
     # ------------------------------------------------------------------
-    # Transform sub-batching (gpu_design.md 4.9).  Splitting a rung's batched
+    # Transform sub-batching (docs/gpu_design.md 4.9).  Splitting a rung's batched
     # transform into column blocks is a SCHEDULING change: every column's
     # transform is independent, so the profiles must come back bit-identical,
     # not merely within the 1e-5 pin the rest of this file uses.  Anything less
@@ -254,7 +254,7 @@ else
         ada = cols(40 * 2^20)
         @test all(<(262144), ada)                  # RTX 4000 Ada: on at every rung
         @test issorted(ada)                        # deep folds want SMALLER batches
-        # Within 1.35x of gpu_design.md 0.3's independently measured optima.
+        # Within 1.35x of docs/gpu_design.md 0.3's independently measured optima.
         for (d, m) in zip(ada, (16384, 32768, 65536, 65536, 131072, 131072))
             @test 1/1.35 < d / m < 1.35
         end
@@ -264,7 +264,7 @@ else
     end
 
     # ------------------------------------------------------------------
-    # The cross-file throughput cache (gpu_design.md 4.6).  `chunk_profiles`
+    # The cross-file throughput cache (docs/gpu_design.md 4.6).  `chunk_profiles`
     # above builds a `GPUChunk` directly and so never touches it -- only
     # `_region!`, i.e. a full `search`, goes through the cache.  These are the
     # only tests that do.
