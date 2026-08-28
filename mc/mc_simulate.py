@@ -57,6 +57,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -569,6 +570,19 @@ def main(argv=None):
                  rednoise=which("rednoise", None, extra),
                  prepfold=which("prepfold", None, extra),
                  accelsearch=which("accelsearch", None, extra))
+
+    # A plain SIGTERM (a `pkill`, or the batch system) does not raise in Python,
+    # so the `finally` that removes the scratch directory never runs and each
+    # killed worker leaks ~400 MB of /dev/shm.  Two restarts during setup left 96
+    # orphaned directories behind.  Turning the signal into SystemExit makes the
+    # cleanup path run on the way out.
+    def _bye(signum, frame):
+        raise SystemExit(f"terminated by signal {signum}")
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        try:
+            signal.signal(sig, _bye)
+        except (ValueError, OSError):
+            pass
 
     workdir = args.workdir or ("/dev/shm" if os.path.isdir("/dev/shm") else "/tmp")
     workdir = os.path.join(workdir, f"mcsim_{os.getpid()}")
