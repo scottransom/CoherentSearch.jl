@@ -367,15 +367,29 @@ def realisation(idx, args, pop, tools, seedseq):
 def _search_all(rec, draws, stem, args, tools, T):
     inj = [dict(f0=d["f0"]) for d in draws]
     tol = args.tol_bins
+    # **Run every PRESTO tool with cwd = the work directory, and give it BARE
+    # NAMES.**  `rednoise` writes `<stem>_red.inf` into the CURRENT DIRECTORY
+    # rather than beside its input, so with the driver launched from the repo
+    # the .fft landed in the work directory and its .inf did not -- and
+    # `coherent_search` then died with "The .inf file ... was not found" on every
+    # single realisation while the other three codes carried on, which reads as a
+    # 0% detection fraction rather than as a crash.  It also littered the repo
+    # root with one stray file per realisation.
+    wd = os.path.dirname(stem)
+    base = os.path.basename(stem)
 
     # --- FFT + de-redden ---------------------------------------------------
     # `rednoise` also NORMALISES the powers to mean 1 (verified: 1.0004 on white
     # noise), which is what our analytic sigma requires.  accelsearch gets the
     # raw .fft -- it does its own local normalisation.
-    t, _, _, rc = run([tools["realfft"], stem + ".dat"])
+    t, _, _, rc = run([tools["realfft"], base + ".dat"], cwd=wd)
     rec["timing"]["realfft"] = t
-    t, _, _, rc = run([tools["rednoise"], stem + ".fft"])
+    t, _, _, rc = run([tools["rednoise"], base + ".fft"], cwd=wd)
     rec["timing"]["rednoise"] = t
+    # Belt and braces: if a PRESTO build still does not produce it, the search
+    # cannot run, and a missing .inf must not be allowed to look like a miss.
+    if not os.path.isfile(stem + "_red.inf") and os.path.isfile(stem + ".inf"):
+        shutil.copyfile(stem + ".inf", stem + "_red.inf")
 
     # --- prepfold, one fold per injection at the KNOWN period ---------------
     pf = []
@@ -383,13 +397,13 @@ def _search_all(rec, draws, stem, args, tools, T):
     for i, d in enumerate(draws):
         o = f"{stem}_pf{i}"
         cmd = [tools["prepfold"], "-f", repr(d["f0"]), "-nosearch", "-fine",
-               "-noxwin", "-nopdsearch", "-o", o]
+               "-noxwin", "-nopdsearch", "-o", os.path.basename(o)]
         # PRESTO picks its own bin count for short periods (it cannot exceed
         # P/dt); 128 is the right fixed choice for everything slower.
         if not d["msp"]:
             cmd += ["-n", "128"]
-        cmd += [stem + ".dat"]
-        dtm, _, _, rc = run(cmd)
+        cmd += [base + ".dat"]
+        dtm, _, _, rc = run(cmd, cwd=wd)
         t_pf += dtm
         best = glob.glob(o + "*.bestprof")
         if rc != 0 or not best:
@@ -403,7 +417,7 @@ def _search_all(rec, draws, stem, args, tools, T):
 
     # --- accelsearch --------------------------------------------------------
     t, _, _, rc = run([tools["accelsearch"], "-numharm", "16", "-zmax", "0",
-                       "-sigma", str(args.accel_sigma), stem + ".fft"])
+                       "-sigma", str(args.accel_sigma), base + ".fft"], cwd=wd)
     rec["timing"]["accelsearch"] = t
     ac = parse_accel(stem + "_ACCEL_0")
     hits, fa = score(ac, inj, T, tol)
@@ -413,7 +427,7 @@ def _search_all(rec, draws, stem, args, tools, T):
     def rseek(cfg):
         return run([tools["rseek"], "--Pmin", repr(cfg["Pmin"]), "--Pmax", repr(cfg["Pmax"]),
                     "--bmin", str(cfg["bmin"]), "--bmax", str(cfg["bmax"]),
-                    "--smin", str(args.rseek_smin), "-f", "presto", stem + ".inf"])
+                    "--smin", str(args.rseek_smin), "-f", "presto", base + ".inf"], cwd=wd)
     t, out, _, rc = rseek(RSEEK_A)
     rec["timing"]["rseek_A"] = t
     rs = parse_rseek(out) if rc == 0 else []
@@ -495,12 +509,31 @@ def main(argv=None):
     ap.add_argument("--workdir", default=None, help="scratch for the ~200 MB of transient files per realisation (default: /dev/shm if present)")
     ap.add_argument("--tpa", default=None, help="TPA table_1.csv; without it the recorded quantiles are used")
     ap.add_argument("--keep", action="store_true")
+    ap.add_argument("--nothreadpin", action="store_true",
+                    help="do NOT pin the child thread pools to 1 (see below)")
     ap.add_argument("--julia", default="julia")
     ap.add_argument("--presto-bin", default=None, help="directory holding realfft/rednoise/prepfold/accelsearch")
     ap.add_argument("--rseek", default=None)
     args = ap.parse_args(argv)
 
     os.makedirs(args.outdir, exist_ok=True)
+
+    # Pin every child's thread pool to 1, inherited through the environment.
+    #
+    # The parallelism here is one single-threaded worker per core, so a child
+    # that helpfully spawns a pool per process is pure contention.  Measured on
+    # bla0 (48 cores, 96 threads): rseek's numpy/BLAS ran **96 threads per
+    # worker** at ~240% CPU, and 48 of those put the load average at 350.
+    #
+    # `compare/compare_riptide.py` records that pinning riptide's pools changed
+    # its wall clock by less than the run-to-run scatter -- but that was ONE
+    # process on a 4-core laptop, which is the opposite regime.  Do not read
+    # that note as covering this case.
+    if not args.nothreadpin:
+        for v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                  "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS",
+                  "BLIS_NUM_THREADS"):
+            os.environ[v] = "1"
 
     if args.workers > 0:
         # Strip `--workers N` as a PAIR.  Filtering out every argument equal to
@@ -576,6 +609,26 @@ def main(argv=None):
                 fh.write(json.dumps(rec) + "\n")
                 print(f"[worker {args.worker}] {n + 1}/{len(idxs)} idx={idx} "
                       f"{time.perf_counter() - t0:.1f}s", flush=True)
+                # ABORT on a search that failed in the FIRST realisation.  A code
+                # that never runs contributes no candidates, which is
+                # indistinguishable from a code that detects nothing -- it shows
+                # up as a 0% detection fraction, not as a crash.  That happened
+                # once already (rednoise writes `_red.inf` into the CWD, so
+                # coherent_search could not find it) and it would otherwise have
+                # burned a whole night.  Better to stop now than to produce a
+                # confident, entirely wrong table in the morning.
+                if n == 0:
+                    dead = [m for m in ("rseek_A", "rseek_B", "coherent")
+                            if m in rec.get("results", {})
+                            and not rec["results"][m].get("ok", True)]
+                    if dead or "error" in rec:
+                        sys.stderr.write(
+                            f"\n*** ABORTING: {dead or rec.get('error')} failed on the "
+                            f"first realisation.  Fix that before running a batch -- a "
+                            f"failing search reads as 0% detection, not as an error.\n")
+                        for m in dead:
+                            sys.stderr.write(rec["results"][m].get("stderr", "")[-1200:] + "\n")
+                        return 2
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
     return 0

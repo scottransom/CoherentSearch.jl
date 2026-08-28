@@ -73,7 +73,16 @@ def rows(recs):
             row["prepfold_ducy"] = (pf or {}).get("ducy")
             for m in SEARCHES:
                 d = res.get(m)
-                h = d["hits"][i] if d and i < len(d["hits"]) else None
+                if d is None:
+                    # The method did not RUN on this realisation (rseek_B only
+                    # runs on a --deep-every subset).  Leave the key ABSENT, so
+                    # the denominator below counts only what it was given: a nan
+                    # would be indistinguishable from "ran and found nothing" and
+                    # would divide a subset method's detections by every
+                    # injection -- which read as 11.4% for rseek_B against
+                    # rseek_A's 81.6% purely from the 1-in-3 duty cycle.
+                    continue
+                h = d["hits"][i] if i < len(d["hits"]) else None
                 row[m] = h["stat"] if h else float("nan")
                 row[m + "_harm"] = h["harmonic"] if h else None
                 row[m + "_ducy"] = h.get("ducy") if h else None
@@ -131,9 +140,13 @@ def table(rws, thr, key=None, edges=None, label=""):
         cells = []
         for m in methods:
             t = thr.get(m, thr.get("_default", 6.0))
-            v = np.array([r.get(m, float("nan")) for r in g], dtype=float)
-            det = np.nansum(v >= t) if np.isfinite(v).any() else 0
-            cells.append(f"{100.0 * det / len(g):11.1f}% ")
+            # Denominator is the injections this METHOD saw, not all of them.
+            v = np.array([r[m] for r in g if m in r], dtype=float)
+            if len(v) == 0:
+                cells.append(f"{'--':>12} ")
+                continue
+            det = int(np.nansum(v >= t))
+            cells.append(f"{100.0 * det / len(v):10.1f}%{'*' if len(v) < len(g) else ' '}")
         print(f"{label}{name:>{16 - len(label)}} " + " ".join(cells) + f"   {len(g):>6}")
 
 
@@ -193,6 +206,9 @@ def main(argv=None):
     print("\noverall:")
     table(rws, thr)
 
+    print("  (* = this method ran on only a subset of realisations, e.g. rseek_B "
+          "under --deep-every;\n     its column is a fraction of what IT saw, not of "
+          "every injection)")
     nh = sum(1 for r in rws for m in SEARCHES
              if r.get(m + "_harm") not in (None, "1"))
     print(f"\n{nh} detections were at a harmonic ratio rather than the fundamental "

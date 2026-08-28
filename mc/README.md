@@ -7,7 +7,7 @@ Combining and tabulating: `mc_analyze.py`.
 ## Running it
 
 ```sh
-PIXI=/data1/environments/pixiPSR/.pixi/envs/default/bin   # or the laptop's
+PIXI=/home/sransom/envs/pulsars/.pixi/envs/default/bin    # bla0; fitzroy and the laptop differ
 
 # fill a machine: N independent workers partitioning the realisation index space
 $PIXI/python mc/mc_simulate.py --outdir mcout --nreal 100000 --workers 48 \
@@ -15,7 +15,15 @@ $PIXI/python mc/mc_simulate.py --outdir mcout --nreal 100000 --workers 48 \
 
 # look at what came out (combining runs is `cat`; this globs *.jsonl)
 $PIXI/python mc/mc_analyze.py mcout/ --fap 1e-2 --by ducy
+
+# one page of diagnostic plots
+$PIXI/python mc/mc_quicklook.py mcout/ --fap 1e-2 -o quicklook.png
 ```
+
+**Always pass `--fap`.** Without it every code is cut at the same nominal value,
+which is not a comparison: ours and rseek's statistics are single-trial,
+accelsearch's sigma is already trials-corrected and prepfold's is a chi-squared.
+Both scripts warn when you leave it off.
 
 `--tpa` wants the MeerKAT TPA supplementary `table_1.csv`
 (`stab2775_supplemental_file.zip`). Without it the sampler falls back to the
@@ -105,3 +113,18 @@ at ~1.7 GB RSS, and each realisation holds ~200 MB of transient files in
 `--workdir` (default `/dev/shm`). At 48 workers that is ~10 GB of scratch plus up
 to ~80 GB of RSS if every worker hits a deep range at once. Lower
 `--deep-every`, or `--workers`, if that is tight.
+
+## Two failure modes this has already hit
+
+* **`rednoise` writes `<stem>_red.inf` into the CURRENT DIRECTORY**, not beside
+  its input. Every PRESTO tool is therefore run with `cwd` set to the work
+  directory. Before that fix `coherent_search` died with "The .inf file ... was
+  not found" on every realisation while the other three codes carried on — which
+  reads as a **0% detection fraction, not as a crash** — and the driver littered
+  the repo root with one stray file per realisation. `mc_simulate.py` now aborts
+  if any search fails on a worker's *first* realisation, precisely so this class
+  of thing cannot burn a night again.
+* **A method that runs on only a subset must not be divided by every injection.**
+  `rseek_B` runs under `--deep-every`, and counting its detections against all
+  injections made it read 11.4% where it is really 95%. Columns from a subset are
+  marked `*` in `mc_analyze.py`.
