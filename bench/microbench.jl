@@ -53,10 +53,11 @@ let profs = ws.profs, nbins = 2nharms,
 
     sigma = CS._block_sigma(profs, nbins, Nprof, sigbuf)
     invsigma = sigma > 0 ? 1.0 / sigma : 0.0
+    bcshape = CS._snr1_shape(nbins, widths)
     function boxcar_all(profs, psum, widths, nbins, invsigma, n)
         s = 0.0
         @inbounds for j in 1:n
-            s += CS._profile_boxcar(profs, j, psum, widths, nbins, invsigma)
+            s += CS._profile_boxcar(profs, j, psum, widths, nbins, invsigma, bcshape)
         end
         s
     end

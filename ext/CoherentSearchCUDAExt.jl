@@ -15,7 +15,7 @@ using CoherentSearch, CUDA
 using CoherentSearch: SearchBackend, SearchParams, FFTFile, DirectPlan, Candidate,
                       _GPU_PHASE_NS, _GPU_TIMING, _GPU_SUBBATCH,
                       build_direct_plans, DIRECT_GROUP_V, ladder_boxcar_widths,
-                      _analytic_sigma, _render_progress
+                      _analytic_sigma, _boxcar_shape!, _render_progress
 using LinearAlgebra: mul!
 using CUDA.CUFFT: plan_brfft
 # `import`, not `using`: extending a function from another module requires the
@@ -468,6 +468,13 @@ struct GPUChunk{WT,P}
     nblocks::Vector{Int}                  # 1 == not sub-batched
     widths::Vector{CuVector{Int32}}       # per rung, the ladder-pruned boxcar bank
     hwidths::Vector{Vector{Int}}          # host copies
+    # Per rung, the per-width boxcar normaliser `invsigma * shape[i]` that the
+    # kernels index directly.  It depends on WHICH harmonics survived Nyquist
+    # (`_boxcar_shape!`), which no thread can see, so the host builds it and
+    # uploads only when the fill count moves -- `shapeH` is that cache key.
+    invsws::Vector{CuVector{Float32}}
+    hinvsw::Vector{Vector{Float64}}       # host scratch
+    shapeH::Vector{Int}                   # fill count each `invsws` was built for
 end
 
 function GPUChunk(::Type{WT}, params::SearchParams, Nprof::Integer;
@@ -488,6 +495,8 @@ function GPUChunk(::Type{WT}, params::SearchParams, Nprof::Integer;
     subs = Int[]; tails = Int[]; nblocks = Int[]
     hwidths = Vector{Int}[]
     widths = CuVector{Int32}[]
+    invsws = CuVector{Float32}[]
+    hinvsw = Vector{Float64}[]
     for (i, k) in enumerate(ks)
         src = CUDA.zeros(Complex{WT}, Hk[i] + 1, Nprof)
         push!(cpulayout, src)
@@ -509,10 +518,41 @@ function GPUChunk(::Type{WT}, params::SearchParams, Nprof::Integer;
         w = ladder_boxcar_widths(2Hk[i], k, params)
         push!(hwidths, w)
         push!(widths, CuArray(Int32.(w)))
+        push!(invsws, CUDA.zeros(Float32, length(w)))
+        push!(hinvsw, Vector{Float64}(undef, length(w)))
     end
     pl = [p for p in plans]; tpl = eltype(pl)[p for p in tailplans]
     return GPUChunk{WT,eltype(pl)}(Int(Nprof), ks, Hk, ftprofs, cpulayout, profs,
-                                   pl, tpl, subs, tails, nblocks, widths, hwidths)
+                                   pl, tpl, subs, tails, nblocks, widths, hwidths,
+                                   invsws, hinvsw, fill(-1, length(ks)))
+end
+
+"""
+    refresh_invsws!(gc, i, k, Hk, filled, invsigma) -> CuVector{Float32}
+
+Rebuild rung `i`'s per-width boxcar normaliser and upload it, but only when this
+chunk's fill count has changed.  Mirrors the CPU's `_refresh_shape!` exactly,
+including the reason keying on the count is enough: failure to fill is monotone
+in harmonic number, so the filled set is always a prefix.
+
+The product `invsigma * shape` is what the kernels want, and under `--gpu`'s
+required `sigma = :analytic` it collapses to `1/sqrt(var(S_w))` — the `sigma`
+cancels — so this changes only where the band crosses a Nyquist knee.
+"""
+function refresh_invsws!(gc::GPUChunk, i::Integer, k::Integer, Hk::Integer,
+                         filled::Vector{Bool}, invsigma::Real)
+    nf = 0
+    @inbounds for j in 1:Hk
+        filled[j * k] && (nf += 1)
+    end
+    if gc.shapeH[i] != nf
+        h = gc.hinvsw[i]
+        _boxcar_shape!(h, 2Int(Hk), gc.hwidths[i], filled, Int(k), Int(Hk))
+        h .*= invsigma
+        copyto!(gc.invsws[i], Float32.(h))
+        gc.shapeH[i] = nf
+    end
+    return gc.invsws[i]
 end
 
 """
@@ -661,7 +701,7 @@ end
     (Int(nbins) + Int(wmax) + 1) * (COAL ? Int(B) + 1 : Int(B))
 
 function _boxcar_kernel!(out, profs, n::Int32, nbins::Int32, wmax::Int32,
-                         widths, nw::Int32, invsigma::Float32, ::Val{B},
+                         widths, nw::Int32, invsws, ::Val{B},
                          ::Val{COAL}) where {B,COAL}
     tid = threadIdx().x
     j0 = (blockIdx().x - Int32(1)) * Int32(B)
@@ -685,7 +725,7 @@ function _boxcar_kernel!(out, profs, n::Int32, nbins::Int32, wmax::Int32,
         for wi in Int32(1):nw
             w = widths[wi]
             duty = Float32(w) / Float32(nbins)
-            invsw = invsigma / sqrt(Float32(w) * (1.0f0 - duty))
+            invsw = invsws[wi]              # = invsigma*shape[wi]; see `_boxcar_shape!`
             m = ps[w * S + tid] - ps[tid]                   # finite seed, as on the CPU
             for p in Int32(2):nbins
                 o = (p - Int32(1)) * S + tid
@@ -713,7 +753,7 @@ end
 #
 # Same arithmetic and same operation order per profile as `_boxcar_scan`.
 function _boxcar_slide_kernel!(out, profs, n::Int32, nbins::Int32,
-                               widths, nw::Int32, invsigma::Float32)
+                               widths, nw::Int32, invsws)
     j = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     j <= n || return nothing
     @inbounds begin
@@ -725,7 +765,7 @@ function _boxcar_slide_kernel!(out, profs, n::Int32, nbins::Int32,
         for wi in Int32(1):nw
             w = widths[wi]
             duty = Float32(w) / Float32(nbins)
-            invsw = invsigma / sqrt(Float32(w) * (1.0f0 - duty))
+            invsw = invsws[wi]              # = invsigma*shape[wi]; see `_boxcar_shape!`
             S = 0.0f0
             for i in Int32(1):w
                 S += profs[i, j]
@@ -760,7 +800,7 @@ end
     ntuple(i -> (@inbounds d = ps[o + ws[i]] - base; ifelse(d > m[i], d, m[i])), Val(NW))
 
 function _boxcar_fused_kernel!(out, profs, n::Int32, nbins::Int32, wmax::Int32,
-                               widths, invsigma::Float32, ::Val{B},
+                               widths, invsws, ::Val{B},
                                ::Val{NW}, ::Val{COAL}) where {B,NW,COAL}
     tid = threadIdx().x
     j0 = (blockIdx().x - Int32(1)) * Int32(B)
@@ -788,7 +828,7 @@ function _boxcar_fused_kernel!(out, profs, n::Int32, nbins::Int32, wmax::Int32,
         for i in Int32(1):NW
             w = widths[i]
             duty = Float32(w) / Float32(nbins)
-            invsw = invsigma / sqrt(Float32(w) * (1.0f0 - duty))
+            invsw = invsws[i]               # = invsigma*shape[i]; see `_boxcar_shape!`
             c = (m[i] - duty * stot) * invsw
             best = ifelse(c > best, c, best)
         end
@@ -803,29 +843,29 @@ const _GPU_BC_COALESCED = false  # measured 1.55x SLOWER on a GTX 1080; see abov
 
 function gpu_boxcar!(out, profs::CuMatrix, n::Integer,
                      nbins::Integer, widths::CuVector{Int32}, wmax::Integer,
-                     invsigma::Real; B::Integer = _GPU_BC_B,
+                     invsws::CuVector{Float32}; B::Integer = _GPU_BC_B,
                      variant::Integer = _GPU_BC_VARIANT,
                      coalesced::Bool = _GPU_BC_COALESCED)
     if variant == 2
         @cuda threads = B blocks = cld(n, B) _boxcar_slide_kernel!(
             out, profs, Int32(n), Int32(nbins), widths,
-            Int32(length(widths)), Float32(invsigma))
+            Int32(length(widths)), invsws)
         return out
     end
     shmem = _bc_shmem(nbins, wmax, B, coalesced) * sizeof(Float32)
     C = coalesced ? Val(true) : Val(false)
     if variant == 3
         nw = length(widths)
-        nw <= 8 || return gpu_boxcar!(out, profs, n, nbins, widths, wmax, invsigma;
+        nw <= 8 || return gpu_boxcar!(out, profs, n, nbins, widths, wmax, invsws;
                                       B = B, variant = 1, coalesced = coalesced)
-        _bcf_launch!(out, profs, n, nbins, wmax, widths, invsigma, shmem,
+        _bcf_launch!(out, profs, n, nbins, wmax, widths, invsws, shmem,
                      Val(Int(B)), Val(nw), C)
         return out
     end
-    B == 32 ? _bc_launch!(out, profs, n, nbins, wmax, widths, invsigma, shmem, Val(32), C) :
-    B == 64 ? _bc_launch!(out, profs, n, nbins, wmax, widths, invsigma, shmem, Val(64), C) :
-    B == 128 ? _bc_launch!(out, profs, n, nbins, wmax, widths, invsigma, shmem, Val(128), C) :
-    B == 256 ? _bc_launch!(out, profs, n, nbins, wmax, widths, invsigma, shmem, Val(256), C) :
+    B == 32 ? _bc_launch!(out, profs, n, nbins, wmax, widths, invsws, shmem, Val(32), C) :
+    B == 64 ? _bc_launch!(out, profs, n, nbins, wmax, widths, invsws, shmem, Val(64), C) :
+    B == 128 ? _bc_launch!(out, profs, n, nbins, wmax, widths, invsws, shmem, Val(128), C) :
+    B == 256 ? _bc_launch!(out, profs, n, nbins, wmax, widths, invsws, shmem, Val(256), C) :
     throw(ArgumentError("unsupported boxcar block size $B"))
     return out
 end
@@ -833,18 +873,18 @@ end
 # `B` must reach the kernel as a `Val`: the shared-array offsets are computed
 # from it in the inner loop, and with a runtime `Int` they are not folded.  Same
 # trap `_BC_BATCH` and `DIRECT_GROUP_V` document on the CPU side.
-@inline function _bcf_launch!(out, profs, n, nbins, wmax, widths, invsigma, shmem,
+@inline function _bcf_launch!(out, profs, n, nbins, wmax, widths, invsws, shmem,
                               ::Val{B}, ::Val{NW}, ::Val{COAL}) where {B,NW,COAL}
     @cuda threads = B blocks = cld(n, B) shmem = shmem _boxcar_fused_kernel!(
         out, profs, Int32(n), Int32(nbins), Int32(wmax), widths,
-        Float32(invsigma), Val(B), Val(NW), Val(COAL))
+        invsws, Val(B), Val(NW), Val(COAL))
 end
 
-@inline function _bc_launch!(out, profs, n, nbins, wmax, widths, invsigma, shmem,
+@inline function _bc_launch!(out, profs, n, nbins, wmax, widths, invsws, shmem,
                              ::Val{B}, ::Val{COAL}) where {B,COAL}
     @cuda threads = B blocks = cld(n, B) shmem = shmem _boxcar_kernel!(
         out, profs, Int32(n), Int32(nbins), Int32(wmax), widths,
-        Int32(length(widths)), Float32(invsigma), Val(B), Val(COAL))
+        Int32(length(widths)), invsws, Val(B), Val(COAL))
 end
 
 # --- stage-2 equivalence entry points --------------------------------------
@@ -867,7 +907,8 @@ end
 function chunk_boxcar(::CUDABackend, ft::FFTFile, params::SearchParams,
                       rstart::Real, n::Integer; t0::Integer = 0,
                       weights::Type{<:AbstractFloat} = Float32, k::Integer = 1,
-                      invsigma::Real = 1.0)
+                      invsigma::Real = 1.0,
+                      nfilled::Union{Nothing,Integer} = nothing)
     gc = GPUChunk(weights, params, n)
     plans = build_direct_plans(weights, params, rstart)
     gp = GPUInterpPlan(plans)
@@ -878,8 +919,14 @@ function chunk_boxcar(::CUDABackend, ft::FFTFile, params::SearchParams,
     fill_stacks!(gc, n)
     transform!(gc, i)
     out = CUDA.zeros(Float32, n)
+    # Matches `chunk_boxcar(::CPUBackend, ...)`: the default assumes nothing was
+    # lost to Nyquist, which holds for the bands the CPU/GPU comparisons use.
+    nf = nfilled === nothing ? gc.Hk[i] : Int(nfilled)
+    invsws = refresh_invsws!(gc, i, k, gc.Hk[i],
+                             [j <= nf * k && j % k == 0 for j in 1:params.nharms],
+                             invsigma)
     gpu_boxcar!(out, gc.profs[i], n, 2gc.Hk[i], gc.widths[i],
-                gc.hwidths[i][end], invsigma)
+                gc.hwidths[i][end], invsws)
     return Float64.(Array(out))
 end
 
@@ -1446,8 +1493,9 @@ function _region!(::CUDABackend, ft::FFTFile, params::SearchParams,
             nvalid == 0 && continue
             sig = _analytic_sigma(filled, k, Hk)
             invsig = sig > 0 ? 1.0 / sig : 0.0
+            invsws = refresh_invsws!(gc, i, k, Hk, filled, invsig)
             gpu_boxcar!(view(out, :, i, b), gc.profs[i], nvalid, 2Hk, gc.widths[i],
-                        gc.hwidths[i][end], invsig)
+                        gc.hwidths[i][end], invsws)
         end
         end
         rstarts[b] = rstart

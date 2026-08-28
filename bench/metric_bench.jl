@@ -86,15 +86,18 @@ function main()
         P = eltype(f.profs)
         invs = one(P) / P(sig)          # the search's own type, not always Float64
         invt = CS._BC_TILE(invs)
+        # Timing only, so the normalisation just has to be the right SHAPE of
+        # work; `_snr1_shape` is one float per width, same as the real one.
+        bcshape = CS._snr1_shape(f.nbins, f.widths)
         t_sig = us(@benchmark CS._block_sigma($(f.profs), $(f.nbins), $NPROF, $(f.bcsig)) evals=1 samples=100)
         t_tr  = us(@benchmark transpose_only!($(f.bb), $(f.profs), $NPROF, $(f.nbins)) evals=1 samples=100)
         t_sc  = us(@benchmark scan_only!($(f.bb), $NPROF, $(f.widths), $(f.nbins), $invt) evals=1 samples=100)
         t_g   = us(@benchmark CS._boxcar_gate!($(f.bb), $(f.profs), $NPROF, $(f.psum),
-                                               $(f.widths), $(f.nbins), $invs) evals=1 samples=100)
+                                               $(f.widths), $(f.nbins), $invs, $bcshape) evals=1 samples=100)
         t_m   = us(@benchmark CS.boxcar_metrics!($(f.bb), $(f.profs), $NPROF,
                                                  $(f.psum), $(f.widths), $(f.nbins), $invs,
-                                                 $exactcut) evals=1 samples=100)
-        CS._boxcar_gate!(f.bb, f.profs, NPROF, f.psum, f.widths, f.nbins, invs)
+                                                 $bcshape, $exactcut) evals=1 samples=100)
+        CS._boxcar_gate!(f.bb, f.profs, NPROF, f.psum, f.widths, f.nbins, invs, bcshape)
         nres = count(>=(exactcut), @view f.bb.mvals[1:NPROF])
         @printf("  %-3d %6d %-26s %8.1f %8.1f %8.1f %8.1f %8.1f %6.2f%%\n",
                 f.k, f.nbins, string(f.widths), t_sig, t_tr, t_sc, t_g, t_m,

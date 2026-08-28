@@ -59,6 +59,12 @@ gp = Ext.GPUInterpPlan(plans)
 
 for Nprof in nprofs
     gc = Ext.GPUChunk(WT, params, Nprof)
+    # The kernels index a per-width normaliser the host builds (`_boxcar_shape!`);
+    # with nothing lost to Nyquist that is the fully-filled table.  Without this the
+    # device array is still zeros and the timings would be measured on garbage.
+    for i in eachindex(gc.ks)
+        Ext.refresh_invsws!(gc, i, gc.ks[i], gc.Hk[i], fill(true, params.nharms), 1.0)
+    end
     out = CUDA.zeros(Float32, Nprof)
     reps = BENCH_TRIALS / Nprof                     # chunks in the reference workload
 
@@ -73,7 +79,7 @@ for Nprof in nprofs
     t_box = bestof(function ()
         for i in eachindex(gc.ks)
             Ext.gpu_boxcar!(out, gc.profs[i], Nprof, 2gc.Hk[i], gc.widths[i],
-                            gc.hwidths[i][end], 1.0f0)
+                            gc.invsws[i])
         end
     end)
     tot = (t_interp + t_stack + t_xform + t_box) * reps

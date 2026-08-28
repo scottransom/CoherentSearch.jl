@@ -297,6 +297,30 @@ optimisation below (1.84x vs 1.26x on the same code and the same data).
   estimator*, not the S/N definition — but every number in this bullet is one
   pulsar in one observation, so treat them as anecdotes and let §3.2's Monte
   Carlo decide anything about sensitivity.
+- **AMENDED 2026-08-28 — read this before quoting the bullet below.** The
+  production statistic is `snr1` **renormalised for the band-limited covariance
+  of a Fourier-domain fold**, and that is a real difference, not a formality.
+  `snr1` divides by `σ√(w(1−δ))`, correct only for *independent* profile bins;
+  riptide's are (time-domain fold), ours are not (the `brfft` of a harmonic stack
+  with rows past the last filled harmonic left zero). **The 1.4e-7 agreement was
+  measured by handing both codes the SAME profile — precisely the test that
+  cannot see this.** `_boxcar_shape!` now divides by the exact
+  `var(S_w) = 2Σ_{j filled}|D_j|² + ½|D_{nbins/2}|²` (Dirichlet kernel `D_j`),
+  validated against 100k simulated noise profiles in all 60 (nbins, H, w) cells
+  to ~0.2%. It fixed **two** biases: (a) past a Nyquist knee the old statistic
+  inflated by ~`√(nbins/2H)` — on pure noise the peak over a 1 Hz band ran 5.32
+  at 20 Hz against **9.09 at 500 Hz**, now 5.28 vs 5.01; (b) even fully sampled
+  it left `1 + 3/(4·nbins)`, so **ladder rungs differed by ~3.4%** (1.006 at 120
+  bins vs 1.040 at the 20 of `k=6`) and shallow rungs won spuriously — measured,
+  a 5%-duty pulsar's winning rung moved `k=5` (24 bins) → `k=2` (60 bins).
+  Reported S/N drops ~0.6% at `k=1` and ~3.3% at `k=6`, so **every S/N recorded
+  in this file predates it and no `.cohout` diff across it is empty.**
+  `snr_metrics` still computes plain `snr1` by default (the oracle pin holds at
+  1.393e-16); `nfilled` selects the production form, which `block_metrics`
+  passes. **The `--gpu` kernels take the same per-width table from the host and
+  were changed with it, but that path is UNTESTED on a device — verify
+  byte-identical candidates on a GPU host before trusting it.** Full account in
+  `Summary_and_Future_Work.md` §3.6.
 - **Our S/N IS riptide's S/N as of 2026-08-24 — same statistic, not merely
   comparable.** `_boxcar_scan`, the Python oracle's `snr_metric` and riptide's
   `cpp/snr.hpp:snr1` all correlate the profile against the width-`w` boxcar made

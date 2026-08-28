@@ -2077,6 +2077,93 @@ checking. A host-dependent number there would have been a bug, not a measurement
 the paper's pseudo-code figure — before being brought into production. That is
 the second time the toy has paid for itself in the same session.
 
+### 3.6 The boxcar's noise scale on a band-limited profile (2026-08-28)
+
+**Found while designing the §3.2 Monte Carlo, and it was in production the whole
+time.** `snr1` divides the width-`w` boxcar sum by `σ·√(w(1−δ))`, which is right
+only when the profile's phase bins are **independent**. riptide's are: it folds in
+the time domain, so each bin sums a disjoint set of samples. Ours are not — our
+profile is the unnormalised `brfft` of a harmonic stack with DC held at zero and
+every row past the last filled harmonic left zero, i.e. **band-limited**, and
+band-limited noise is correlated between bins. The `1.4e-7` agreement with the
+`rseek` binary recorded in §3.4 was measured by handing both codes *the same
+profile*, which is exactly the test that cannot see this.
+
+**Symptom, on pure noise.** Same trial count per 1 Hz band, `--maxdecim 1`,
+`dt = 60 µs` so harmonic 60 crosses Nyquist at 138.9 Hz. Peak S/N, and trials
+above 5, before → after:
+
+| band | before | after | trials ≥ 5 |
+|---|---|---|---|
+| 20–21 Hz | 5.32 | 5.28 | 24 → 18 |
+| 100–101 Hz | 5.59 | 5.55 | 26 → 24 |
+| 271–272 Hz | **7.57** | **5.56** | 4112 → 11 |
+| 500–501 Hz | **9.09** | **5.01** | 33116 → 1 |
+
+**The fix is exact, not fitted.** Writing the boxcar as a filter, its response at
+profile harmonic `j` is the Dirichlet kernel `D_j = sin(πjw/nbins)/sin(πj/nbins)`,
+and each filled harmonic contributes independent real and imaginary parts of
+variance 1/2, so in the units `_analytic_sigma` counts
+
+    var(S_w) = 2·Σ_{j filled, j < nbins/2} |D_j|²  +  (1/2)·|D_{nbins/2}|²
+
+with the last term present only when the profile's own Nyquist harmonic is
+filled. `_boxcar_shape!` builds `σ/√(var(S_w))` per width; `_boxcar_scan` then
+forms `S_w · invsigma · shape[i]`. The `δ·S_tot` term contributes nothing to the
+variance because DC is held at zero, making `S_tot ≡ 0` identically.
+
+Validated against 100k noise profiles built through the shipped `brfft`, at
+`nbins ∈ {120, 40, 20}` × six fill counts: **predicted and measured agree inside
+the ~0.2% Monte-Carlo error in all 60 cells.**
+
+**It fixes two biases, and only the first was being looked for.**
+
+* **Nyquist truncation**, above. Inflation ≈ `√(nbins/2H)`: measured
+  per-(phase,width) sd 1.40 at `H = 30`, 1.90 at `H = 16`, **2.48 at `H = 10`**.
+* **Fold depth, with nothing truncated at all.** At `H = nbins/2` the exact
+  formula does *not* reduce to `√(w(1−δ))`; it leaves ≈ `1 + 3/(4·nbins)` — 1.006
+  at `nbins = 120` but **1.040 at the `nbins = 20` of a `k = 6` rung**. Every
+  ladder rung carried a noise floor ~3.4% different from its neighbours, biasing
+  **which fold depth wins** — the one comparison the boxcar metric and
+  `_analytic_sigma`'s own `√(1−3/(4H))` term exist to keep honest.
+
+**Measured end to end** (injected file, `dt = 60 µs`, defaults, so nothing is
+truncated and this is purely the second bias). Two injections at zero-mean
+matched-filter S/N 9:
+
+| | before | after | Δ |
+|---|---|---|---|
+| 271.234 Hz, `k=6` (20 bins) | 10.01 | 9.68 | −3.3% |
+| 3.7124 Hz pulsar | 10.00 at **`k=5`** (24 bins) | 9.77 at **`k=2`** (60 bins) | −2.3%, **rung moved** |
+| 608 Hz noise, `k=5` | 6.74 | 6.53 | −3.1% |
+| 33.1 / 70.7 Hz noise, `k=1` | 6.39 / 6.23 | 6.35 / 6.19 | −0.6% |
+
+The rung change is the point: with the rungs finally on the same footing, a
+5%-duty pulse is won by a 30-harmonic fold rather than a 12-harmonic one, which
+is the physically right answer. Candidates above 6 went 18 → 13, and
+`total_above_threshold` 248 → 220.
+
+**What this does to §3.4's headline.** "Our S/N **is** riptide's `snr1`" is no
+longer literally true of the production path, and should be stated as: both codes
+use the same zero-mean unit-L2 boxcar matched filter, and ours additionally
+normalises by the exact covariance of *its own* fold. On a fully-sampled profile
+the two differ by the `1 + 3/(4·nbins)` above. `snr_metrics` still computes plain
+`snr1` by default — that is what the Python oracle is pinned to and what
+`test_search.jl`'s longhand-`snr1` test asserts — and takes `nfilled` to select
+the production normalisation, which is what `block_metrics` passes so the
+equivalence gate keeps comparing like with like.
+
+**Pins.** Oracle unchanged at 3.847e-16 / 2.131e-16 / **1.393e-16**; suite 819
+passing (up from 752, the new testset being the noise simulation, the
+`H = nbins/2` residual, rung-`k` indexing, and `_refresh_shape!`'s cache).
+
+**Cost is nil.** The table is `O(Hk · nwidths)` transcendentals, cached on the
+fill count in `_refresh_shape!` — and because failure to fill is monotone in
+harmonic number the filled set is always a prefix, so the count determines it.
+In a normal search it rebuilds a handful of times in total.
+
+---
+
 ## 4. Summary
 
 Phase 1 delivered a correct, parallel, well-tested foundation whose numerical

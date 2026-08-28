@@ -41,6 +41,12 @@ bestof(f, n = 5) = minimum(begin
 end for _ in 1:n)
 
 gc = Ext.GPUChunk(WT, params, Nprof)
+# The kernels index a per-width normaliser the host builds (`_boxcar_shape!`);
+# with nothing lost to Nyquist that is the fully-filled table.  Without this the
+# device array is still zeros and the timings would be measured on garbage.
+for i in eachindex(gc.ks)
+    Ext.refresh_invsws!(gc, i, gc.ks[i], gc.Hk[i], fill(true, params.nharms), 1.0)
+end
 gp = Ext.GPUInterpPlan(build_direct_plans(WT, params, 0.1 * ft.T))
 d = CuArray(ft.amps)
 Ext.gpu_fill_ftprofs!(gc.ftprofs, gp, d, ft, 0, Nprof)
@@ -59,7 +65,7 @@ println("  variant  coal    B     stage (s)   shared/block")
 
 allrungs(B, v, c) = () -> for i in eachindex(gc.ks)
     Ext.gpu_boxcar!(out, gc.profs[i], Nprof, 2gc.Hk[i], gc.widths[i],
-                    gc.hwidths[i][end], 1.0f0; B = B, variant = v, coalesced = c)
+                    gc.invsws[i]; B = B, variant = v, coalesced = c)
 end
 shbytes(B, v, c) = v == 2 ? 0 :
     Ext._bc_shmem(2 * gc.Hk[1], gc.hwidths[1][end], B, c) * 4

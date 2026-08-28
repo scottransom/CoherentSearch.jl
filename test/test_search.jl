@@ -187,11 +187,122 @@ end
     prof = randn(MersenneTwister(5), 60)
     widths = boxcar_widths(60)
     psum = Vector{Float64}(undef, 60 + widths[end] + 1)
+    shape = CS._snr1_shape(60, widths)
     vals = map((0.0, sum(prof) / 60, 37.0, -1.0e3)) do base
         CS._boxcar_psum!(psum, prof, 60, widths[end], base)
-        CS._boxcar_scan(psum, widths, 60, 1.0)
+        CS._boxcar_scan(psum, widths, 60, 1.0, shape)
     end
     @test all(isapprox(v, vals[1]; rtol=1e-10) for v in vals)
+end
+
+# ---------------------------------------------------------------------------
+# The boxcar's own noise scale on a BAND-LIMITED profile.  `snr1`'s
+# `sigma*sqrt(w(1-delta))` is right only for independent profile bins; ours are
+# the brfft of a harmonic stack, so they are correlated, and the statistic was
+# over-normalised -- mildly always, severely once harmonics cross Nyquist.
+# See `_boxcar_shape!` for the derivation and the history.
+# ---------------------------------------------------------------------------
+@testset "boxcar normalisation on a band-limited profile" begin
+    CS = CoherentSearch
+
+    # Build noise profiles exactly as the search does: unnormalised brfft of a
+    # stack with DC = 0, harmonics 1..H filled with Re,Im ~ N(0,1/2), rest zero.
+    function noise_profiles(nbins, H, M, rng)
+        A = zeros(ComplexF64, nbins ÷ 2 + 1, M)
+        for j in 1:H, t in 1:M
+            A[j + 1, t] = complex(randn(rng) / sqrt(2), randn(rng) / sqrt(2))
+        end
+        # `coherent_profiles` is `irfft`; the hot loop uses the UNNORMALISED
+        # `brfft`, and `_analytic_sigma` counts in those units, so scale by nbins.
+        return CS.coherent_profiles(A, nbins) .* nbins
+    end
+
+    # The reported statistic must be unit-variance per (phase, width).  A single
+    # FIXED phase is scored, not the max over phase: this is a statement about
+    # the variance, and a max would be an extreme value instead.
+    rng = MersenneTwister(20260828)
+    M = 20_000
+    for (nbins, H) in ((120, 60), (120, 30), (120, 10), (40, 20), (20, 10), (20, 4))
+        P = noise_profiles(nbins, H, M, rng)
+        filled = [j <= H for j in 1:(nbins ÷ 2)]
+        widths = boxcar_widths(nbins)
+        shape = CS._boxcar_shape!(Vector{Float64}(undef, length(widths)), nbins,
+                                  widths, filled, 1, nbins ÷ 2)
+        sigma = CS._analytic_sigma(filled, 1, nbins ÷ 2)
+        psum = Vector{Float64}(undef, nbins + widths[end] + 1)
+        for (i, w) in enumerate(widths)
+            vals = Vector{Float64}(undef, M)
+            for t in 1:M
+                CS._boxcar_psum!(psum, view(P, :, t), nbins, widths[end], 0.0)
+                stot = psum[nbins + 1] - psum[1]
+                vals[t] = ((psum[1 + w] - psum[1]) - (w / nbins) * stot) *
+                          (1 / sigma) * shape[i]
+            end
+            sd = sqrt(sum(abs2, vals .- sum(vals) / M) / (M - 1))
+            # 3% covers the ~1.6% Monte-Carlo error on an sd at M = 20k plus slack.
+            @test isapprox(sd, 1.0; atol = 0.03)
+        end
+    end
+
+    # The correction is NOT only about Nyquist truncation: with every harmonic
+    # filled it still differs from `snr1`, by about `1 + 3/(4*nbins)` for w >= 2.
+    # That term is fold-depth dependent -- 1.006 at nbins=120 against 1.040 at
+    # the nbins=20 of a k=6 rung -- so leaving it out biased which rung of the
+    # ladder wins.  Pinned explicitly so it cannot quietly come back.
+    for nbins in (120, 40, 20)
+        widths = boxcar_widths(nbins)
+        full = fill(true, nbins ÷ 2)
+        got = CS._boxcar_shape!(Vector{Float64}(undef, length(widths)), nbins,
+                                widths, full, 1, nbins ÷ 2)
+        snr1 = CS._snr1_shape(nbins, widths)
+        for (i, w) in enumerate(widths)
+            w == 1 && continue
+            @test isapprox(snr1[i] / got[i], 1 + 3 / (4 * nbins); rtol = 0.02)
+        end
+    end
+
+    # Truncated, the inflation `snr1` would have produced grows as sqrt(nh/H).
+    let nbins = 120, widths = boxcar_widths(120), snr1 = CS._snr1_shape(120, widths)
+        for H in (30, 20, 16, 10)
+            filled = [j <= H for j in 1:60]
+            got = CS._boxcar_shape!(Vector{Float64}(undef, length(widths)), nbins,
+                                    widths, filled, 1, 60)
+            @test isapprox(snr1[end] / got[end], sqrt(60 / H); rtol = 0.06)
+        end
+    end
+
+    # A decimated rung indexes `filled` by BASE harmonic (j*k), which is what
+    # keeps this consistent with `_analytic_sigma`.  With every base harmonic
+    # filled, rung k must agree with a native fold of Hk harmonics.
+    let params = SearchParams(nharms = 60, decimations = decimation_set(60, 6)), nh = 60
+        for k in (2, 3, 4, 6)
+            Hk = fld(nh, k); nbins = 2Hk
+            widths = ladder_boxcar_widths(nbins, k, params)
+            a = CS._boxcar_shape!(Vector{Float64}(undef, length(widths)), nbins,
+                                  widths, fill(true, nh), k, Hk)
+            b = CS._boxcar_shape!(Vector{Float64}(undef, length(widths)), nbins,
+                                  widths, fill(true, Hk), 1, Hk)
+            @test a ≈ b
+        end
+    end
+
+    # `_refresh_shape!` must rebuild when the fill count moves and reuse it when
+    # it does not -- it is keyed on the count, and a stale table would silently
+    # mis-normalise a whole chunk.
+    let nbins = 120, widths = boxcar_widths(120)
+        shape = Vector{Float64}(undef, length(widths)); key = Ref(-1)
+        full = fill(true, 60)
+        CS._refresh_shape!(shape, key, nbins, widths, full, 1, 60)
+        @test key[] == 60
+        want = copy(shape)
+        fill!(shape, NaN)                       # a reuse must NOT recompute
+        CS._refresh_shape!(shape, key, nbins, widths, full, 1, 60)
+        @test all(isnan, shape)
+        cut = [j <= 30 for j in 1:60]
+        CS._refresh_shape!(shape, key, nbins, widths, cut, 1, 60)
+        @test key[] == 30
+        @test !any(isnan, shape) && shape != want
+    end
 end
 
 @testset "remove_duplicates collapses clusters" begin
@@ -444,11 +555,13 @@ if isfile(EXAMPLE_FFT)
         sigma = CS._block_sigma(ws.profs, nbins, Nprof, ws.bcsig)
         invsigma = one(PIN_PROFT) / sigma
 
+        shape = CS._boxcar_shape!(ws.bcshape, nbins, ws.bcwidths, ws.filled, 1,
+                                  params.nharms)
         CS._boxcar_gate!(ws.bcbatch, ws.profs, Nprof, ws.bcpsum, ws.bcwidths,
-                         nbins, PIN_PROFT(invsigma))
+                         nbins, PIN_PROFT(invsigma), shape)
         got = copy(ws.bcbatch.mvals[1:Nprof])
         want = [Float64(CS._profile_boxcar(ws.profs, j, ws.bcpsum, ws.bcwidths,
-                                           nbins, invsigma)) for j in 1:Nprof]
+                                           nbins, invsigma, shape)) for j in 1:Nprof]
         err = maximum(abs.(got .- want))
         @info "batched vs scalar boxcar gate" maxabs=err gatemargin=params.boxcar_gatemargin
         @test err < 1e-3 * params.boxcar_gatemargin

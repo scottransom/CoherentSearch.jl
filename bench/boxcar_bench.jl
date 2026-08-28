@@ -29,12 +29,13 @@ const BS = (16, 32, 48, 64, 96, 128)   # 64 is the production knee; see §3.1
 # --- the scalar reference, per profile column -------------------------------
 function gate_scalar!(out::Vector{Float64}, profs::Matrix{Float64}, n::Int,
                       psum::Vector{Float64}, widths::Vector{Int},
-                      nbins::Int, invsigma::Float64)
+                      nbins::Int, invsigma::Float64,
+                      shape::Vector{Float64} = CS._snr1_shape(nbins, widths))
     wmax = widths[end]
     @inbounds for j in 1:n
         col = @view profs[:, j]
         CS._boxcar_psum!(psum, col, nbins, wmax, 0.0)
-        out[j] = CS._boxcar_scan(psum, widths, nbins, invsigma)
+        out[j] = CS._boxcar_scan(psum, widths, nbins, invsigma, shape)
     end
     return out
 end

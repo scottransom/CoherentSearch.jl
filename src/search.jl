@@ -601,6 +601,125 @@ and `bench/toy_vs_production.jl` is what measures it on real data.
     return sqrt(2 * nlow + 0.5 * nnyq)
 end
 
+"""
+    _boxcar_shape!(shape, nbins, widths, filled, k, Hk) -> shape
+
+Per-width factor `σ / sd(S_w)` turning the block's per-*bin* noise scale into the
+noise scale of the width-`w` boxcar *sum*, written into `shape[i]` for
+`widths[i]`.  [`_boxcar_scan`](@ref) forms `S_w · invsigma · shape[i]`, so this
+is the whole of the statistic's normalisation beyond the per-bin `σ`.
+
+It is **not** `1/√(w(1−δ))`.  That is riptide's `snr1`, and it is right only when
+the profile bins are independent.  riptide's are — it folds in the time domain,
+so each bin sums a disjoint set of samples.  Ours are not: our profile is the
+unnormalised `brfft` of a harmonic stack with DC held at zero and every row past
+`H` left zero, i.e. **band-limited**, and band-limited noise is correlated
+between phase bins.  The `1.4e-7` agreement with the `rseek` binary was measured
+by handing both codes the *same profile*, which is exactly the test that cannot
+see this.
+
+Writing the width-`w` boxcar as a filter, its response at profile harmonic `j` is
+the Dirichlet kernel `D_j = sin(πjw/nbins)/sin(πj/nbins)`, and each filled
+harmonic contributes independent real and imaginary parts of variance 1/2, so —
+in the same units [`_analytic_sigma`](@ref) counts —
+
+    var(S_w) = 2·Σ_{j filled, j < nbins/2} |D_j|²  +  (1/2)·|D_{nbins/2}|²
+
+the last term present only when the profile's own Nyquist harmonic is filled
+(`brfft` keeps just its real part there).  Then `shape = σ / √(var(S_w))`, and
+the `δ·S_tot` term `_boxcar_scan` also applies contributes nothing to the
+variance because DC is held at zero, making `S_tot ≡ 0` identically.
+
+**This fixes two biases, and only the first was looked for.**
+
+  * **Nyquist truncation.**  Where `fill_harmonic_row_direct!` gives up, the row
+    is left zero and the profile is band-limited to `H < nbins/2` harmonics;
+    `snr1`'s `√(w(1−δ))` then under-estimates the boxcar's noise and the reported
+    S/N inflates by roughly `√(nbins/2H)`.  Measured per-(phase,width) sd at
+    `nbins = 120`: 1.40 at `H = 30`, 1.90 at `H = 16`, **2.48 at `H = 10`**.  On
+    pure noise the search's own peak over a 1 Hz band ran 5.32 at 20 Hz against
+    **9.09 at 500 Hz** for this reason alone.
+  * **Fold depth, with nothing truncated at all.**  At `H = nbins/2` the formula
+    does *not* reduce to `√(w(1−δ))`; it leaves a residual of about
+    `1 + 3/(4·nbins)` — 1.006 at `nbins = 120` but **1.040 at the `nbins = 20` of
+    a `k = 6` fold**.  Every ladder rung therefore carried a noise floor ~3.4%
+    different from its neighbours, biasing *which fold depth wins* — the one
+    comparison the boxcar metric and `_analytic_sigma`'s own `√(1−3/(4H))` term
+    exist to keep honest.
+
+Validated against 100k synthetic noise profiles built through the shipped
+`brfft`, at `nbins ∈ {120, 40, 20}` × six fill counts: predicted and measured
+agree inside the ~0.2% Monte-Carlo error in all 60 cells.  `test/test_search.jl`
+pins a smaller version of that check, and pins the `H = nbins/2` residual
+explicitly so the second bias above cannot silently return.
+"""
+function _boxcar_shape!(shape::Vector{Float64}, nbins::Int, widths::Vector{Int},
+                        filled::Vector{Bool}, k::Int, Hk::Int)
+    sigma = _analytic_sigma(filled, k, Hk)
+    @inbounds for (i, w) in enumerate(widths)
+        v = 0.0
+        for j in 1:(Hk - 1)
+            filled[j * k] || continue
+            d = sinpi(j * w / nbins) / sinpi(j / nbins)
+            v += 2 * d * d
+        end
+        if filled[Hk * k]
+            d = sinpi(w / 2)          # D at the profile Nyquist harmonic, nbins = 2Hk
+            v += 0.5 * d * d
+        end
+        shape[i] = (sigma > 0 && v > 0) ? sigma / sqrt(v) : 0.0
+    end
+    return shape
+end
+
+"""
+    _snr1_shape!(shape, nbins, widths) -> shape
+
+The `1/√(w(1−δ))` normalisation of riptide's `snr1` (`cpp/snr.hpp`) and of the
+Python oracle's `snr_metric`: correct for a profile whose bins are independent.
+Kept so [`snr_metrics`](@ref) still computes exactly what the oracle is pinned to
+and what the `rseek` equivalence test asserts — see [`_boxcar_shape!`](@ref) for
+why the production path must not use it.
+"""
+function _snr1_shape!(shape::Vector{Float64}, nbins::Int, widths::Vector{Int})
+    @inbounds for (i, w) in enumerate(widths)
+        shape[i] = 1.0 / sqrt(w * (1.0 - w / nbins))
+    end
+    return shape
+end
+
+_snr1_shape(nbins::Integer, widths::Vector{Int}) =
+    _snr1_shape!(Vector{Float64}(undef, length(widths)), Int(nbins), widths)
+
+"""
+    _refresh_shape!(shape, shapeH, nbins, widths, filled, k, Hk) -> shape
+
+Rebuild `shape` with [`_boxcar_shape!`](@ref) only when this chunk's set of
+filled harmonics has changed, keyed on the count in `shapeH`.
+
+Keying on the *count* is sound because failure to fill is monotone in the
+harmonic number: `fill_harmonic_row_direct!` gives up when the harmonic's bin
+window runs past the amplitudes or past Nyquist, and both bounds move the same
+way with `h`.  So the filled set is always a prefix and its size determines it.
+The sum itself is `O(Hk · nwidths)` transcendentals — ~540 at the defaults, a few
+percent of a chunk's metric if it ran every chunk — and the count only moves as
+the band crosses a Nyquist knee, so in a typical search this recomputes a
+handful of times in total.
+"""
+@inline function _refresh_shape!(shape::Vector{Float64}, shapeH::Base.RefValue{Int},
+                                 nbins::Int, widths::Vector{Int},
+                                 filled::Vector{Bool}, k::Int, Hk::Int)
+    nf = 0
+    @inbounds for j in 1:Hk
+        filled[j * k] && (nf += 1)
+    end
+    if shapeH[] != nf
+        _boxcar_shape!(shape, nbins, widths, filled, k, Hk)
+        shapeH[] = nf
+    end
+    return shape
+end
+
 # Prefix sum of the profile column minus a scalar baseline `b`, tiled by one extra
 # `wmax` samples so a boxcar that wraps past bin `nbins` reads real (wrapped) data:
 # boxcar sum of bins p..p+w-1 (1-based) = psum[p+w] - psum[p].
@@ -619,12 +738,15 @@ end
 # (two contiguous, `w`-shifted loads), which `@simd` vectorises; pulling `invsw`
 # out of the inner loop returns the identical `Float64`.
 @inline function _boxcar_scan(psum::Vector{T}, widths::Vector{Int},
-                              nbins::Int, invsigma::T) where {T<:AbstractFloat}
+                              nbins::Int, invsigma::T,
+                              shape::Vector{Float64}) where {T<:AbstractFloat}
     best = T(-Inf)
     @inbounds stot = psum[nbins + 1] - psum[1]     # profile total, baseline removed
-    @inbounds for w in widths
+    @inbounds for (i, w) in enumerate(widths)
         duty = T(w) / T(nbins)
-        invsw = invsigma / sqrt(T(w) * (one(T) - duty))
+        # `shape[i]` is σ/sd(S_w); with the snr1 shape this is the old
+        # `invsigma / sqrt(w*(1-duty))` exactly.  See `_boxcar_shape!`.
+        invsw = T(invsigma * shape[i])
         m = psum[1 + w] - psum[1]                  # finite seed (no -Inf in the reduction)
         @simd for p in 2:nbins
             m = max(m, psum[p + w] - psum[p])
@@ -654,7 +776,8 @@ prefix sums, same bank — so the width it returns is the one the search's own s
 maximised.  (The mean is removed before the prefix sum purely for conditioning;
 the statistic is invariant to it, which is what the `prof .+ 37.0` pin asserts.)
 """
-function boxcar_best_width(prof::AbstractVector{<:Real}; fsp::Real=1.5, maxfrac::Real=0.3)
+function boxcar_best_width(prof::AbstractVector{<:Real}; fsp::Real=1.5, maxfrac::Real=0.3,
+                           nfilled::Union{Nothing,Integer}=nothing)
     nbins = length(prof)
     nbins >= 1 || throw(ArgumentError("profile must be non-empty"))
     col = prof isa Vector{Float64} ? prof : Vector{Float64}(prof)
@@ -662,10 +785,17 @@ function boxcar_best_width(prof::AbstractVector{<:Real}; fsp::Real=1.5, maxfrac:
     psum = Vector{Float64}(undef, nbins + widths[end] + 1)
     _boxcar_psum!(psum, col, nbins, widths[end], sum(col) / nbins)  # mean: conditioning only
     stot = psum[nbins + 1] - psum[1]
+    # Which width wins depends on the per-width normalisation, so this has to use
+    # the same one the search did (`_boxcar_shape!`), not `snr1`'s.  The default
+    # is a fully-filled profile, which is what `candidate_profile` returns: it
+    # stops at the last harmonic under Nyquist and inverts those to `2H` bins.
+    nf = nfilled === nothing ? nbins ÷ 2 : Int(nfilled)
+    shape = _boxcar_shape!(Vector{Float64}(undef, length(widths)), nbins, widths,
+                           [j <= nf for j in 1:(nbins ÷ 2)], 1, nbins ÷ 2)
     best, bestw = -Inf, widths[1]
-    @inbounds for w in widths
+    @inbounds for (i, w) in enumerate(widths)
         duty = w / nbins
-        invsw = 1.0 / sqrt(float(w) * (1.0 - duty))
+        invsw = shape[i]
         m = psum[1 + w] - psum[1]
         for p in 2:nbins
             m = max(m, psum[p + w] - psum[p])
@@ -856,7 +986,8 @@ end
 # and same operation order per profile as the scalar pair; only the axis the
 # vectoriser sees is different.
 @inline function _bc_scan_batch!(bb::BoxcarBatch{T}, widths::Vector{Int},
-                                 nbins::Int, invsigma::T, ::Val{B}) where {T,B}
+                                 nbins::Int, invsigma::T, shape::Vector{Float64},
+                                 ::Val{B}) where {T,B}
     tile = bb.tile; psT = bb.psT; res = bb.res; mbuf = bb.mbuf
     wmax = widths[end]
     @inbounds for b in 1:B
@@ -874,9 +1005,9 @@ end
         res[b] = T(-Inf)
     end
     to = nbins * B                         # offset of each lane's profile total
-    @inbounds for w in widths
+    @inbounds for (i, w) in enumerate(widths)
         duty = T(w) / T(nbins)
-        invsw = invsigma / sqrt(T(w) * (one(T) - duty))
+        invsw = T(invsigma * shape[i])          # σ/sd(S_w); see `_boxcar_shape!`
         wo = w * B
         @simd for b in 1:B                     # finite seed, as in `_boxcar_scan`
             mbuf[b] = psT[wo + b] - psT[b]
@@ -900,7 +1031,7 @@ end
 # (both are valid lower bounds, which is all the gate needs).
 function _boxcar_gate!(bb::BoxcarBatch{T}, profs::AbstractMatrix{P}, n::Int,
                        psum::Vector{P}, widths::Vector{Int}, nbins::Int,
-                       invsigma::P) where {T,P<:AbstractFloat}
+                       invsigma::P, shape::Vector{Float64}) where {T,P<:AbstractFloat}
     B = _BC_BATCH
     vb = Val(B)
     invsig_t = T(invsigma)
@@ -908,7 +1039,7 @@ function _boxcar_gate!(bb::BoxcarBatch{T}, profs::AbstractMatrix{P}, n::Int,
     j0 = 0
     @inbounds while j0 + B <= n
         _bc_transpose!(bb.tile, profs, j0, nbins, vb)
-        _bc_scan_batch!(bb, widths, nbins, invsig_t, vb)
+        _bc_scan_batch!(bb, widths, nbins, invsig_t, shape, vb)
         for b in 1:B
             mvals[j0 + b] = Float64(bb.res[b])
         end
@@ -918,7 +1049,7 @@ function _boxcar_gate!(bb::BoxcarBatch{T}, profs::AbstractMatrix{P}, n::Int,
     @inbounds for j in (j0 + 1):n
         col = @view profs[:, j]
         _boxcar_psum!(psum, col, nbins, wmax, zero(P))
-        mvals[j] = Float64(_boxcar_scan(psum, widths, nbins, invsigma))
+        mvals[j] = Float64(_boxcar_scan(psum, widths, nbins, invsigma, shape))
     end
     return mvals
 end
@@ -941,18 +1072,19 @@ cannot move that set.
 """
 function boxcar_metrics!(bb::BoxcarBatch, profs::AbstractMatrix{P}, n::Int,
                          psum::Vector{P}, widths::Vector{Int}, nbins::Int,
-                         invsigma::P, exactcut::Float64) where {P<:AbstractFloat}
+                         invsigma::P, shape::Vector{Float64},
+                         exactcut::Float64) where {P<:AbstractFloat}
     mvals = bb.mvals
     if exactcut == -Inf || invsigma <= 0
         @inbounds for j in 1:n
-            mvals[j] = Float64(_profile_boxcar(profs, j, psum, widths, nbins, invsigma))
+            mvals[j] = Float64(_profile_boxcar(profs, j, psum, widths, nbins, invsigma, shape))
         end
         return mvals
     end
-    _boxcar_gate!(bb, profs, n, psum, widths, nbins, invsigma)
+    _boxcar_gate!(bb, profs, n, psum, widths, nbins, invsigma, shape)
     @inbounds for j in 1:n
         mvals[j] < exactcut && continue       # cannot reach threshold: keep the Float32 value
-        mvals[j] = Float64(_profile_boxcar(profs, j, psum, widths, nbins, invsigma))
+        mvals[j] = Float64(_profile_boxcar(profs, j, psum, widths, nbins, invsigma, shape))
     end
     return mvals
 end
@@ -980,11 +1112,12 @@ removes the mean first for conditioning on arbitrary input.
 """
 @inline function _profile_boxcar(profs::AbstractMatrix{T}, j::Integer,
                                  psum::Vector{T}, widths::Vector{Int},
-                                 nbins::Int, invsigma::T) where {T<:AbstractFloat}
+                                 nbins::Int, invsigma::T,
+                                 shape::Vector{Float64}) where {T<:AbstractFloat}
     invsigma > 0 || return zero(T)                # degenerate (flat block): no detection
     col = @view profs[:, j]
     _boxcar_psum!(psum, col, nbins, widths[end], zero(T))
-    return _boxcar_scan(psum, widths, nbins, invsigma)
+    return _boxcar_scan(psum, widths, nbins, invsigma, shape)
 end
 
 """
@@ -1018,7 +1151,8 @@ function snr_metrics(profs::AbstractMatrix{<:Real};
                      boxcar_fsp::Real=1.5, boxcar_maxfrac::Real=0.3,
                      sigma_samples::Integer=typemax(Int),
                      sigma_center::Symbol=:zero,
-                     widths::Union{Nothing,AbstractVector{<:Integer}}=nothing)
+                     widths::Union{Nothing,AbstractVector{<:Integer}}=nothing,
+                     nfilled::Union{Nothing,Integer}=nothing)
     nbins, L = size(profs)
     P = profs isa Matrix{Float64} ? profs : convert(Matrix{Float64}, profs)
     # `widths` overrides the derived bank so this function can stand in for a
@@ -1035,9 +1169,21 @@ function snr_metrics(profs::AbstractMatrix{<:Real};
     # profiles carrying a large constant offset — which the search's own never do,
     # but a caller's may — do not lose digits in the prefix sum.
     mean_j = [sum(view(P, :, j)) / nbins for j in 1:L]
+    # `nfilled === nothing` keeps riptide's `snr1` normalisation, which is what
+    # the Python oracle computes and what `crossval/` is pinned to.  Given a fill
+    # count this instead uses the exact band-limited one (`_boxcar_shape!`) — the
+    # production statistic, which `block_metrics` must reproduce for the
+    # equivalence gate to mean anything.
+    shape = if nfilled === nothing
+        _snr1_shape(nbins, widths)
+    else
+        nf = Int(nfilled)
+        _boxcar_shape!(Vector{Float64}(undef, length(widths)), nbins, widths,
+                       [j <= nf for j in 1:(nbins ÷ 2)], 1, nbins ÷ 2)
+    end
     return [begin
                 _boxcar_psum!(psum, view(P, :, j), nbins, widths[end], mean_j[j])
-                invsigma > 0 ? _boxcar_scan(psum, widths, nbins, invsigma) : 0.0
+                invsigma > 0 ? _boxcar_scan(psum, widths, nbins, invsigma, shape) : 0.0
             end for j in 1:L]
 end
 
@@ -1100,7 +1246,8 @@ separate from the detection metric so each can be cross-validated on its own.
 Both share every other step, so switching `kernel` isolates the interpolator.
 """
 function reference_profiles(ft::FFTFile, rfund::AbstractVector{<:Real},
-                            params::SearchParams; kernel::Symbol=:fft)
+                            params::SearchParams; kernel::Symbol=:fft,
+                            filled::Union{Nothing,Vector{Bool}}=nothing)
     kernel in (:fft, :direct) ||
         throw(ArgumentError("kernel must be :fft or :direct, got :$kernel"))
     nh = params.nharms
@@ -1123,6 +1270,12 @@ function reference_profiles(ft::FFTFile, rfund::AbstractVector{<:Real},
         # Skip (leave zeros) if the harmonic runs past Nyquist or off either end
         # of the available amplitudes.
         (lobin >= m2 && (lobin + numbins + m2) <= namps && hibin < Nhalf) || continue
+        # Same bookkeeping the production path keeps in `ws.filled`: which
+        # harmonics actually carry data, hence noise.  `block_metrics` needs it
+        # to normalise the boxcar the way `chunk_metrics` does — see
+        # `_boxcar_shape!` — and the equivalence gate would otherwise drift apart
+        # from the optimised path wherever a harmonic crosses Nyquist.
+        filled === nothing || (filled[h] = true)
 
         if kernel === :fft
             amps = finterp_fft(lobin, numbins, nb, ft.amps, m)
@@ -1155,7 +1308,8 @@ function block_metrics(ft::FFTFile, rfund::AbstractVector{<:Real},
     nh = params.nharms
     nbins = 2nh
     L = length(rfund)
-    profs = reference_profiles(ft, rfund, params; kernel=kernel)
+    filled = fill(false, nh)
+    profs = reference_profiles(ft, rfund, params; kernel=kernel, filled=filled)
     # Default to the bank the production *base* (k = 1) pass would use, so the
     # equivalence gate stays exact when `params` carries a decimation ladder.
     widths = widths === nothing ? ladder_boxcar_widths(nbins, 1, params) : widths
@@ -1166,7 +1320,8 @@ function block_metrics(ft::FFTFile, rfund::AbstractVector{<:Real},
     # `nbins*L ≤ _BOXCAR_SIGMA_SAMPLES`, which the tests pin.
     return snr_metrics(profs; boxcar_fsp=params.boxcar_fsp,
                        boxcar_maxfrac=params.boxcar_maxfrac,
-                       sigma_samples=_BOXCAR_SIGMA_SAMPLES, widths=widths)
+                       sigma_samples=_BOXCAR_SIGMA_SAMPLES, widths=widths,
+                       nfilled=count(filled))
 end
 
 """
@@ -1268,6 +1423,8 @@ struct DecimBuf{B,P<:AbstractFloat,V<:AbstractMatrix{<:Complex}}
     bcpsum::Vector{P}              # prefix-sum scratch (2*Hk + wmax + 1)
     bcsig::Vector{P}               # per-block σ subsample scratch
     bcbatch::BoxcarBatch{_BC_TILE}    # cross-profile SIMD gate scratch + metrics
+    bcshape::Vector{Float64}       # per-width σ/sd(S_w); see `_boxcar_shape!`
+    bcshapeH::Base.RefValue{Int}   # fill count `bcshape` was built for (-1 = none)
 end
 
 # `ftprofs` is the workspace array this buffer decimates; the plan is built
@@ -1285,7 +1442,7 @@ function DecimBuf(k::Integer, nharms::Integer, ftprofs::Matrix{Complex{P}},
     bcsig    = Vector{P}(undef, min(2Hk * Nprof, _BOXCAR_SIGMA_SAMPLES))
     bcbatch  = BoxcarBatch(2Hk, bcwidths[end], Nprof)
     return DecimBuf(Int(k), Hk, src, dprofs, brfftplan, bcwidths, bcpsum,
-                    bcsig, bcbatch)
+                    bcsig, bcbatch, Vector{Float64}(undef, length(bcwidths)), Ref(-1))
 end
 
 """
@@ -1309,6 +1466,8 @@ struct Workspace{B, D<:DecimBuf, P<:AbstractFloat}
     bcpsum::Vector{P}              # prefix-sum scratch (2*nharms + wmax + 1)
     bcsig::Vector{P}               # per-block σ subsample scratch
     bcbatch::BoxcarBatch{_BC_TILE}    # cross-profile SIMD gate scratch + metrics
+    bcshape::Vector{Float64}       # per-width σ/sd(S_w) for the k = 1 pass
+    bcshapeH::Base.RefValue{Int}   # fill count `bcshape` was built for (-1 = none)
     decims::Vector{D}              # one per decimation factor k > 1
     # The chunk's bin window, de-interleaved into real/imaginary planes.  Kept at
     # `Float32`, the storage type of the `.fft` file: widening on load is exact,
@@ -1351,7 +1510,8 @@ function Workspace(::Type{P}, params::SearchParams, Nprof::Integer) where {P<:Ab
     re = Vector{Float32}(undef, nw)
     im = Vector{Float32}(undef, nw)
     return Workspace(ftprofs, profs, brfftplan, bcwidths, bcpsum,
-                     bcsig, bcbatch, decims, re, im, fill(false, nh))
+                     bcsig, bcbatch, Vector{Float64}(undef, length(bcwidths)), Ref(-1),
+                     decims, re, im, fill(false, nh))
 end
 
 """
@@ -1782,9 +1942,15 @@ function decim_pass!(out::Vector{Candidate}, ws::Workspace, db::DecimBuf, ft::FF
               P(_analytic_sigma(ws.filled, k, Hk)) :
               _block_sigma(db.dprofs, nbins, nvalid, db.bcsig)
         invsigma = sig > 0 ? one(P) / sig : zero(P)
+        # The boxcar's own noise scale is NOT σ√(w(1−δ)) — this profile is
+        # band-limited to the filled harmonics, so its bins are correlated.
+        # `_boxcar_shape!` carries that; it matters most exactly here, where a
+        # shallow rung is both few-binned and the first to cross Nyquist.
+        shape = _refresh_shape!(db.bcshape, db.bcshapeH, nbins, db.bcwidths,
+                                ws.filled, k, Hk)
         # Only the valid prefix is scored; past-Nyquist columns are skipped below.
         boxcar_metrics!(db.bcbatch, db.dprofs, nvalid, db.bcpsum,
-                        db.bcwidths, nbins, invsigma, Float64(exactcut))
+                        db.bcwidths, nbins, invsigma, shape, Float64(exactcut))
     end
     mbuf = stats === nothing ? nothing : Float64[]     # gather metrics if requested
     @phase 9 @inbounds for j in 1:n
@@ -1845,8 +2011,9 @@ function chunk_metrics(ft::FFTFile, params::SearchParams, rstart::Real, n::Integ
     P = eltype(ws.profs)
     sigma = _block_sigma(ws.profs, nbins, n, ws.bcsig)
     invsigma = sigma > 0 ? one(P) / sigma : zero(P)
+    shape = _boxcar_shape!(ws.bcshape, nbins, ws.bcwidths, ws.filled, 1, nh)
     return [Float64(_profile_boxcar(ws.profs, j, ws.bcpsum, ws.bcwidths,
-                                    nbins, invsigma)) for j in 1:n]
+                                    nbins, invsigma, shape)) for j in 1:n]
 end
 
 # ---------------------------------------------------------------------------
@@ -1918,11 +2085,13 @@ function _search_region!(ft::FFTFile, params::SearchParams,
                           P(_analytic_sigma(ws.filled, 1, params.nharms)) :
                           _block_sigma(ws.profs, nbins, n, ws.bcsig)
                     invsigma = sig > 0 ? one(P) / sig : zero(P)
+                    shape = _refresh_shape!(ws.bcshape, ws.bcshapeH, nbins,
+                                            ws.bcwidths, ws.filled, 1, params.nharms)
                 end
                 # All n trials at once: batched `Float32` gate, then a `Float64`
                 # rescore only for those that reach `exactcut`.
                 @phase 4 boxcar_metrics!(ws.bcbatch, ws.profs, n, ws.bcpsum,
-                                         ws.bcwidths, nbins, invsigma, exactcut)
+                                         ws.bcwidths, nbins, invsigma, shape, exactcut)
                 # Whole (narrow) block → one window, keyed by its centre freq.
                 basehist = collect_stats ?
                     hists[1][_window_index(wedges[1], rmean / ft.T)] : nothing

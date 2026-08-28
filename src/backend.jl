@@ -85,14 +85,21 @@ end
 function chunk_boxcar(::CPUBackend, ft::FFTFile, params::SearchParams,
                       rstart::Real, n::Integer; t0::Integer = 0,
                       weights::Type{<:AbstractFloat} = Float32, k::Integer = 1,
-                      invsigma::Real = 1.0)
+                      invsigma::Real = 1.0,
+                      nfilled::Union{Nothing,Integer} = nothing)
     profs = chunk_profiles(CPUBackend(), ft, params, rstart, n;
                            t0 = t0, weights = weights, k = k)
     nbins = size(profs, 1)
     widths = ladder_boxcar_widths(nbins, k, params)
     psum = Vector{Float64}(undef, nbins + widths[end] + 1)
     P64 = Matrix{Float64}(profs)
-    return [_profile_boxcar(P64, j, psum, widths, nbins, Float64(invsigma))
+    # Same band-limited normalisation the search uses (`_boxcar_shape!`); the
+    # default assumes nothing was lost to Nyquist, which is true of the bands the
+    # CPU/GPU comparisons run over.
+    nf = nfilled === nothing ? nbins ÷ 2 : Int(nfilled)
+    shape = _boxcar_shape!(Vector{Float64}(undef, length(widths)), nbins, widths,
+                           [j <= nf for j in 1:(nbins ÷ 2)], 1, nbins ÷ 2)
+    return [_profile_boxcar(P64, j, psum, widths, nbins, Float64(invsigma), shape)
             for j in 1:n]
 end
 
