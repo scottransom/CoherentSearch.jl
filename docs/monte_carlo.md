@@ -753,7 +753,65 @@ rather than falling off in the MSP band. For a 0.2%-duty pulse, whose power
 really does run past the cap, truncation costs what one expects (0.547 → 0.219 at
 `hmax = 8`).
 
-## 16. Still not done
+## 16. Run 2 launched — fitzroy, 2026-08-29 09:33
+
+15 workers under `screen`, `/data1/mc/run2`, `mc/launch_fitzroy.sh` at 7570be5.
+Zero failures and zero errors in the first 44 realisations, all six always-on arms
+present on every one, both 1-in-5 arms completing, and `prepfold_null` recording
+6 folds per injection-free realisation. `--nreal 400000` over 15 workers is ~45
+days of work, so it does not stop on its own; kill it with
+`pkill -f mc_simulate.py` (the SIGTERM handler clears `/dev/shm`).
+
+Measured per stage, against the estimate this file projected before it ran:
+
+| stage | estimate | measured | how often |
+|---|---|---|---|
+| `rseek_B` | 163 s | **179.3** | 1-in-5 |
+| `coherent_deep` | 54 s | **74.7** | 1-in-5 |
+| `rseek_A` | 39 s | **42.2** | every |
+| `coherent` | 27 s | **29.1** | every |
+| `coherent_tier` | 6 s | **8.2** | every |
+| `prepfold` x6 | 8 s | 8.2 | every |
+| generate | 6 s | 7.4 | every |
+| `accelsearch` x2 | 4.5 s | 4.0 | every |
+| `realfft` + `rednoise` | 1.1 s | 1.1 | every |
+
+**151 s per realisation** against the projected 137 s — 10% out, which for a
+cross-host extrapolation is closer than this project usually manages. Over 8 days
+that is ~68,600 realisations and ~370,000 injections (4.5x run 1), ~13,700
+realisations on the 1-in-5 arms (6.2x), and — the number the whole run 2 design
+turns on — **~13,700 injections below 0.5% duty against run 1's 757**, of which
+~2,700 in the deep subset against run 1's 118. Section 8 asked for 1000.
+
+### Trials are not compute, and the cost table prints both
+
+`coherent_deep` has **exactly 2x** `coherent`'s trial count and takes **2.57x**
+its wall clock. That is not an anomaly, it is the definition: `trials.json` counts
+(fundamental, rung) pairs, which is the *statistical* trials factor that sets a
+threshold, and the deep arm searches the SAME number of fundamentals as the
+default arm — 15.07M against 15.08M — while paying 2x per fundamental in
+interpolation (120 harmonics, not 60) and ~2.5x in the transform and the boxcar
+(`Σ_k 2·nharms/k` is 745 bins against 294). Cost per fundamental changed; trials
+per fundamental changed; they are different numbers and only coincidentally close.
+
+`mc_analyze`'s cost section prints `det/CPU-s` and `det% per 1e6 trials` side by
+side, and they answer different questions: the first is "what does this cost", the
+second is "how hard is this statistically". **Do not read the second as a cost
+normalisation across arms with different `nharms`.**
+
+This bit once, immediately: the first reading of `coherent_tier` (8.2 s against
+`coherent`'s 29.1 s at 15.7% of the trials) was solved for a Julia start-up of
+**7.9 s**, which would have made the three invocations 16% of the budget and
+worth restarting the run to merge. Redone with the measured 2.57x per-fundamental
+factor it is **2.9 s** — the ~2.4 s this repo already records for a warm
+single-file run — so the three invocations are 4% of the budget and merging them
+is not worth touching an unattended 8-day job. **One ratio, one unexamined
+proportionality assumption, and an order-of-magnitude wrong answer that pointed at
+a real action.** The standing rule in CLAUDE.md is to split the function and
+measure the phases before optimising one; the same applies to solving for a
+constant from a single ratio.
+
+## 17. Still not done
 
 * **A second observation length.** All of this is `T = 1006 s`. §2a's threshold
   advantage should grow with `T`; one confirming run.
