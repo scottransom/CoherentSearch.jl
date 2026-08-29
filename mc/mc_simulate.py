@@ -384,18 +384,24 @@ def score(cands, injections, T, tol_bins):
     return hits, fa
 
 
-def fa_summary(fa):
+def fa_summary(fa, cap=800):
     """False alarms, as a count and as the sorted statistics of the top few.
 
     Keeping the top values (not just a count at one threshold) is what lets the
     analysis build a false-alarm RATE curve per code without re-running anything.
+
+    **800, not run 1's 200.**  `rseek_B` reports a median of 432 candidates and up
+    to 503 on a 2^24 file at `--smin 6`, so 200 truncated its tail on **100% of
+    realisations** and its measured rate curve was a ceiling below 6.20.  That
+    never touched a threshold anyone used -- the loosest is 7.25 -- but it is a
+    censoring WE imposed, on the one arm that costs 121 s to produce, and the
+    storage is a few kB per realisation.  A truncated list reads as a rate
+    ceiling rather than as missing data, which is the kind of quiet wrong answer
+    that is hard to spot later, so the cheap fix is the right one.
     """
     s = sorted((c.stat for c in fa), reverse=True)
-    # 200, not 20: rseek at `--smin 6` reports ~150 candidates on a 2^24 file,
-    # so a short tail saturates exactly where the false-alarm RATE is
-    # interesting.  A truncated list reads as a rate ceiling, not as missing
-    # data, which is the kind of quiet wrong answer that is hard to spot later.
-    return dict(n=len(s), top=[round(v, 3) for v in s[:200]], truncated=len(s) > 200)
+    return dict(n=len(s), top=[round(v, 3) for v in s[:cap]], truncated=len(s) > cap,
+                floor=(round(s[-1], 3) if s else None))
 
 
 def add_rednoise(x, dt, fcorner, alpha, rng):
@@ -614,7 +620,7 @@ def _search_all(rec, draws, null_draws, stem, args, tools, T, keep_prof=False):
         rec["timing"][name] = t
         ac = parse_accel(os.path.join(wd, src[:-4] + "_ACCEL_0"))
         hits, fa = score(ac, inj, T, tol)
-        rec["results"][name] = dict(hits=hits, false=fa_summary(fa), ncand=len(ac),
+        rec["results"][name] = dict(hits=hits, false=fa_summary(fa, args.fa_top), ncand=len(ac),
                                     ok=(rc == 0))
 
     # --- rseek, config A ----------------------------------------------------
@@ -626,7 +632,7 @@ def _search_all(rec, draws, null_draws, stem, args, tools, T, keep_prof=False):
     rec["timing"]["rseek_A"] = t
     rs = parse_rseek(out) if rc == 0 else []
     hits, fa = score(rs, inj, T, tol)
-    rec["results"]["rseek_A"] = dict(hits=hits, false=fa_summary(fa), ncand=len(rs),
+    rec["results"]["rseek_A"] = dict(hits=hits, false=fa_summary(fa, args.fa_top), ncand=len(rs),
                                      ok=(rc == 0))
 
     # --- rseek, deep tiling, on a subset ------------------------------------
@@ -639,7 +645,7 @@ def _search_all(rec, draws, null_draws, stem, args, tools, T, keep_prof=False):
             allc += parse_rseek(out) if rc == 0 else []
         rec["timing"]["rseek_B"] = tt
         hits, fa = score(allc, inj, T, tol)
-        rec["results"]["rseek_B"] = dict(hits=hits, false=fa_summary(fa),
+        rec["results"]["rseek_B"] = dict(hits=hits, false=fa_summary(fa, args.fa_top),
                                          ncand=len(allc), ok=ok)
         rec["config"]["rseek_B"] = RSEEK_B
 
@@ -664,7 +670,7 @@ def _search_all(rec, draws, null_draws, stem, args, tools, T, keep_prof=False):
         rec["timing"][name] = t
         ch = parse_cohout(out_f) if rc == 0 else []
         hits, fa = score(ch, inj, T, tol)
-        rec["results"][name] = dict(hits=hits, false=fa_summary(fa), ncand=len(ch),
+        rec["results"][name] = dict(hits=hits, false=fa_summary(fa, args.fa_top), ncand=len(ch),
                                     ok=(rc == 0))
         if rc != 0:
             rec["results"][name]["stderr"] = err[-2000:]
@@ -800,9 +806,31 @@ def main(argv=None):
     ap.add_argument("--snr-range", type=float, nargs=2, default=[5.5, 11.5],
                     metavar=("LO", "HI"))
     ap.add_argument("--min-fwhm-samples", type=float, default=3.0)
-    ap.add_argument("--threshold", type=float, default=6.0, help="coherent_search S/N floor")
-    ap.add_argument("--ncands", type=int, default=500)
-    ap.add_argument("--rseek-smin", type=float, default=6.0)
+    ap.add_argument("--threshold", type=float, default=5.5,
+                    help="coherent_search reporting floor.  5.5, not run 1's 6.0: "
+                         "the false-alarm rate curve is FLAT below this by "
+                         "construction, and the low-frequency tier arm searches "
+                         "6.4x fewer trials than the default arm, so its own "
+                         "matched threshold lands near 6.0 (measured 6.05 in a "
+                         "short-T smoke run) -- at 6.0 it would have been floor-"
+                         "limited and read as better than it is.  Costs nothing: "
+                         "the gated exact rescan fires on ~1e-6 of trials either "
+                         "way")
+    ap.add_argument("--ncands", type=int, default=2000,
+                    help="candidates coherent_search may report.  A THIRD cap that "
+                         "censors the same way as --threshold and --fa-top, so it "
+                         "is kept well clear: at --threshold 5.5 the full-band deep "
+                         "arm produces ~200 per realisation at T = 1006 s, and "
+                         "reporting more costs only the writing of them")
+    ap.add_argument("--rseek-smin", type=float, default=6.0,
+                    help="rseek's reporting floor.  LEFT AT 6.0 deliberately: its "
+                         "matched thresholds are 7.95 and 8.05, its rate at 6.5 is "
+                         "already 20-48 per realisation, and lowering it multiplies "
+                         "a candidate list that is already ~170 (config A) and ~430 "
+                         "(config B) long for a region of the curve no threshold "
+                         "ever reaches")
+    ap.add_argument("--fa-top", type=int, default=800,
+                    help="false-alarm statistics stored per code per realisation")
     ap.add_argument("--accel-sigma", type=float, default=1.0)
     ap.add_argument("--tol-bins", type=float, default=3.0)
     ap.add_argument("--coh-threads", type=int, default=1)

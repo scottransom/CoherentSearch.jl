@@ -119,7 +119,7 @@ def _merge_union(res, name):
             if h and (best is None or h["stat"] > best["stat"]):
                 best = h
         hits.append(best)
-    top = sorted((v for p in parts for v in p["false"]["top"]), reverse=True)[:400]
+    top = sorted((v for p in parts for v in p["false"]["top"]), reverse=True)[:1600]
     return dict(hits=hits, ncand=sum(p["ncand"] for p in parts),
                 ok=all(p.get("ok", True) for p in parts),
                 false=dict(n=sum(p["false"]["n"] for p in parts), top=top,
@@ -272,28 +272,41 @@ def fa_rates(recs, method, thresholds, empty_only=False):
 
 
 def saturation(recs, method):
-    """Where a stored top-N tail stops being a rate and becomes a ceiling.
+    """Where a false-alarm rate curve stops being a rate and becomes a ceiling.
 
-    `rseek_B`'s 200-entry tail was saturated in 100% of run 1's realisations, so
-    its rate curve below ~6.5 is a cap, not a measurement.  Harmless at the
-    thresholds actually used -- but the report must say so rather than leave it
-    to be noticed.
+    There are TWO censoring mechanisms and they are easy to confuse:
+
+      * **the stored top-N cap**, which is OURS.  `rseek_B`'s 200-entry tail was
+        saturated in 100% of run 1's realisations, so its rate curve below 6.20
+        was a cap.  Run 2 stores 800 and this should read 0%.
+      * **each code's own reporting floor** -- `--rseek-smin`, our `--threshold`,
+        accelsearch's sifting cut.  Below it the curve is FLAT by construction,
+        because no candidate below it was ever emitted.  Run 1's report showed
+        `rseek_A` at 161.96 for cuts 5.0, 5.5 AND 6.0 and said nothing; that is
+        one number printed three times, not three measurements.
+
+    Neither ever touched a threshold run 1 actually used -- the loosest was 6.30
+    against floors of 4.8 and 6.0 -- but a rate curve with a flat censored region
+    in it should say which part is data.
     """
-    nt, n, floors = 0, 0, []
+    nt, n, cap_floors, rep_floors = 0, 0, [], []
     for r in recs:
         res = r["results"]
         d = res.get(method) or (_merge_union(res, method) if method in UNION else None)
-        if not d:
+        if not d or not d["false"]["top"]:
             continue
         n += 1
         if d["false"].get("truncated"):
             nt += 1
-            if d["false"]["top"]:
-                floors.append(d["false"]["top"][-1])
+            cap_floors.append(d["false"]["top"][-1])
+        else:
+            rep_floors.append(d["false"].get("floor", d["false"]["top"][-1]))
     if not n:
         return None
-    return dict(n=n, frac=nt / n,
-                floor=float(np.median(floors)) if floors else float("-inf"))
+    cap = float(np.median(cap_floors)) if cap_floors else float("-inf")
+    rep = float(np.median(rep_floors)) if rep_floors else float("-inf")
+    return dict(n=n, frac=nt / n, cap_floor=cap, report_floor=rep,
+                floor=max(cap, rep))
 
 
 FA_GRID = np.arange(3.0, 30.0, 0.05)
@@ -446,19 +459,34 @@ def sec_cost(recs, rws, thr, args):
           "   a code that is 6x slower must be 6x better to be on the same line)")
 
 
-def sec_falarm(recs, args):
+def sec_falarm(recs, args, thr=None):
     grid = np.array([5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 9.0, 10.0])
     print("\n--- false alarms per realisation (candidates matching no injection) ---")
-    print(f"{'':>15} " + " ".join(f"{t:>7.1f}" for t in grid) + "   saturated")
+    print(f"{'':>15} " + " ".join(f"{t:>7.1f}" for t in grid) +
+          f"   {'floor':>6}   n")
+    warn = []
     for m in present_recs(recs, SEARCHES):
         rate, n = fa_rates(recs, m, grid)
         if not n:
             continue
-        s = saturation(recs, m)
-        flag = ""
-        if s and s["frac"] > 0.01:
-            flag = f"  {100 * s['frac']:.0f}% of tails truncated: the curve is a CEILING below {s['floor']:.2f}"
-        print(f"{m:>15} " + " ".join(f"{v:>7.2f}" for v in rate) + f"   (n={n}){flag}")
+        s = saturation(recs, m) or {}
+        floor = s.get("floor", float("-inf"))
+        # A cut at or below the floor is one number repeated, not a measurement.
+        cells = [f"{v:>6.2f}{'c' if t <= floor else ' '}" for v, t in zip(rate, grid)]
+        print(f"{m:>15} " + " ".join(cells) + f"   {floor:>6.2f}   {n}")
+        if s.get("frac", 0) > 0.01:
+            warn.append(f"    {m}: {100 * s['frac']:.0f}% of stored tails hit the "
+                        f"top-N cap, so the curve is a CEILING below "
+                        f"{s['cap_floor']:.2f} -- raise --fa-top")
+        if thr and np.isfinite(thr.get(m, np.nan)) and thr[m] <= floor + 0.15:
+            warn.append(f"    {m}: its matched threshold {thr[m]:.2f} is within 0.15 of "
+                        f"its reporting floor {floor:.2f} -- FLOOR-LIMITED, lower the "
+                        f"code's own reporting cut and re-run before quoting it")
+    print("  ('c' = at or below that code's reporting floor, where the curve is flat by\n"
+          "   construction: no candidate below it was ever emitted.  It is one number\n"
+          "   repeated, not a measurement.)")
+    for w in warn:
+        print(w)
 
 
 def present_recs(recs, pool):
@@ -947,7 +975,7 @@ def main(argv=None):
     if "cost" in want:
         sec_cost(recs, rws, thr, args)
     if "falarm" in want:
-        sec_falarm(recs, args)
+        sec_falarm(recs, args, thr)
     if "roc" in want:
         sec_roc(recs, rws, curves, args, rng)
     if "table" in want:

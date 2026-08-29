@@ -90,10 +90,26 @@ skips indices already present.
   false-alarm rate does. `mc_analyze.py --fap` is what makes the columns
   comparable; without it the table prints a warning.
 * **False alarms are counted on every realisation**, not just the empty ones —
-  a candidate matching no injection at any simple harmonic ratio. The top 200
-  statistics are stored, so a rate curve can be built at analysis time. rseek at
-  `--smin 6` reports ~150 candidates per file, which is why the cap is 200 and
-  not 20.
+  a candidate matching no injection at any simple harmonic ratio. The top **800**
+  statistics are stored, so a rate curve can be built at analysis time.
+* **Two things censor that curve, and only one of them is ours.** The stored
+  top-N cap is ours: at run 1's 200 it truncated `rseek_B` on **100%** of
+  realisations, making its rate a ceiling below 6.20 (it reports a median of 432
+  candidates). 800 covers it. The other is each code's own reporting floor —
+  `--rseek-smin 6.0`, our `--threshold`, accelsearch's sifting cut at ~4.8 —
+  below which the curve is *flat by construction*. Run 1's report printed
+  `rseek_A` at 161.96 for cuts 5.0, 5.5 and 6.0 and said nothing; that is one
+  number three times. `mc_analyze.py` now marks those cells `c` and warns if any
+  matched threshold lands within 0.15 of a floor.
+* **Our reporting floor is 5.5, not 6.0, and that is because of the tier arm.**
+  `coherent_tier` searches 6.4x fewer trials than the default arm, so its own
+  matched threshold sits near 6.0 (measured 6.05 on a short-`T` smoke run) — at a
+  6.0 floor it would have been floor-limited and read as better than it is. It
+  costs nothing: the gated exact rescan fires on ~1e-6 of trials either way.
+  **rseek's floor is left at 6.0 on purpose** — its matched thresholds are 7.95
+  and 8.05, its rate at 6.5 is already 20–48 per realisation, and lowering it
+  would multiply an already ~430-long candidate list over a region of the curve
+  no threshold ever reaches.
 * **Harmonic detections count as detections, and are flagged.** rseek and
   accelsearch do not collapse the `f/2, 2f, 3f/2 …` family and we do, so scoring
   them as misses would penalise the codes that report them.

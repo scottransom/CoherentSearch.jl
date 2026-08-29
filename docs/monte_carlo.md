@@ -640,7 +640,43 @@ Two things worth knowing when running it: pass `-u` and do not pipe into
 run-1 output takes a few minutes because it has to rebuild the profiles the driver
 no longer has.
 
-## 13. `mc/test_mc.py`
+## 13. The false-alarm curves are censored in two places, and one of them was ours
+
+Raised by Scott on 2026-08-29, reviewing the above. **Every threshold run 1
+actually used is clear of both floors** — the loosest is 6.30 against floors of
+4.8 and 6.0 — so nothing in §1–§3 moves. But a rate curve with a flat censored
+region in it should say which part is data:
+
+| code | floor | what sets it |
+|---|---|---|
+| `accelsearch` | ~4.8 | its own sifting cut. `-sigma 1.0` is already maximally permissive and **0%** of its tails truncate, so there is nothing to lower |
+| `rseek_A`, `rseek_B` | 6.00 | `--rseek-smin` |
+| `coherent` | 6.02 | `--threshold` |
+| `rseek_B` | 6.20 | **our own top-200 storage cap, hit on 100% of realisations** |
+
+Run 1's report printed `rseek_A` at 161.96 for cuts 5.0, 5.5 *and* 6.0 without
+comment. That is one number three times, not three measurements — the flag it did
+carry (§7 item 5) caught only the storage cap.
+
+Three changes, and one deliberate non-change:
+
+* **`--fa-top` 200 → 800.** `rseek_B` reports a median of 432 candidates and up to
+  503, so 200 truncated it every time. It is a censoring *we* imposed, on the one
+  arm that costs 121 s to produce, and the fix is a few kB per realisation.
+* **Our `--threshold` 6.0 → 5.5.** This is the one that would have bitten run 2:
+  `coherent_tier` searches 6.4x fewer trials than the default arm, so its own
+  matched threshold sits near 6.0 — the smoke run measured **6.05**, i.e. at the
+  floor, where it would have read as better than it is. It costs nothing, because
+  the gated exact rescan fires on ~1e-6 of trials either way.
+* **`mc_analyze` marks censored cells `c`** and warns when any matched threshold
+  lands within 0.15 of a code's floor. `saturation()` now separates the two
+  mechanisms instead of reporting one.
+* **`--rseek-smin` stays at 6.0.** Its matched thresholds are 7.95 and 8.05, its
+  rate at 6.5 is already 20–48 per realisation, and lowering it multiplies an
+  already ~430-long candidate list over a region of the curve no threshold ever
+  reaches. Nothing to buy.
+
+## 14. `mc/test_mc.py`
 
 Nineteen pins, all green, run in ~40 s. They cover the things that would fail
 *silently* and in a plausible direction: the width bank against the Julia it
@@ -663,7 +699,7 @@ rather than falling off in the MSP band. For a 0.2%-duty pulse, whose power
 really does run past the cap, truncation costs what one expects (0.547 → 0.219 at
 `hmax = 8`).
 
-## 14. Still not done
+## 15. Still not done
 
 * **A second observation length.** All of this is `T = 1006 s`. §2a's threshold
   advantage should grow with `T`; one confirming run.
