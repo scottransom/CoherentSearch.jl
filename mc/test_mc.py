@@ -122,6 +122,53 @@ def test_drizzle():
           abs(MM.drizzle_boxcar_corr(128, 271.0, 9) - 1.0) < 0.002)
 
 
+# --- 2b. the measurement that checks the model, on a fold we control ---------
+def test_drizzle_measured():
+    """`_pooled_corr` must recover `drizzle_boxcar_corr` from simulated profiles.
+
+    This pins the ESTIMATOR, not the model: `mc_analyze --sections drizzle` runs
+    the same code on real prepfold profiles, and the point of that section is
+    that a disagreement there means `fold()` is not drizzling the way we think.
+    That inference only holds if the estimator itself is known to be unbiased,
+    which is what this checks -- on a fold whose weights we wrote.
+    """
+    import mc_analyze as MA
+    rng = np.random.default_rng(3)
+    # `dt/bin` must be INCOMMENSURATE, as a real fold's always is: at exactly 2.5
+    # the sample start phase takes only five distinct sub-bin values instead of
+    # sweeping the bin, and the closed form -- which is the equidistributed
+    # average -- is then simply answering a different question.  (Measured: 2.5
+    # and 8.0 exactly give a 1.3-1.9% offset, in `sigma` and in the correction
+    # alike; 2.5137 and 8.0413 give 0.3%.)  Same artifact as the commensurate
+    # `dpb` in `test_drizzle` above.
+    for nbins, dpb, tol in ((64, 1.0409, 0.012), (64, 2.5137, 0.012),
+                            (128, 8.0413, 0.012)):
+        nrot, nprof = 150, 400
+        nsamp = int(nrot * nbins * dpb)
+        L = 1.0 / dpb
+        s = (np.arange(nsamp) * L) % nbins
+        b0 = np.floor(s).astype(int)
+        w0 = np.minimum(L, 1.0 - (s - b0)) / L
+        idx0, idx1 = b0, (b0 + 1) % nbins
+        P = np.empty((nprof, nbins))
+        for k in range(nprof):
+            x = rng.normal(size=nsamp)
+            p = np.zeros(nbins)
+            np.add.at(p, idx0, x * w0)
+            np.add.at(p, idx1, x * (1.0 - w0))
+            P[k] = p
+        widths = (1, 2, 4, 8)
+        meas, sd = MA._pooled_corr(P, widths)
+        worst = max(abs(meas[w] / MM.drizzle_boxcar_corr(nbins, dpb, w) - 1.0)
+                    for w in widths)
+        check(f"_pooled_corr recovers the model at nbins={nbins}, dt/bin={dpb}",
+              worst < tol, f"worst {worst:.4f}")
+        # ... and the analytic per-bin sigma, which is the other half of `snr1`.
+        r = sd / MM.prepfold_sigma(nbins, dpb, nsamp)
+        check(f"  analytic sigma at nbins={nbins}, dt/bin={dpb}", abs(r - 1) < 0.02,
+              f"measured/analytic {r:.4f}")
+
+
 # --- 3. the efficiency model ------------------------------------------------
 def test_model():
     prof, _ = MP.make_profile(0.05, MP.VONMISES_W10_W50, nph=1 << 12)
@@ -206,6 +253,7 @@ def test_one_in():
 if __name__ == "__main__":
     test_ladder()
     test_drizzle()
+    test_drizzle_measured()
     test_model()
     test_strat()
     test_one_in()

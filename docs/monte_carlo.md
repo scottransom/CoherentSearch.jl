@@ -676,9 +676,58 @@ Three changes, and one deliberate non-change:
   already ~430-long candidate list over a region of the curve no threshold ever
   reaches. Nothing to buy.
 
-## 14. `mc/test_mc.py`
+## 14. The drizzle model is now measured, not assumed
 
-Nineteen pins, all green, run in ~40 s. They cover the things that would fail
+Scott asked (2026-08-29) whether the stored profiles were actually implemented and
+whether they were worth it. They were — `--keep-profiles 10`, which is 1-in-10
+realisations and **every** injection-free one, stored inline in the JSON rather
+than as `.bestprof` files. The answer to "worth it" is that the check they exist
+for has now been run, and §5's central assumption — that `fold()` spreads each
+sample across the bins its duration covers, in proportion to the overlap — was
+until now exactly that, an assumption.
+
+**210 real `prepfold` folds of pure white noise**, `N = 2^23`, `-n 128`, periods
+swept to give `dt_per_bin` from 1.35 to 222, measured against
+`mc_model.drizzle_boxcar_corr`:
+
+| dt/bin | nprof | σ meas/analytic | w=1 | w=2 | w=4 | w=8 |
+|---|---|---|---|---|---|---|
+| 1.35 | 18 | 1.017 | 0.999/1.001 | **0.928/0.928** | **0.896/0.897** | 0.890/0.882 |
+| 3.10 | 45 | 0.984 | 0.999/1.000 | 0.972/0.972 | 0.958/0.958 | 0.947/0.951 |
+| 10.15 | 45 | 0.984 | 0.998/1.000 | 0.988/0.992 | 0.973/0.988 | 0.962/0.986 |
+| 32.0 | 42 | 1.009 | 0.998/1.000 | 0.987/0.997 | 0.980/0.996 | 0.959/0.995 |
+| 100.7 | 45 | 0.996 | 0.998/1.000 | 0.995/0.999 | 0.986/0.999 | 0.999/0.999 |
+| 222.3 | 15 | 0.978 | 0.998/1.000 | 1.001/1.000 | 0.996/0.999 | 1.004/0.999 |
+
+**Where the correction matters it is confirmed to 0.1%.** `dt_per_bin ≈ 1` is the
+MSP band — 200–1000 Hz, where the raw `snr1` was reading 1.009 and crossing unity
+— and there the correction is a 7–12% effect and the two agree at w = 2 and w = 4
+to one part in a thousand. The analytic σ is within ~2% at every `dt_per_bin`,
+which is its own sampling error at these profile counts.
+
+The 1–4% low-side residuals at `dt_per_bin` 10–32 for wide boxcars are 1–2σ on
+±2.6% error bars, and they sit where the correction is ≈1 anyway, so nothing in
+the study depends on them. Worth re-reading on run 2's ~22,000 null profiles,
+which is 100x this sample.
+
+`mc_analyze.py --sections drizzle` is that table, run on the study's own stored
+profiles. `load()` drops profiles unless that section asks, because parsed they
+are gigabytes of Python floats.
+
+**Two traps this turned up, and they are the same trap.** `dt_per_bin` must be
+INCOMMENSURATE for the closed form to apply — it is the equidistributed average
+of the sub-bin sample phase, and at exactly 2.5 the phase takes five distinct
+values instead of sweeping the bin (worth 1.3–1.9%, in σ and in the correction
+alike). Real folds are always incommensurate; contrived test values are not, and
+both `test_drizzle` and `test_drizzle_measured` say so. Separately, `_pooled_corr`
+subtracts a POOLED mean rather than each profile's own: per-profile subtraction
+costs a degree of freedom out of `nbins` and biases the per-bin σ low by
+`1/(2·nbins)` — 0.4% at 128 bins, the same size as the effect being looked for,
+and it showed up as a uniform 0.996 in the w = 1 column before it was fixed.
+
+## 15. `mc/test_mc.py`
+
+Twenty-five pins, all green, run in ~90 s. They cover the things that would fail
 *silently* and in a plausible direction: the width bank against the Julia it
 transcribes (all cells, three configurations), the drizzle covariance's closed
 form against a direct accumulation over the real fold weights, the efficiency
@@ -688,7 +737,12 @@ stratified sampler's importance weights *restore the population*. A broken weigh
 is the single bug in this study that would make every headline number wrong while
 every plot still looked reasonable.
 
-Two of them earned their keep on the first run: the `one_in` power-of-two case
+`test_drizzle_measured` pins the ESTIMATOR rather than the model: it simulates a
+fold whose weights we wrote and checks that `_pooled_corr` recovers
+`drizzle_boxcar_corr` from it. That is what licenses the inference in §14 — a
+disagreement on real profiles means `fold()`, not a bug in the measurement.
+
+Three of them earned their keep on the first run: the `one_in` power-of-two case
 above, and a claim in the model that turned out to be **backwards**. Truncating
 the harmonic sum at the data's own Nyquist makes a broad pulse's efficiency go
 **up** (0.982 at `hmax = 20` against 0.967 unlimited, at 5% duty), because the
@@ -699,7 +753,7 @@ rather than falling off in the MSP band. For a 0.2%-duty pulse, whose power
 really does run past the cap, truncation costs what one expects (0.547 → 0.219 at
 `hmax = 8`).
 
-## 15. Still not done
+## 16. Still not done
 
 * **A second observation length.** All of this is `T = 1006 s`. §2a's threshold
   advantage should grow with `T`; one confirming run.

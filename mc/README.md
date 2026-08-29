@@ -149,9 +149,20 @@ skips indices already present.
   pulses by ~20%. The correction is applied at ANALYSIS time, from the `(nbins,
   dt_per_bin, w)` recorded beside the raw value, so revising it never means
   re-folding a week of compute.
-* **prepfold's σ is computed, not measured.** A 128-point MAD has ~7% sampling
-  error and `snr1` is exactly `1/σ̂`, so the MAD alone put a scatter term on the
-  reference column comparable to everything else in it. Both are recorded.
+* **prepfold's σ is computed, not measured.** The MAD carries ~11% scatter on the
+  31–128 bins prepfold picks, and `snr1` is exactly `1/σ̂`, so it put a scatter
+  term on the reference column comparable to everything else in it. Both are
+  recorded.
+* **prepfold's profiles are stored** — 1-in-10 realisations and **every**
+  injection-free one — so the drizzle model can be *checked* rather than
+  believed. `mc_analyze.py --sections drizzle` measures the inter-bin covariance
+  from those null folds and prints it beside the model. Verified against 210 real
+  `prepfold` folds of pure noise: at `dt_per_bin = 1.35`, where the correction is
+  a 10% effect, measured and modelled agree to **0.1–2%** (0.928/0.928,
+  0.896/0.897 at w = 2, 4), and the analytic σ is right to ~2% at every
+  `dt_per_bin`. The empties are what that check needs and they are already at
+  100%; `--keep-profiles 1` stores every realisation's, for ~290 MB over a
+  40k-realisation run.
 * **The duty cycle is stratified and every injection carries an importance
   weight.** Run 1 drew 757 injections below 0.5% duty out of 82,014, and that is
   the one place we lose. The default `--strat 0.005 0.5 0.25` raises that

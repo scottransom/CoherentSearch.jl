@@ -78,7 +78,15 @@ BINS = {
 # ---------------------------------------------------------------------------
 # Loading
 # ---------------------------------------------------------------------------
-def load(paths):
+def load(paths, with_profiles=False):
+    """Every realisation, de-duplicated by index.
+
+    `with_profiles` keeps prepfold's stored profiles.  It is OFF by default and
+    that is not an oversight: a stored profile is 128 floats, so at one realisation
+    in one they are 40% of the file and -- much worse -- several GB of Python
+    float objects once parsed.  Only `sec_drizzle` needs them, and it is the one
+    section that asks.
+    """
     recs, seen = [], set()
     files = []
     for p in paths:
@@ -93,6 +101,11 @@ def load(paths):
                 if "error" in r or r.get("index") in seen:
                     continue
                 seen.add(r["index"])
+                if not with_profiles:
+                    for k in ("prepfold", "prepfold_null"):
+                        for d in (r.get("results", {}).get(k) or []):
+                            if d:
+                                d.pop("prof", None)
                 recs.append(r)
     recs.sort(key=lambda r: r["index"])
     return recs
@@ -724,6 +737,96 @@ def sec_prepfold(rws, args):
           "are not)")
 
 
+def _pooled_corr(profs, widths):
+    """Measured `sigma_bin / sd(S_w)` for a pool of NOISE profiles of one shape.
+
+    This is exactly the factor `drizzle_boxcar_corr` returns, measured instead of
+    modelled.  `S_w` is the zero-mean unit-L2 boxcar sum, evaluated at EVERY
+    phase of every profile and pooled: phases within one profile are correlated,
+    which costs precision but not accuracy, and profiles are independent.
+    """
+    P = np.asarray(profs, dtype=float)
+    # Pooled mean, NOT per-profile: subtracting each profile's own mean removes a
+    # degree of freedom from `nbins` and biases `sd_bin` low by `1/(2 nbins)` --
+    # 0.4% at 128 bins, which is the same size as the effect at large `dt/bin`
+    # and would have been read as a defect in the model.  `S_w` is a zero-sum
+    # template, so it is invariant to any per-profile offset anyway.
+    P = P - P.mean()
+    n = P.shape[1]
+    sd_bin = float(P.std())
+    out = {}
+    c = np.concatenate([P, P], axis=1).cumsum(axis=1)
+    c = np.concatenate([np.zeros((len(P), 1)), c], axis=1)
+    tot = P.sum(axis=1, keepdims=True)
+    for w in widths:
+        if w >= n:
+            continue
+        Sw = c[:, w:w + n] - c[:, 0:n]
+        # (S_w - delta*S_tot) / sqrt(w(1-delta)) is `sum_j h_j P_j` exactly.
+        t = (Sw - (w / n) * tot) / math.sqrt(w * (1.0 - w / n))
+        out[w] = sd_bin / float(t.std())
+    return out, sd_bin
+
+
+def sec_drizzle(recs, args):
+    """Measure prepfold's inter-bin correlation, against the model that corrects it.
+
+    Section 5's correction rests on an ASSUMPTION about what PRESTO's `fold()` does
+    -- that it spreads each sample across the bins its finite duration covers, in
+    proportion to the overlap.  The stored profiles are what let that be checked
+    rather than believed, and the injection-free realisations are the right data
+    for it: they are pure noise folded at periods from the real population, so
+    every number below is a direct measurement of the noise covariance the
+    statistic divides by.
+
+    If the measured column ever departs from the model column, the drizzle model
+    has stopped describing `fold()` -- and every prepfold S/N in the study is
+    then wrong by that factor, silently, in the direction that flatters it.
+    """
+    cells = defaultdict(list)
+    for r in recs:
+        if not r.get("empty"):
+            continue
+        for d in (r["results"].get("prepfold_null") or []):
+            if d and d.get("prof") and d.get("nbins") and d.get("dt_per_bin"):
+                # Bin dt_per_bin by half-decade: the correction is smooth in it,
+                # and it is drawn continuously so no two folds share a value.
+                cells[(d["nbins"], round(math.log10(d["dt_per_bin"]) * 2) / 2)].append(d["prof"])
+    if not cells:
+        print("\n--- prepfold drizzle check: no stored null profiles "
+              "(--keep-profiles 0, or no injection-free realisations) ---")
+        return
+    print("\n--- prepfold inter-bin correlation: MEASURED vs the section-5 model ---")
+    print(f"{'nbins':>6} {'dt/bin':>8} {'nprof':>6} {'sd/sqrt(C0)':>12} {'+-':>6}   "
+          + "  ".join(f"w={w:<2d} meas/model" for w in (1, 2, 4, 8)))
+    for (nb, ldpb), profs in sorted(cells.items(), key=lambda kv: (-kv[0][0], kv[0][1])):
+        if len(profs) < 40:
+            continue
+        dpb = 10.0 ** ldpb
+        meas, sd_bin = _pooled_corr(profs, (1, 2, 4, 8))
+        # The per-bin sd itself: sqrt(C0 * rotations) on unit-variance data.
+        pred_sd = MM.prepfold_sigma(nb, dpb, recs[0].get("N"))
+        cells_txt = []
+        for w in (1, 2, 4, 8):
+            if w not in meas:
+                cells_txt.append(f"{'--':>14}")
+                continue
+            mod = MM.drizzle_boxcar_corr(nb, dpb, w)
+            cells_txt.append(f"{meas[w]:6.3f}/{mod:<6.3f} ")
+        # A width-`w` boxcar has only ~nbins/w independent phases per profile, so
+        # the wide columns are much noisier than the profile count suggests.
+        err = 1.0 / math.sqrt(2 * len(profs) * max(nb / 8.0, 1.0))
+        print(f"{nb:>6} {dpb:>8.2f} {len(profs):>6} {sd_bin / pred_sd:>12.4f} "
+              f"{err:>6.3f}   " + "  ".join(cells_txt))
+    print("  (sd/sqrt(C0) is the measured per-bin noise over the ANALYTIC one -- 1.000\n"
+          "   means the closed-form sigma is right, and `+-` is its rough 1-sigma.\n"
+          "   meas/model is the boxcar correction: they must agree, or `fold()` is not\n"
+          "   drizzling the way `mc_model.fold_covariance` assumes and every prepfold\n"
+          "   S/N is off by the gap.  Read the SMALL dt/bin rows: that is where the\n"
+          "   correction is large (0.82-0.89, i.e. the MSP band) and so where being\n"
+          "   wrong would matter.  At dt/bin > 30 the correction is ~1 either way.)")
+
+
 def sec_duty(rws, args):
     """Duty recovery as bias + scatter, against the realised `ducy_got`."""
     ms = [m for m in present(rws, SEARCHES) if any(r.get(m + "_ducy") for r in rws)]
@@ -876,7 +979,8 @@ def add_model(rws, nharms, maxdecim, quiet=False):
 
 # ---------------------------------------------------------------------------
 SECTIONS = ("header", "cost", "falarm", "roc", "table", "pairs", "decompose",
-            "scatter", "recovery", "model", "prepfold", "duty", "2d", "s50", "harm")
+            "scatter", "recovery", "model", "prepfold", "drizzle", "duty", "2d",
+            "s50", "harm")
 
 
 def main(argv=None):
@@ -917,7 +1021,7 @@ def main(argv=None):
     if bad:
         raise SystemExit(f"unknown section(s) {bad}; choose from {SECTIONS}")
 
-    recs = load(args.paths)
+    recs = load(args.paths, with_profiles=("drizzle" in want))
     if not recs:
         raise SystemExit("no realisations found")
     rws = rows(recs)
@@ -996,6 +1100,8 @@ def main(argv=None):
         sec_model(rws, thr, args)
     if "prepfold" in want:
         sec_prepfold(rws, args)
+    if "drizzle" in want:
+        sec_drizzle(recs, args)
     if "duty" in want:
         sec_duty(rws, args)
     if "2d" in want:
