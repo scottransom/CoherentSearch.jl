@@ -11,11 +11,25 @@ each one recovers.  Design settled in `docs/monte_carlo.md` and
   prepfold          folds at the KNOWN period (`-nosearch`) -- the reference a
                     reader will want, scored BOTH by its chi-squared sigma (the
                     standard) and by an snr1 boxcar on its .bestprof profile (so
-                    there is one column in the same statistic as the searches)
-  accelsearch       -numharm 16 -zmax 0, the standard incoherent harmonic sum
+                    there is one column in the same statistic as the searches).
+                    On the injection-free realisations it folds at periods drawn
+                    from the same population, which gives both of those a
+                    MEASURED null instead of a nominal cut.
+  accelsearch       -numharm 16 -zmax 0, the standard incoherent harmonic sum, on
+                    the raw .fft AND on the de-reddened one
   rseek             riptide's FFA; config A always, the deep 4-range tiling on a
                     subset (measured 4.05x the cost)
-  coherent_search   this repository, at its BARE DEFAULTS
+  coherent_search   this repository: the shipped defaults, plus a low-frequency
+                    DEEP tier every realisation and a full-band deep arm on a
+                    subset (see COH_ARMS)
+
+**Injected S/N is continuous and the duty cycle is stratified.**  Run 1 used six
+integer S/N values and the bare TPA population; the first spent all its resolution
+on six points when what the paper wants is a fitted S/N at 50% detection, and the
+second drew only 757 injections below 0.5% duty -- the one place we lose.  Duty is
+now over-sampled there and every injection carries the importance `weight` that
+undoes it, so population-weighted numbers are unchanged and the narrow-duty cells
+are several times better determined.
 
 **Statistic values are recorded, not booleans.**  Every code runs at a permissive
 threshold and the best match to each injection is stored with its statistic, so
@@ -66,6 +80,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mc_profiles as MP
+import mc_model as MM
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -75,6 +90,31 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Getting this wrong (Pmin = 1/hifreq) makes us search 6x its band and is the
 # mistake `compare_riptide.py`'s docstring records having made once already.
 COH_LOFREQ, COH_HIFREQ, COH_NHARMS, COH_MAXDECIM = 0.1, 125.0, 60, 6
+
+# The coherent arms.  `every` is how often each one runs (1 = every realisation);
+# `--deep-coh-every` overrides the third.
+#
+#   coherent       the shipped defaults, the arm everything else is measured
+#                  against.
+#   coherent_tier  section 4's proposal: a DEEP fold restricted to low frequency.
+#                  `nharms x maxdecim` is unchanged, so `hifreq 5` x 12 still
+#                  reaches 60 Hz; what changes is that a fundamental below 5 Hz is
+#                  folded into 240 bins instead of 120, which is where the whole
+#                  duty < 0.5% deficit lives.  It is a separate INVOCATION, so it
+#                  carries its own false-alarm tail -- which is the point: a deep
+#                  tier has to pay for its own trials, and `mc_analyze` forms
+#                  `coh+tier` by concatenating the two candidate lists, so the
+#                  union's threshold is measured and not assumed.
+#   coherent_deep  the same depth over the WHOLE band, on a subset, purely to
+#                  measure section 4's prediction that a blanket deep search is a net
+#                  LOSS (2-4x the trials, and worse at 5-12% duty because the
+#                  shallowest rung becomes H=20 instead of H=10).
+COH_ARMS = {
+    "coherent":      dict(lofreq=0.1, hifreq=125.0, nharms=60,  maxdecim=6,  every=1),
+    "coherent_tier": dict(lofreq=0.1, hifreq=5.0,   nharms=120, maxdecim=12, every=1),
+    "coherent_deep": dict(lofreq=0.1, hifreq=62.5,  nharms=120, maxdecim=12, every=5),
+}
+
 RSEEK_A = dict(Pmin=1.0 / (COH_HIFREQ * COH_MAXDECIM), Pmax=10.0, bmin=20, bmax=120)
 # riptide-at-its-best: narrow bins ranges where periods are long, but a WIDE one
 # at the short end -- a literal pipeline-style tiling there pins b near 22 and is
@@ -134,14 +174,25 @@ class Cand:
 
 
 def parse_rseek(text):
+    """`period freq width ducy dm snr` -> candidates, carrying the FOLD DEPTH.
+
+    `rseek` does not print `b`, but it prints `width` and `ducy = width / b`, so
+    `b` is exact arithmetic on two printed columns.  It matters: without it an
+    rseek miss at narrow duty cannot be attributed between the downsampling
+    sawtooth (which sets how deep it folded) and the `bins_min` width bank (which
+    caps its widest boxcar at 6 regardless of depth).
+    """
     out = []
     for line in text.splitlines():
         f = line.split()
         if len(f) != 6 or f[0].startswith("period"):
             continue
         try:
-            out.append(Cand(float(f[1]), float(f[5]), float(f[3].rstrip("%")) / 100.0,
-                            {"width": int(f[2])}))
+            w = int(f[2])
+            ducy = float(f[3].rstrip("%")) / 100.0
+            out.append(Cand(float(f[1]), float(f[5]), ducy,
+                            {"width": w,
+                             "nbins": int(round(w / ducy)) if ducy > 0 else None}))
         except ValueError:
             continue
     return out
@@ -203,20 +254,31 @@ def boxcar_widths(nbins, fsp=1.5, maxfrac=0.3):
     return out
 
 
-def snr1(prof):
+def snr1(prof, sigma=None):
     """riptide's `snr1` on a folded profile: peak over the zero-mean unit-L2
-    boxcar bank, with a robust baseline and scale.
+    boxcar bank, with a robust baseline.  Returns `(snr1, width, sigma_used)`.
 
-    Plain `snr1` is CORRECT here, with no band-limited correction: prepfold folds
-    in the time domain, so its phase bins really are independent -- which is the
-    whole distinction that made our own Fourier fold need `_boxcar_shape!`.
+    `sigma` overrides the per-profile MAD.  Use it: the MAD carries ~11% scatter
+    on the 31-128 bins prepfold picks, and `snr1` is exactly `1/sigma-hat`, so it
+    puts a scatter term on prepfold's column comparable to everything else in it
+    -- and prepfold is the CEILING the searches are measured against, so noise
+    there is not neutral.  `mc_model.prepfold_sigma` computes it in closed
+    form from the fold's own drizzle weights.
+
+    **No band-limited correction is applied here** -- prepfold folds in the time
+    domain, so this is the right `snr1`.  What its bins are NOT is independent
+    (the drizzle correlates neighbours), and that correction is applied at
+    analysis time from the `(nbins, dt_per_bin, w)` recorded beside this value;
+    see `mc_model.drizzle_boxcar_corr`.  It is left out of the recorded number on
+    purpose, so the raw statistic stays in the file and a revision of the
+    correction does not mean re-running a week of compute.
     """
     p = np.asarray(prof, dtype=float)
     n = len(p)
     p = p - np.median(p)
-    sd = 1.4826 * np.median(np.abs(p - np.median(p)))
-    if sd <= 0:
-        return float("nan"), None
+    sd = sigma if sigma else 1.4826 * np.median(np.abs(p - np.median(p)))
+    if not sd or sd <= 0:
+        return float("nan"), None, float("nan")
     c = np.concatenate([p, p]).cumsum()
     c = np.concatenate([[0.0], c])
     best, bestw = -np.inf, 1
@@ -226,7 +288,36 @@ def snr1(prof):
         v = s.max() / (sd * math.sqrt(w * (1.0 - d)))
         if v > best:
             best, bestw = v, w
-    return float(best), bestw / n
+    return float(best), bestw, float(sd)
+
+
+def score_bestprof(sigma_chi2, prof, f0, args, keep_profile=False):
+    """One prepfold fold, scored every way the analysis needs.
+
+    Records BOTH sigma estimates and the RAW `snr1`, plus `(nbins, dt_per_bin,
+    w)`.  Two reasons, both learned from run 1: the drizzle correction is applied
+    at analysis time (so revising it does not mean re-folding a week of data), and
+    the MAD it used to divide by is noisy: measured over 144 null folds, the two
+    sigmas agree in the MEDIAN to 0.5% and scatter by **11%** about it (prepfold
+    picks 31 to 128 bins, and a MAD on 31 points is poor).  `snr1` is exactly
+    `1/sigma-hat`, so that 11% landed on every value in the column the searches
+    are measured against.  Recording both lets the run itself settle which to
+    quote rather than the question being decided in advance.
+    """
+    if not prof:
+        return None
+    n = len(prof)
+    dpb = (1.0 / f0) / n / args.dt          # samples per profile bin
+    s_ana = MM.prepfold_sigma(n, dpb, args.nsamp)
+    s1_mad, w_mad, s_mad = snr1(prof)
+    s1_ana, w_ana, _ = snr1(prof, sigma=s_ana)
+    out = dict(chi2_sigma=sigma_chi2, nbins=n, dt_per_bin=dpb,
+               snr1=s1_ana, w=w_ana, ducy=(w_ana / n if w_ana else None),
+               snr1_mad=s1_mad, w_mad=w_mad,
+               sigma_mad=s_mad, sigma_analytic=s_ana)
+    if keep_profile:
+        out["prof"] = [round(float(v), 4) for v in prof]
+    return out
 
 
 def read_bestprof(path):
@@ -307,6 +398,65 @@ def fa_summary(fa):
     return dict(n=len(s), top=[round(v, 3) for v in s[:200]], truncated=len(s) > 200)
 
 
+def add_rednoise(x, dt, fcorner, alpha, rng):
+    """Add a power-law red-noise component to `x` in place.
+
+    `fcorner` is where the red power equals the white: `P(f) = (fcorner/f)^alpha`
+    for `f > 0`, so the added variance is roughly `fcorner^alpha * T^(alpha-1)`
+    and only values well below `1/sqrt(T)` are sane -- at `alpha = 2` and
+    `T = 1006 s`, `fcorner = 0.01 Hz` adds ~10% of the white variance and
+    `fcorner = 1 Hz` adds a thousand times it.
+
+    OFF by default and untouched by run 2 -- everything measured so far is pure
+    white noise, which is the regime where our analytic sigma is exactly right and
+    where riptide's per-profile sigma-hat has no compensating advantage, so a
+    red-noise run is a SEPARATE study whose numbers must not be pooled with the
+    white ones (the FAP calibration and the paired-noise design both have to be
+    redone per subset).  The flag exists so that study is one
+    argument away rather than a fresh code change.
+    """
+    n = len(x)
+    F = np.fft.rfft(rng.normal(size=n))
+    f = np.fft.rfftfreq(n, dt)
+    g = np.zeros_like(f)
+    g[1:] = (fcorner / f[1:]) ** (0.5 * alpha)
+    F *= g
+    x += np.fft.irfft(F, n)
+    return x
+
+
+def one_in(idx, n):
+    """True on 1-in-`n` realisations, spread EVENLY over the workers.
+
+    `idx % n` looks right and is not.  Worker `w` of `W` takes the indices with
+    `idx % W == w`, so whenever `n` divides `W` -- 15 workers with
+    `--deep-every 5`, or run 1's 48 with 3 -- `idx % n` is CONSTANT inside a
+    worker: the entire subset lands on `W/n` of the workers, those workers are
+    then the slow ones (the deep tiling is 121 s), and the finished subset comes
+    out far under 1-in-n.  **Run 1 asked for 1-in-3 and finished with 14.4%**
+    (2,197 of 15,212), which is exactly this and was read as normal attrition.
+
+    Hashing the index decorrelates the selector from the worker stride while
+    staying a pure function of the index, so a rerun still reproduces the same
+    subset and workers still need no coordination.
+
+    **It has to be a real mixer, not a multiply.**  A plain `idx * K` preserves
+    the low bits -- `K mod 4 == 1` for the usual Knuth constant, so `(idx*K) % 4
+    == idx % 4` and the whole failure comes straight back for every power-of-two
+    `n`.  Caught by `test_mc.py` at `W = 20, n = 4`, where the per-worker counts
+    were `0..300` against an ideal 75.  This is splitmix64's finaliser, which
+    mixes every bit into every other.
+    """
+    if n <= 0:
+        return False
+    if n == 1:
+        return True
+    z = (idx + 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & 0xFFFFFFFFFFFFFFFF
+    return ((z ^ (z >> 31)) % n) == 0
+
+
 # ---------------------------------------------------------------------------
 # One realisation
 # ---------------------------------------------------------------------------
@@ -314,15 +464,25 @@ def realisation(idx, args, pop, tools, seedseq):
     rng = np.random.default_rng(seedseq)
     N, dt = args.nsamp, args.dt
     T = N * dt
-    empty = (idx % args.noise_every) == 0 if args.noise_every > 0 else False
+    empty = one_in(idx, args.noise_every)
     ninj = 0 if empty else args.injections
 
     rec = dict(index=idx, host=os.uname().nodename, t_start=time.time(),
                N=N, dt=dt, T=T, empty=empty, injections=[], timing={}, results={},
-               config=dict(coh=dict(lofreq=COH_LOFREQ, hifreq=COH_HIFREQ,
-                                    nharms=COH_NHARMS, maxdecim=COH_MAXDECIM,
-                                    threshold=args.threshold),
-                           rseek_A=RSEEK_A, tol_bins=args.tol_bins))
+               config=dict(coh=COH_ARMS, rseek_A=RSEEK_A, tol_bins=args.tol_bins,
+                           threshold=args.threshold, trials=tools.get("trials"),
+                           strat=args.strat, rednoise=args.rednoise))
+
+    # On an injection-free realisation, draw the SAME number of pulsars anyway --
+    # not to inject them, but to give prepfold somewhere to fold.  Folding pure
+    # noise at periods from the real population is what turns `snr1` and
+    # `chi2_sigma` from nominal cuts into measured nulls.
+    null_draws = []
+    if empty:
+        while len(null_draws) < args.injections:
+            d = pop.draw(rng, dt, args.min_fwhm_samples)
+            d["f0"] = 1.0 / d["period"]
+            null_draws.append(d)
 
     # --- draw, rejecting harmonic or near-coincident pairs -----------------
     draws = []
@@ -332,19 +492,34 @@ def realisation(idx, args, pop, tools, seedseq):
         if any(harmonic_label(f0, e["f0"], T, 5 * args.tol_bins) for e in draws):
             continue                      # would be indistinguishable at scoring
         d["f0"] = f0
-        d["snr"] = float(rng.choice(args.snrs))
+        # **Continuous, not a six-point grid.**  Run 1's integers bracketed the
+        # curve well (15% at 6, 99.6% at 11) but spent all their resolution on six
+        # points, and what the paper wants is the S/N at 50% detection -- which is
+        # a FIT, and fits better to a continuous covariate.
+        d["snr"] = (float(rng.uniform(*args.snr_range)) if args.snrs is None
+                    else float(rng.choice(args.snrs)))
         d["phase0"] = float(rng.random())
         draws.append(d)
 
     # --- build the time series ---------------------------------------------
     t0 = time.perf_counter()
     x = rng.normal(size=N)
+    if args.rednoise:
+        add_rednoise(x, dt, args.rednoise, args.rednoise_alpha, rng)
     for d in draws:
         prof, info = MP.make_profile(d["ducy"], d["w10_w50"])
         MP.inject(x, dt, d["period"], d["phase0"], prof, d["snr"])
         d["profile"] = dict(tau=info["tau"], ped=info["ped"],
                             ratio_got=info["ratio"], ducy_got=info["ducy"],
                             exact=info["exact"])
+        # The section-4 band-limited efficiency of the arm we ship, for THIS pulse
+        # shape at THIS frequency: what fraction of the injected S/N a 120-bin
+        # fold truncated at the data's own Nyquist can recover.  ~1 ms, and it
+        # lets the analysis normalise recovery out and see what is left.  The
+        # profile is already built here, so this costs no extra `make_profile`.
+        A = MM.profile_harmonics(prof, COH_NHARMS)
+        hmax = min(COH_NHARMS, int(math.floor(0.5 / (dt * d["f0"]))))
+        d["model_eff"] = MM.ladder_efficiency(A, COH_NHARMS, COH_MAXDECIM, hmax)[0]
         rec["injections"].append(d)
     stem = os.path.join(args.workdir, f"mc{idx:07d}_DM00.00")
     x.astype(np.float32).tofile(stem + ".dat")
@@ -353,7 +528,9 @@ def realisation(idx, args, pop, tools, seedseq):
     rec["timing"]["generate"] = time.perf_counter() - t0
 
     try:
-        _search_all(rec, draws, stem, args, tools, T)
+        _search_all(rec, draws, null_draws, stem, args, tools, T,
+                    keep_prof=(args.keep_profiles > 0
+                               and (empty or one_in(idx, args.keep_profiles))))
     finally:
         if not args.keep:
             for f in glob.glob(stem + "*"):
@@ -365,7 +542,7 @@ def realisation(idx, args, pop, tools, seedseq):
     return rec
 
 
-def _search_all(rec, draws, stem, args, tools, T):
+def _search_all(rec, draws, null_draws, stem, args, tools, T, keep_prof=False):
     inj = [dict(f0=d["f0"]) for d in draws]
     tol = args.tol_bins
     # **Run every PRESTO tool with cwd = the work directory, and give it BARE
@@ -393,9 +570,12 @@ def _search_all(rec, draws, stem, args, tools, T):
         shutil.copyfile(stem + ".inf", stem + "_red.inf")
 
     # --- prepfold, one fold per injection at the KNOWN period ---------------
-    pf = []
-    t_pf = 0.0
-    for i, d in enumerate(draws):
+    # On an INJECTION-FREE realisation the same folds are done at periods drawn
+    # from the same population.  That is what gives `snr1` and `chi2_sigma` a
+    # MEASURED null, so prepfold can join the FAP-matched table as a proper
+    # ceiling instead of sitting beside it at a nominal cut that means nothing.
+    pf, t_pf = [], 0.0
+    for i, d in enumerate(draws if draws else null_draws):
         o = f"{stem}_pf{i}"
         cmd = [tools["prepfold"], "-f", repr(d["f0"]), "-nosearch", "-fine",
                "-noxwin", "-nopdsearch", "-o", os.path.basename(o)]
@@ -411,18 +591,31 @@ def _search_all(rec, draws, stem, args, tools, T):
             pf.append(None)
             continue
         sig, prof = read_bestprof(best[0])
-        s1, ducy = snr1(prof) if prof else (float("nan"), None)
-        pf.append(dict(chi2_sigma=sig, snr1=s1, ducy=ducy, nbins=len(prof)))
+        pf.append(score_bestprof(sig, prof, d["f0"], args, keep_profile=keep_prof))
     rec["timing"]["prepfold"] = t_pf
-    rec["results"]["prepfold"] = pf          # targeted: no false-alarm column
+    # Targeted: no false-alarm column of its own, so the empty realisations'
+    # folds are filed separately -- `mc_analyze` reads them as prepfold's null.
+    rec["results"]["prepfold_null" if not draws else "prepfold"] = pf
 
-    # --- accelsearch --------------------------------------------------------
-    t, _, _, rc = run([tools["accelsearch"], "-numharm", "16", "-zmax", "0",
-                       "-sigma", str(args.accel_sigma), base + ".fft"], cwd=wd)
-    rec["timing"]["accelsearch"] = t
-    ac = parse_accel(stem + "_ACCEL_0")
-    hits, fa = score(ac, inj, T, tol)
-    rec["results"]["accelsearch"] = dict(hits=hits, false=fa_summary(fa), ncand=len(ac))
+    # --- accelsearch, on BOTH the raw and the de-reddened FFT ---------------
+    # Run 1 gave accelsearch the raw `.fft` while `coherent_search` got
+    # `_red.fft`, which is an asymmetry a referee will find: `rednoise` also
+    # normalises the powers, and accelsearch's own local normalisation is not the
+    # same operation.  Running both settles it from inside the study instead of
+    # by argument.  The two arms write `<base>_ACCEL_0` and `<base>_red_ACCEL_0`,
+    # which is why each is parsed from its own input's stem rather than a fixed
+    # name.
+    for name, src in (("accelsearch", base + ".fft"),
+                      ("accelsearch_red", base + "_red.fft")):
+        if name == "accelsearch_red" and not args.accel_red:
+            continue
+        t, _, _, rc = run([tools["accelsearch"], "-numharm", "16", "-zmax", "0",
+                           "-sigma", str(args.accel_sigma), src], cwd=wd)
+        rec["timing"][name] = t
+        ac = parse_accel(os.path.join(wd, src[:-4] + "_ACCEL_0"))
+        hits, fa = score(ac, inj, T, tol)
+        rec["results"][name] = dict(hits=hits, false=fa_summary(fa), ncand=len(ac),
+                                    ok=(rc == 0))
 
     # --- rseek, config A ----------------------------------------------------
     def rseek(cfg):
@@ -437,7 +630,7 @@ def _search_all(rec, draws, stem, args, tools, T):
                                      ok=(rc == 0))
 
     # --- rseek, deep tiling, on a subset ------------------------------------
-    if args.deep_every > 0 and (rec["index"] % args.deep_every) == 0:
+    if one_in(rec["index"], args.deep_every):
         allc, tt, ok = [], 0.0, True
         for cfg in RSEEK_B:
             t, out, _, rc = rseek(cfg)
@@ -450,20 +643,95 @@ def _search_all(rec, draws, stem, args, tools, T):
                                          ncand=len(allc), ok=ok)
         rec["config"]["rseek_B"] = RSEEK_B
 
-    # --- coherent_search, BARE DEFAULTS ------------------------------------
-    out_f = stem + ".cohout"
-    cmd = [tools["julia"], f"--project={REPO}", f"-t{args.coh_threads}",
-           os.path.join(REPO, "bin", "coherent_search.jl"),
-           "--threshold", str(args.threshold), "--noprogress",
-           "--ncands", str(args.ncands), "-o", out_f, stem + "_red.fft"]
-    t, _, err, rc = run(cmd)
-    rec["timing"]["coherent"] = t
-    ch = parse_cohout(out_f) if rc == 0 else []
-    hits, fa = score(ch, inj, T, tol)
-    rec["results"]["coherent"] = dict(hits=hits, false=fa_summary(fa), ncand=len(ch),
-                                      ok=(rc == 0))
-    if rc != 0:
-        rec["results"]["coherent"]["stderr"] = err[-2000:]
+    # --- coherent_search: the shipped defaults, plus the deeper arms --------
+    # Three SEPARATE invocations, not one: each arm is a different `SearchParams`,
+    # and -- more to the point -- each must carry its OWN false-alarm tail, so a
+    # deeper configuration pays for its own trials instead of being handed the
+    # default arm's threshold.  The ~2 s of Julia start-up per arm is ~4% of a
+    # realisation and buys a threshold that is measured rather than assumed.
+    for name, cfg in COH_ARMS.items():
+        every = args.deep_coh_every if name == "coherent_deep" else cfg["every"]
+        if every != 1 and not one_in(rec["index"], every):
+            continue
+        out_f = f"{stem}_{name}.cohout"
+        cmd = [tools["julia"], f"--project={REPO}", f"-t{args.coh_threads}",
+               os.path.join(REPO, "bin", "coherent_search.jl"),
+               "--threshold", str(args.threshold), "--noprogress",
+               "--lofreq", repr(cfg["lofreq"]), "--hifreq", repr(cfg["hifreq"]),
+               "--nharms", str(cfg["nharms"]), "--maxdecim", str(cfg["maxdecim"]),
+               "--ncands", str(args.ncands), "-o", out_f, stem + "_red.fft"]
+        t, _, err, rc = run(cmd)
+        rec["timing"][name] = t
+        ch = parse_cohout(out_f) if rc == 0 else []
+        hits, fa = score(ch, inj, T, tol)
+        rec["results"][name] = dict(hits=hits, false=fa_summary(fa), ncand=len(ch),
+                                    ok=(rc == 0))
+        if rc != 0:
+            rec["results"][name]["stderr"] = err[-2000:]
+
+
+# ---------------------------------------------------------------------------
+# Trial counts, so cost can be normalised per unit of searching
+# ---------------------------------------------------------------------------
+def trial_counts(args, path):
+    """Statistics each code evaluates on one realisation.  Cached in `path`.
+
+    Computed ONCE, in the parent, and handed to every worker: it is a property of
+    the configuration and the file length, not of a realisation.  Without it the
+    cost column can only say "we are 6x faster than rseek_B", which is a statement
+    about two implementations; with it the comparison can be made per trial, which
+    is a statement about two algorithms.
+
+    `rseek`'s count is MEASURED (riptide's `ffa_search` returns the periodogram it
+    built) on a shorter series and scaled: at fixed `tsamp` and period range the
+    downsampling ladder is identical and the number of shifts is linear in the
+    sample count, so the scaling is exact and a 2^20 probe costs a second instead
+    of a minute and a gigabyte.  Ours is analytic and exact.  accelsearch's is an
+    ESTIMATE (`numharm x N/2`) and marked as one -- its sigma is already
+    trials-corrected, so the number is context, not a normaliser.
+    """
+    if os.path.isfile(path):
+        try:
+            with open(path) as fh:
+                return json.load(fh)
+        except Exception:
+            pass
+    out = {}
+    T = args.nsamp * args.dt
+    for name, cfg in COH_ARMS.items():
+        # Fundamental trials x rungs: `(hifreq - lofreq) * T * nharms / hidr`
+        # fundamentals, each scored at every decimation in the ladder.
+        nfund = (cfg["hifreq"] - cfg["lofreq"]) * T * cfg["nharms"] / 0.5
+        nk = len([k for k in range(1, cfg["maxdecim"] + 1)
+                  if cfg["nharms"] // k >= 2])
+        out[name] = int(round(nfund * nk))
+    out["accelsearch"] = int(16 * args.nsamp / 2)
+    out["accelsearch_red"] = out["accelsearch"]
+    try:
+        import numpy as _np
+        from riptide import TimeSeries, ffa_search
+        nprobe = 1 << 20
+        scale = args.nsamp / nprobe
+        ts = TimeSeries.from_numpy_array(
+            _np.random.default_rng(0).normal(size=nprobe).astype(_np.float32),
+            tsamp=args.dt)
+        for name, cfgs in (("rseek_A", [RSEEK_A]), ("rseek_B", RSEEK_B)):
+            tot = 0
+            for c in cfgs:
+                _, pg = ffa_search(ts, period_min=c["Pmin"], period_max=c["Pmax"],
+                                   bins_min=c["bmin"], bins_max=c["bmax"])
+                tot += len(pg.periods) * len(_np.asarray(pg.widths))
+            out[name] = int(round(tot * scale))
+    except Exception as exc:                 # riptide not importable, or it moved
+        out["rseek_note"] = f"not counted: {exc!r}"
+    try:
+        tmp = path + f".{os.getpid()}.tmp"
+        with open(tmp, "w") as fh:
+            json.dump(out, fh, indent=1)
+        os.replace(tmp, path)                # atomic, so a reader never sees half
+    except OSError:
+        pass
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -495,11 +763,42 @@ def main(argv=None):
     ap.add_argument("--injections", type=int, default=6)
     ap.add_argument("--noise-every", type=int, default=10,
                     help="every Nth realisation gets NO injections (false-alarm calibration); 0 disables")
-    ap.add_argument("--deep-every", type=int, default=3,
-                    help="every Nth realisation also gets the deep rseek tiling (4.05x its cost); 0 disables")
+    ap.add_argument("--deep-every", type=int, default=5,
+                    help="every Nth realisation also gets the deep rseek tiling "
+                         "(121 s, the single largest cost, and already losing by "
+                         "7.3 points); 0 disables")
+    ap.add_argument("--deep-coh-every", type=int, default=5,
+                    help="every Nth realisation also gets the FULL-BAND deep coherent "
+                         "arm (nharms 120, maxdecim 12, hifreq 62.5) -- the arm that "
+                         "measures whether a blanket deep search is the net loss "
+                         "section 4 predicts; 0 disables")
+    ap.add_argument("--accel-red", action="store_true", default=True)
+    ap.add_argument("--no-accel-red", dest="accel_red", action="store_false",
+                    help="do NOT also run accelsearch on _red.fft (run 1 gave it "
+                         "only the raw .fft while we got the de-reddened one)")
+    ap.add_argument("--keep-profiles", type=int, default=10,
+                    help="store prepfold's actual profile on every Nth realisation "
+                         "(and on every injection-free one), so section 5's correction "
+                         "can be re-derived without re-folding; 0 disables")
+    ap.add_argument("--strat", type=float, nargs=3, default=[0.005, 0.5, 0.25],
+                    metavar=("D0", "ALPHA", "QMIN"),
+                    help="duty-cycle stratification: keep a draw of duty d with "
+                         "probability clip((D0/d)^ALPHA, QMIN, 1) and weight it 1/q. "
+                         "The default raises the fraction below 0.5%% duty from 1.5%% "
+                         "to 3.7%% at 0.85 effective sample size.  Pass '0 0 1' for "
+                         "the unstratified population")
+    ap.add_argument("--rednoise", type=float, default=0.0,
+                    help="add power-law red noise with this corner frequency in Hz "
+                         "(0 = off, which is what run 2 uses).  Sane values are "
+                         "~0.003-0.05 at T = 1006 s; see add_rednoise for why")
+    ap.add_argument("--rednoise-alpha", type=float, default=2.0)
     ap.add_argument("--nsamp", type=int, default=1 << 24)
     ap.add_argument("--dt", type=float, default=60.0e-6)
-    ap.add_argument("--snrs", type=float, nargs="+", default=[6, 7, 8, 9, 10, 11])
+    ap.add_argument("--snrs", type=float, nargs="+", default=None,
+                    help="inject at these DISCRETE S/N values (run 1's six integers); "
+                         "omit for the continuous default")
+    ap.add_argument("--snr-range", type=float, nargs=2, default=[5.5, 11.5],
+                    metavar=("LO", "HI"))
     ap.add_argument("--min-fwhm-samples", type=float, default=3.0)
     ap.add_argument("--threshold", type=float, default=6.0, help="coherent_search S/N floor")
     ap.add_argument("--ncands", type=int, default=500)
@@ -518,6 +817,10 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     os.makedirs(args.outdir, exist_ok=True)
+    # Once, in the PARENT, before any worker starts: it is a property of the
+    # configuration and the file length, and 15 workers racing to write the same
+    # cache file is how a half-written JSON gets read.
+    trial_counts(args, os.path.join(args.outdir, "trials.json"))
 
     # Pin every child's thread pool to 1, inherited through the environment.
     #
@@ -570,6 +873,7 @@ def main(argv=None):
                  rednoise=which("rednoise", None, extra),
                  prepfold=which("prepfold", None, extra),
                  accelsearch=which("accelsearch", None, extra))
+    tools["trials"] = trial_counts(args, os.path.join(args.outdir, "trials.json"))
 
     # A plain SIGTERM (a `pkill`, or the batch system) does not raise in Python,
     # so the `finally` that removes the scratch directory never runs and each
@@ -590,7 +894,9 @@ def main(argv=None):
     args.workdir = workdir
 
     tpa = MP.load_tpa(args.tpa) if args.tpa else None
-    pop = MP.Population(tpa=tpa)
+    strat = tuple(args.strat) if args.strat and args.strat[0] > 0 else None
+    args.strat = list(strat) if strat else None
+    pop = MP.Population(tpa=tpa, strat=strat)
 
     outfile = os.path.join(args.outdir, f"mc_{os.uname().nodename}_{args.worker:03d}.jsonl")
     done = set()
@@ -632,7 +938,9 @@ def main(argv=None):
                 # burned a whole night.  Better to stop now than to produce a
                 # confident, entirely wrong table in the morning.
                 if n == 0:
-                    dead = [m for m in ("rseek_A", "rseek_B", "coherent")
+                    dead = [m for m in ("rseek_A", "rseek_B", "accelsearch",
+                                        "accelsearch_red", "coherent",
+                                        "coherent_tier", "coherent_deep")
                             if m in rec.get("results", {})
                             and not rec["results"][m].get("ok", True)]
                     if dead or "error" in rec:

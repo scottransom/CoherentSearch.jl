@@ -462,3 +462,212 @@ is. Simulate it once per `(nbins, dt_per_bin)` cell rather than deriving it —
   ask about.
 * **A second observation length.** All of this is `T = 1006 s`. The threshold
   advantage of §2a should grow with `T`; worth one confirming run.
+
+---
+
+# Run 2 — configured 2026-08-29, for fitzroy
+
+Everything in §7 and §8 is implemented. `mc/launch_fitzroy.sh` is the command;
+15 of fitzroy's 40 logical CPUs, ~137 s per realisation, ~9,400 realisations
+(~56,000 injections) per day. What follows records the decisions, the two things
+that had to be *fixed* rather than added, and what the two new models are worth.
+
+## 9. What run 2 changes
+
+**New arms.** Three coherent invocations instead of one (`COH_ARMS`), plus
+`accelsearch` on `_red.fft`:
+
+| arm | configuration | how often | why |
+|---|---|---|---|
+| `coherent` | the shipped defaults | every | the baseline |
+| `coherent_tier` | `nharms 120 maxdecim 12 hifreq 5` | every | §4's actual proposal |
+| `coherent_deep` | `nharms 120 maxdecim 12 hifreq 62.5` | 1-in-5 | §4's *counter*-claim: that a blanket deep search is a net loss |
+| `accelsearch_red` | `-numharm 16 -zmax 0` on `_red.fft` | every | the asymmetry §6 flags |
+
+They are **separate invocations on purpose.** Each arm then carries its own
+false-alarm tail, so the deep tier pays for its own trials instead of being handed
+the default arm's threshold — which is exactly the quantity §4 had to *model*
+(`Δthr ≈ ln(N)/thr`) and could not measure. `mc_analyze.py` forms `coh+tier` by
+concatenating the two candidate lists, which is what a tiered search would
+actually report, and its threshold is then measured like any other column. The
+cost is ~2 s of Julia start-up per arm, ~4% of a realisation.
+
+`rseek_B` goes to `--deep-every 5`: it is 121 s, the single largest line in the
+budget, and it is already losing by 7.3 points.
+
+**Sampling.** Injected S/N is continuous over 5.5–11.5 (the six integers spent all
+their resolution on six points, and what the paper wants is a *fitted* S/N at 50%
+detection). Duty cycle is stratified by rejection — keep a draw of duty `d` with
+probability `clip((0.005/d)^0.5, 0.25, 1)` and weight it `1/q` — which takes the
+fraction below 0.5% duty from 1.5% to **3.7%** at 0.85 effective sample size, and
+leaves every population-weighted number identical because the weights are exact.
+Rejection rather than a tilted proposal: a draw costs no simulation, and the
+target is a bootstrap of the TPA table with no closed form to tilt.
+
+**Recording.** Per injection, the §4 model efficiency (~1 ms, and the profile is
+already built). Per prepfold fold, `nbins`, `dt_per_bin`, the winning width, the
+raw `snr1`, *both* σ estimates, and the profile itself on 1-in-10 realisations and
+on every injection-free one. Per rseek candidate, the fold depth `b` — which it
+does not print, but `b = width/ducy` is exact arithmetic on two columns it does.
+Per run, each code's trial count (`trials.json`, computed once in the parent;
+riptide's is measured from `ffa_search` on a 2^20 probe and scaled, which is exact
+because the ladder is identical and the shift count is linear in the samples).
+
+**prepfold folds the injection-free realisations too**, at periods drawn from the
+same population. That gives `snr1` and `chi2_sigma` a measured null, so prepfold
+can enter the FAP-matched table as a proper ceiling.
+
+**Red noise is NOT in this run.** `--rednoise` exists, is tested, and is off. It
+is a separate study: its FAP calibration and its paired-noise design both have to
+be redone per subset, so mixing a red fraction into run 2 would split every cell
+rather than add an axis.
+
+## 10. Two things that were broken, not missing
+
+**`idx % N` does not select 1-in-N when workers stride by `W`.** Worker `w` takes
+the indices with `idx % W == w`, so when `N | W` — 15 workers with
+`--deep-every 5`, or run 1's 48 with 3 — `idx % N` is *constant inside a worker*.
+The whole subset lands on `W/N` of the workers, those workers are then the slow
+ones (they are the ones running the 121 s tiling), and the finished subset comes
+out far under `1/N`. **Run 1 asked for 1-in-3 and finished with 14.4%** (2,197 of
+15,212 realisations), and that was read as ordinary attrition. `one_in(idx, n)`
+now hashes the index first; measured over 6,000 indices at `W=15, N=5`, the
+per-worker counts go from `0..200` to `67..95` against an ideal 80 — which is
+just binomial scatter.
+
+It has to be a *real* mixer. The first fix was a multiply by Knuth's constant,
+and `2654435761 mod 4 == 1`, so `(idx·K) mod 4 == idx mod 4` and the entire
+failure came straight back for every power-of-two `N` — `mc/test_mc.py` caught it
+at `W = 20, N = 4`, where the counts were `0..300` against an ideal 75. It is
+splitmix64's finaliser now.
+
+**The §4 model's phase average was not sub-bin.** The recorded model sampled the
+pulse phase over a whole turn, but the maximisation over the boxcar's integer
+start bin already absorbs whole-bin shifts — so on any grid that divides the fold,
+every phase sample gives the identical answer and a pulse split across two bins is
+never sampled at all. That is why §4 read **optimistic by ~8 points** at duty
+< 0.5% (51.3% against a measured 43.6%). `mc_model.ladder_efficiency` uses `nsub`
+points per bin of the *finest* rung spanning one bin of the *coarsest*, which is
+one grid every rung sees uniformly and which lets the max over rungs be taken
+before the average over phase, in that order.
+
+## 11. What the two models are worth, measured against run 1
+
+**The §4 efficiency model, re-derived and re-validated.** Absolute efficiency,
+von Mises core (§4's own table in brackets):
+
+| duty | 60/6 | 120/6 | 120/12 | 240/24 |
+|---|---|---|---|---|
+| 0.2% | 0.547 (0.591) | 0.743 (0.795) | 0.743 (0.795) | 0.917 (0.941) |
+| 0.5% | 0.806 (0.859) | 0.948 (0.979) | 0.948 (0.979) | 0.956 (0.979) |
+| 1% | 0.947 (0.979) | 0.955 (0.979) | 0.955 (0.979) | 0.970 (0.994) |
+| 5% | 0.967 (0.994) | 0.959 (0.970) | 0.972 (0.994) | 0.974 (0.994) |
+| 8% | 0.964 (0.993) | 0.941 (0.947) | 0.964 (0.993) | 0.964 (0.993) |
+| 12% | 0.946 (0.958) | 0.931 (0.936) | 0.947 (0.958) | 0.948 (0.958) |
+
+Every structural conclusion survives: `120/6` alone **loses** at 5–12% duty,
+`120/12` dominates `60/6` everywhere, `240/24` only adds below 0.3%. The whole
+table is 2–5% lower, which is what honest sub-bin phase averaging costs.
+
+Against run 1's 82,014 injections, at the measured threshold 7.05:
+
+| duty | n | model eff | measured eff | **predicted det%** | **measured det%** |
+|---|---|---|---|---|---|
+| <0.5% | 757 | 0.781 | 0.811 | **40.2** | **43.6** |
+| 0.5–1% | 4366 | 0.897 | 0.919 | 60.9 | 62.1 |
+| 1–2% | 11228 | 0.943 | 0.969 | 65.4 | 69.1 |
+| 2–4% | 16074 | 0.955 | 0.984 | 66.7 | 71.4 |
+| 4–8% | 15944 | 0.964 | 0.990 | 67.9 | 73.1 |
+| 8–16% | 15064 | 0.945 | 0.988 | 65.6 | 72.4 |
+| >16% | 18581 | 0.917 | 0.972 | 63.4 | 71.6 |
+
+(measured efficiency is detected-only, hence biased high; compare the detection
+columns.) It is now **3–8 points pessimistic** rather than 8 points optimistic,
+and in the narrow-duty corner that matters it is out by 3.4 points instead of 7.7.
+It is a model and the deep arms are being measured anyway — but it is no longer
+the thing the §4 conclusion rests on.
+
+**The §5 drizzle correction, and it does what §5 predicted.** `fold_covariance`
+is exact linear algebra on the fold weights rather than a Monte Carlo: with
+`dpb ≥ 1` a sample touches at most two bins and, averaged over sub-bin sample
+phase, `C[0] = dpb − 1/3` and `C[1] = 1/6` exactly. (`dpb < 1` does occur — 0.995,
+because prepfold's bin count is a rounded quantity — and falls back to a numeric
+accumulation over the real weights.) The correction is
+`√(C[0] / hᵀCh)` for the zero-mean unit-L2 boxcar `h`, and it reproduces §5's
+simulated table to 0.5–2% at every `(nbins, dpb, w)` cell in it.
+
+Applied to run 1, at fixed duty 5–20% so the profile-shape loss is flat:
+
+| f0 (Hz) | n | nbins | dt/bin | raw | corrected | `coherent` |
+|---|---|---|---|---|---|---|
+| 0.1–1 | 600 | 128 | 221.3 | 0.903 | 0.902 | 0.961 |
+| 1–5 | 2537 | 128 | 46.2 | 0.904 | 0.901 | 0.981 |
+| 5–20 | 5730 | 128 | 11.5 | 0.911 | 0.898 | 0.984 |
+| 20–100 | 5927 | 128 | 3.98 | 0.923 | 0.888 | 0.985 |
+| 100–200 | 1232 | 64 | 1.38 | 0.965 | 0.857 | 0.990 |
+| 200–300 | 8897 | 64 | 1.04 | **1.009** | **0.858** | 0.993 |
+| 300–400 | 4482 | 50 | 1.00 | **1.004** | 0.842 | 0.994 |
+| 400–1000 | 1845 | 37 | 1.00 | 0.968 | 0.820 | 0.988 |
+
+The raw column **rises 11% with frequency and crosses 1.0**; corrected it is
+monotone and always below 1, and 200–300 Hz lands at 0.858 against §5's predicted
+~0.84. The residual fall above 300 Hz is the shrinking `nbins` prepfold picks,
+which is a real loss and not a normalisation. It also moves the recovered-statistic
+scatter of §2b: `prepfold_snr1` sd 1.909 → **1.691**, against `rseek_A` 1.526 and
+our 0.991.
+
+**The correction is applied at ANALYSIS time**, from the `(nbins, dt_per_bin, w)`
+recorded beside the raw value — so revising it never means re-folding a week of
+compute, and run 1's output gets it for free.
+
+## 12. `mc_analyze.py` now
+
+Fourteen sections, `--sections` to pick, `--fap 1e-2` by default (a nominal cut is
+not a comparison and there is no longer a way to ask for one by accident). All of
+§7 is in: the common-subset restriction on every cross-code cell, bootstrap by
+realisation, McNemar discordant pairs, the ROC over seven FAP decades, top-N
+saturation flags, the threshold/paired-Δstat decomposition with its
+counterfactual, the null-scatter table, 2-D (duty × f0) and (duty × S/N) maps,
+`--weight tpa|flat`, detection per CPU-second and per trial, the §4 model overlay,
+duty recovery as bias + scatter, and the drizzle-corrected prepfold column.
+
+It reproduces §1–§3 exactly where it should: 27.5 / 41.8 / 64.3 / **71.6%** on the
+common subset at FAP 1e-2, the duty < 0.5% cell at 50.8% against `rseek_B`'s
+64.4%, and the FAP-invariant ordering from 1 to 1e-3.
+
+Two things worth knowing when running it: pass `-u` and do not pipe into
+`head`/`tail` (Python buffers, and the report prints as it goes), and `--model` on
+run-1 output takes a few minutes because it has to rebuild the profiles the driver
+no longer has.
+
+## 13. `mc/test_mc.py`
+
+Nineteen pins, all green, run in ~40 s. They cover the things that would fail
+*silently* and in a plausible direction: the width bank against the Julia it
+transcribes (all cells, three configurations), the drizzle covariance's closed
+form against a direct accumulation over the real fold weights, the efficiency
+model's structural claims (`120/6` loses at broad duty, `120/12` recovers it,
+truncation dominates at 0.2% duty), and — the one that matters most — that the
+stratified sampler's importance weights *restore the population*. A broken weight
+is the single bug in this study that would make every headline number wrong while
+every plot still looked reasonable.
+
+Two of them earned their keep on the first run: the `one_in` power-of-two case
+above, and a claim in the model that turned out to be **backwards**. Truncating
+the harmonic sum at the data's own Nyquist makes a broad pulse's efficiency go
+**up** (0.982 at `hmax = 20` against 0.967 unlimited, at 5% duty), because the
+rows past the last filled harmonic are zero and `_boxcar_shape!` stops counting
+their noise — a free matched low-pass. That is the 1b8fed9 normalisation working
+as designed, and it is why our detection fraction was *flat* in frequency in run 1
+rather than falling off in the MSP band. For a 0.2%-duty pulse, whose power
+really does run past the cap, truncation costs what one expects (0.547 → 0.219 at
+`hmax = 8`).
+
+## 14. Still not done
+
+* **A second observation length.** All of this is `T = 1006 s`. §2a's threshold
+  advantage should grow with `T`; one confirming run.
+* **Red noise**, per §8 — the flag is there, the run is not.
+* The `--normalize` per-region threshold in the search itself. Run 2 measures the
+  tiered configuration by running two invocations, which is the right *experiment*
+  but is not how anyone would want to ship it.

@@ -52,9 +52,11 @@ import mc_profiles as MP
 
 # One colour per method, used everywhere so the panels can be read together.
 COLOURS = {"prepfold_chi2": "#8c8c8c", "prepfold_snr1": "#3b7dd8",
-           "accelsearch": "#d9822b", "rseek_A": "#c1272d", "rseek_B": "#7b3fa0",
-           "coherent": "#1a9850"}
-SNR1_LIKE = ("prepfold_snr1", "rseek_A", "coherent")   # same statistic, comparable
+           "accelsearch": "#d9822b", "accelsearch_red": "#b06010",
+           "rseek_A": "#c1272d", "rseek_B": "#7b3fa0",
+           "coherent": "#1a9850", "coherent_tier": "#0d6e33",
+           "coherent_deep": "#66bd63", "coh+tier": "#054d21"}
+SNR1_LIKE = ("prepfold_snr1", "rseek_A", "coherent", "coh+tier")
 
 
 def frac(rws, m, thr, key, edges):
@@ -106,6 +108,9 @@ def main(argv=None):
     ap.add_argument("--threshold", type=float, default=6.0)
     ap.add_argument("--fap", type=float, default=None,
                     help="give each code the threshold at which it makes this many false alarms per realisation")
+    ap.add_argument("--methods", default=None,
+                    help="comma-separated subset to plot (run 2 has ten, which is "
+                         "too many curves for one panel to be read)")
     args = ap.parse_args(argv)
 
     recs = MA.load(args.paths)
@@ -113,9 +118,12 @@ def main(argv=None):
         raise SystemExit("no realisations found")
     rws = MA.rows(recs)
     methods = [m for m in MA.METHODS if any(m in r for r in rws)]
+    if args.methods:
+        methods = [m for m in methods if m in args.methods.split(",")]
 
     if args.fap is not None:
-        thr = MA.pick_thresholds(recs, args.fap, MA.SEARCHES)
+        thr = MA.pick_thresholds(MA.fa_curves(recs, MA.present_recs(recs, MA.SEARCHES)),
+                                 args.fap)
         thr["_default"] = args.threshold
         cut = f"matched at {args.fap:g} false alarms/realisation"
     else:
@@ -143,13 +151,17 @@ def main(argv=None):
 
     # --- recovered vs injected S/N, only for the comparable statistics -------
     ax = axes[0, 3]
+    # Binned, not grouped by exact value: injected S/N is CONTINUOUS as of run 2,
+    # so grouping on equality would give one point per injection.
+    edges = np.arange(5.5, 12.01, 0.5)
     for m in [m for m in SNR1_LIKE if m in methods]:
         xs, ys = [], []
-        for s in sorted({r["snr"] for r in rws}):
-            v = np.array([r[m] for r in rws if m in r and r["snr"] == s], dtype=float)
+        for lo, hi in zip(edges[:-1], edges[1:]):
+            v = np.array([r[m] for r in rws
+                          if m in r and lo <= r["snr"] < hi], dtype=float)
             v = v[np.isfinite(v)]
-            if len(v):
-                xs.append(s)
+            if len(v) >= 10:
+                xs.append(0.5 * (lo + hi))
                 ys.append(np.median(v))
         ax.plot(xs, ys, "o-", ms=4, color=COLOURS.get(m), label=m)
     lim = [5, 13]
@@ -162,7 +174,7 @@ def main(argv=None):
 
     # --- recovered vs true duty --------------------------------------------
     ax = axes[1, 0]
-    for m in ("coherent", "rseek_A"):
+    for m in ("coherent", "coherent_tier", "rseek_A"):
         if m not in methods:
             continue
         x = np.array([r["ducy"] for r in rws if r.get(m + "_ducy")], dtype=float)

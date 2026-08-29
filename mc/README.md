@@ -7,23 +7,41 @@ Combining and tabulating: `mc_analyze.py`.
 ## Running it
 
 ```sh
-PIXI=/home/sransom/envs/pulsars/.pixi/envs/default/bin    # bla0; fitzroy and the laptop differ
+PIXI=/data1/environments/pixiPSR/.pixi/envs/default/bin   # fitzroy; bla0 and the laptop differ
 
-# fill a machine: N independent workers partitioning the realisation index space
+# run 2, on fitzroy: 15 of its 40 logical CPUs, leaving the desktop usable
+mc/launch_fitzroy.sh /data1/mc/run2
+
+# or by hand, on any host: N independent workers partitioning the index space
 $PIXI/python mc/mc_simulate.py --outdir mcout --nreal 100000 --workers 48 \
     --presto-bin $PIXI --rseek $PIXI/rseek --tpa /path/to/table_1.csv
 
-# look at what came out (combining runs is `cat`; this globs *.jsonl)
-$PIXI/python mc/mc_analyze.py mcout/ --fap 1e-2 --by ducy
+# the whole report (combining runs is `cat`; this globs *.jsonl)
+$PIXI/python mc/mc_analyze.py mcout/
+$PIXI/python mc/mc_analyze.py mcout/ --sections roc,pairs,decompose --fap 1e-3
+$PIXI/python mc/mc_analyze.py mcout/ --weight flat      # flat in log duty
 
 # one page of diagnostic plots
-$PIXI/python mc/mc_quicklook.py mcout/ --fap 1e-2 -o quicklook.png
+$PIXI/python mc/mc_quicklook.py mcout/ --fap 1e-2 -o quicklook.png \
+    --methods prepfold_snr1,rseek_A,rseek_B,coherent,coh+tier
 ```
 
-**Always pass `--fap`.** Without it every code is cut at the same nominal value,
-which is not a comparison: ours and rseek's statistics are single-trial,
-accelsearch's sigma is already trials-corrected and prepfold's is a chi-squared.
-Both scripts warn when you leave it off.
+`mc_analyze.py` matches false-alarm rates at `--fap 1e-2` by default. A nominal
+cut is not a comparison: ours and rseek's statistics are single-trial,
+accelsearch's sigma is already trials-corrected and prepfold's is a chi-squared,
+and run 1 measured the four sitting at 8.10 / 7.95 / 8.05 / **7.05** for the same
+rate. `mc_quicklook.py` still takes `--fap` explicitly and warns without it.
+
+## The pieces
+
+| file | what it is |
+|---|---|
+| `mc_simulate.py` | the driver: generate, inject, run every code, record |
+| `mc_profiles.py` | the population sampler and the profile model (the astronomy) |
+| `mc_model.py` | the band-limited efficiency model and prepfold's drizzle correction |
+| `mc_analyze.py` | combining and the whole report |
+| `mc_quicklook.py` | one page of diagnostic plots |
+| `test_mc.py` | pins for both models, the sampler and the subset selector |
 
 `--tpa` wants the MeerKAT TPA supplementary `table_1.csv`
 (`stab2775_supplemental_file.zip`). Without it the sampler falls back to the
@@ -33,10 +51,25 @@ recorded quantiles of that table, which is close but does not carry the real
 ## What it does per realisation
 
 White noise, `N = 2^24`, `dt = 60 µs` (`T = 1006 s`), 6 injected pulsars drawn
-from the TPA width population, then the **same** realisation handed to four
-codes: `prepfold -nosearch` at the known period, `accelsearch -numharm 16
--zmax 0`, `rseek` (riptide's FFA), and `coherent_search.jl` at its bare
-defaults. One JSON object per realisation.
+from the TPA width population at continuous injected S/N over 5.5–11.5, then the
+**same** realisation handed to every code. One JSON object per realisation.
+
+| arm | configuration | how often |
+|---|---|---|
+| `prepfold` | `-nosearch` at the known period; on the injection-free realisations, at random periods from the same population (its measured null) | every |
+| `accelsearch` | `-numharm 16 -zmax 0` on the raw `.fft` | every |
+| `accelsearch_red` | the same on `_red.fft` | every |
+| `rseek_A` | `bmin 20 / bmax 120`, matching our coverage exactly | every |
+| `rseek_B` | the deep 4-range tiling, 4.05x the cost | 1-in-5 |
+| `coherent` | the shipped defaults (`nharms 60`, `maxdecim 6`, `hifreq 125`) | every |
+| `coherent_tier` | `nharms 120 maxdecim 12` below 5 Hz — §4's proposal | every |
+| `coherent_deep` | `nharms 120 maxdecim 12` over the whole band | 1-in-5 |
+
+`mc_analyze.py` also forms **`coh+tier`**, the union of the first two coherent
+arms: hits merged by the stronger statistic, false-alarm tails concatenated. That
+is what a tiered search would actually report, and because each arm ran as its own
+invocation the union's threshold is *measured*, not assumed — a deep tier has to
+pay for its own trials.
 
 Seeds come from the realisation index alone, so workers need no coordination,
 a rerun reproduces the same noise, and appending to an existing output file
@@ -86,35 +119,65 @@ skips indices already present.
 * **`prepfold` is a reference, not a competitor.** It folds at the known period
   with no trials penalty. Its chi-squared sigma is the standard people fold
   with; the `snr1` boxcar computed from its `.bestprof` is the same statistic as
-  the searches, so there is one directly comparable column. Plain `snr1` is
-  correct there with no band-limited correction — prepfold folds in the time
-  domain, so its phase bins really are independent.
+  the searches, so there is one directly comparable column.
+* **prepfold's bins are NOT independent, and run 1's numbers were inflated
+  because of it.** `fold()` drizzles each finite-duration sample across every
+  profile bin it covers, which correlates neighbouring bins; `snr1` divides by
+  `σ√(w(1−δ))` as if they were independent, and the study can see it. At fixed
+  duty, prepfold's recovered/injected ratio *rose 11% with spin frequency and
+  crossed 1.0* — an inflated ceiling, in the MSP band, which is the worst place
+  for one. `mc_model.drizzle_boxcar_corr` is exact linear algebra on the fold
+  weights and flattens it (200–300 Hz: 1.009 → 0.858, against 0.902 at low
+  frequency). It is **width-dependent**: a one-bin boxcar cannot feel
+  bin-to-bin correlation at all, so a flat `√DOF_corr` would over-correct narrow
+  pulses by ~20%. The correction is applied at ANALYSIS time, from the `(nbins,
+  dt_per_bin, w)` recorded beside the raw value, so revising it never means
+  re-folding a week of compute.
+* **prepfold's σ is computed, not measured.** A 128-point MAD has ~7% sampling
+  error and `snr1` is exactly `1/σ̂`, so the MAD alone put a scatter term on the
+  reference column comparable to everything else in it. Both are recorded.
+* **The duty cycle is stratified and every injection carries an importance
+  weight.** Run 1 drew 757 injections below 0.5% duty out of 82,014, and that is
+  the one place we lose. The default `--strat 0.005 0.5 0.25` raises that
+  fraction from 1.5% to 3.7% at 0.85 effective sample size, and `weight = 1/q`
+  makes every population-weighted number identical to the unstratified one.
+* **1-in-N subsets are selected by a HASH of the realisation index, not by
+  `idx % N`.** Worker `w` of `W` takes `idx % W == w`, so when `N` divides `W`
+  the whole subset lands on `W/N` of the workers — which are then the *slow*
+  ones. Run 1 asked for 1-in-3 deep tilings and finished with **14.4%** (2,197 of
+  15,212); that was this, and it was read as ordinary attrition.
 
 ## Cost
 
-Measured on the laptop, one worker, `N = 2^24`:
+Run-1 medians, measured on `bla0` (48 workers, `N = 2^24`), and the run-2
+estimate for fitzroy — scaled by 1.35, which is roughly the per-core ratio and is
+the number the projection below stands or falls on:
 
-| stage | wall |
-|---|---|
-| `rseek_B` (deep tiling, subset only) | 177 s |
-| `rseek_A` | 51 s |
-| `coherent_search` `-t 1` | 20 s |
-| generate + inject 6 pulsars | 11 s |
-| `prepfold` x6 | 4 s |
-| `accelsearch` | 1 s |
-| `realfft` + `rednoise` | 0.7 s |
+| stage | bla0 (run 1) | fitzroy (run 2, est.) | how often |
+|---|---|---|---|
+| `rseek_B`, deep tiling | 121.1 s | 163 s | 1-in-5 → 33 s |
+| `rseek_A` | 29.2 s | 39 s | every |
+| `coherent` | 20.2 s | 27 s | every |
+| `coherent_deep`, full band | — | 54 s | 1-in-5 → 11 s |
+| `prepfold` x6 | 5.8 s | 8 s | every |
+| generate + inject | 4.5 s | 6 s | every |
+| `coherent_tier`, below 5 Hz | — | 6 s | every |
+| `accelsearch` x2 | 1.7 s | 4.5 s | every |
+| `realfft` + `rednoise` | 0.8 s | 1.1 s | every |
 
-So ~96 s per realisation without the deep tiling and ~270 s with it. At
-`--deep-every 3` the average is ~160 s, i.e. **6 injections per 160 s per
-worker**.
+**~137 s per realisation**, so 15 workers give ~9,400 realisations (~56,000
+injections) per day. The 1-in-5 arms cost 44 s of that between them, i.e. a third
+of the run goes to the two configurations that exist to *test* a claim rather
+than to make one.
 
 **Memory is the constraint on worker count**, not CPU: rseek's deep ranges peak
 at ~1.7 GB RSS, and each realisation holds ~200 MB of transient files in
-`--workdir` (default `/dev/shm`). At 48 workers that is ~10 GB of scratch plus up
-to ~80 GB of RSS if every worker hits a deep range at once. Lower
-`--deep-every`, or `--workers`, if that is tight.
+`--workdir` (default `/dev/shm`). At 15 workers that is ~3 GB of scratch against
+fitzroy's 94 GB `/dev/shm`, plus up to ~25 GB of RSS if every worker hits a deep
+range at once, against 187 GB. Comfortable. At 48 workers on a smaller box it is
+not — raise `--deep-every`, or lower `--workers`.
 
-## Two failure modes this has already hit
+## Failure modes this has already hit
 
 * **`rednoise` writes `<stem>_red.inf` into the CURRENT DIRECTORY**, not beside
   its input. Every PRESTO tool is therefore run with `cwd` set to the work
@@ -126,5 +189,15 @@ to ~80 GB of RSS if every worker hits a deep range at once. Lower
   of thing cannot burn a night again.
 * **A method that runs on only a subset must not be divided by every injection.**
   `rseek_B` runs under `--deep-every`, and counting its detections against all
-  injections made it read 11.4% where it is really 95%. Columns from a subset are
-  marked `*` in `mc_analyze.py`.
+  injections made it read 11.4% where it is really 95%. `mc_analyze.py` now
+  restricts every cross-code cell to the realisations all compared codes ran, and
+  says so in the header; run 1's report only footnoted it with a `*`, and its
+  headline table still put `rseek_B`'s 1-in-3 subset beside a `coherent` column
+  built from 7x more data.
+* **`idx % N` selects a 1-in-N subset that lands on `W/N` of the workers.**
+  See the `one_in` note above. Run 1's deep tiling was configured 1-in-3 and
+  finished at 14.4%. The symptom is a subset fraction well under `1/N` with no
+  errors anywhere, which reads as attrition and is not.
+* **Buffered output hides a slow script.** Every analysis command here prints as
+  it goes; run them with `python -u`, and never pipe into `head`/`tail` while
+  waiting, or the first output you see is the last.

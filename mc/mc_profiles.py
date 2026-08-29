@@ -99,7 +99,8 @@ class Population:
 
     def __init__(self, tpa=None, msp_frac=1.0 / 3.0,
                  slow_p=(0.02, 5.0), msp_p_mean=3.5e-3, msp_p_sd=1.0e-3,
-                 msp_p_range=(1.5e-3, 10.0e-3), msp_ducy=(0.02, 0.30)):
+                 msp_p_range=(1.5e-3, 10.0e-3), msp_ducy=(0.02, 0.30),
+                 strat=None):
         self.tpa = tpa
         self.msp_frac = msp_frac
         self.slow_p = slow_p
@@ -107,6 +108,32 @@ class Population:
         self.msp_p_sd = msp_p_sd
         self.msp_p_range = msp_p_range
         self.msp_ducy = msp_ducy
+        # `(d0, alpha, qmin)`: keep a draw of duty `d` with probability
+        # `clip((d0/d)^alpha, qmin, 1)` and give it importance weight `1/q`.
+        # See `accept_prob`.
+        self.strat = strat
+
+    def accept_prob(self, ducy):
+        """Acceptance probability for stratifying the duty-cycle axis.
+
+        Run 1 drew 757 injections below 0.5% duty out of 82,014 -- 0.92%, and 118
+        of them in the subset where the deep-tiling comparison lives.  That is the
+        ONE place the coherent search loses, and it was decided on ~3 sigma of
+        discordant pairs.  Over-sampling it and carrying an importance weight
+        `1/q` is exactly equivalent to the natural population for every
+        population-weighted number (the estimator stays unbiased; only its
+        variance moves, and it moves the right way), while giving the narrow-duty
+        cells several times the statistics.
+
+        REJECTION, not a tilted proposal, deliberately: a draw costs a few random
+        numbers and no simulation, the target distribution is the TPA bootstrap
+        with no closed form to tilt, and `1/q` is then the exact weight rather
+        than a ratio of two densities that would have to be kept in step by hand.
+        """
+        if not self.strat:
+            return 1.0
+        d0, alpha, qmin = self.strat
+        return float(min(1.0, max(qmin, (d0 / max(ducy, 1e-9)) ** alpha)))
 
     def _resid(self, rng):
         if self.tpa is not None:
@@ -119,14 +146,21 @@ class Population:
         return float(np.interp(rng.random(), TPA_RATIO_P, TPA_RATIO_Q))
 
     def draw(self, rng, dt, min_fwhm_samples=3.0):
-        """One pulsar.  Rejects until the pulse is resolved by the sampling.
+        """One pulsar, with its importance `weight`.  Rejects until the pulse is
+        resolved by the sampling, and (with `strat`) until the duty-cycle
+        stratification accepts it.
 
         A FWHM under a few samples is not a meaningful injection: point-sampling
         a narrower pulse makes its sampled shape depend on the sub-sample phase,
         so no filter can match it and "injected S/N" stops meaning one thing.
         The rejection is recorded (`ducy_floor`) rather than silently applied.
+
+        **The sampling rejection is NOT weighted, and the stratification one is.**
+        The first removes pulsars the study cannot meaningfully inject at all, so
+        it redefines the population; the second only changes how often a pulsar
+        the study CAN inject gets drawn, so it must be undone at analysis time.
         """
-        for _ in range(200):
+        for _ in range(2000):
             msp = rng.random() < self.msp_frac
             if msp:
                 P = float(rng.normal(self.msp_p_mean, self.msp_p_sd))
@@ -144,7 +178,11 @@ class Population:
             ducy = min(ducy, 0.45)
             if ducy * P < min_fwhm_samples * dt:
                 continue                       # unresolved: redraw
-            return dict(period=P, ducy=ducy, w10_w50=ratio, msp=bool(msp))
+            q = self.accept_prob(ducy)
+            if q < 1.0 and rng.random() >= q:
+                continue                       # stratification: redraw
+            return dict(period=P, ducy=ducy, w10_w50=ratio, msp=bool(msp),
+                        weight=1.0 / q)
         raise RuntimeError("population draw failed to converge")
 
 
