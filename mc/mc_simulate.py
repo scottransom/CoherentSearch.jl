@@ -217,25 +217,55 @@ def parse_cohout(path):
     return out
 
 
+def check_presto_python():
+    """Import `presto.sifting`, or raise with the remedy.  Called BEFORE any compute.
+
+    **This is the run-2 bug, and it cost 1.5 days.**  `parse_accel` used to
+    swallow the ImportError and return no candidates, so on fitzroy -- where the
+    pixi environment ships `libpresto.so` in `lib64/`, which is on no default
+    loader path -- `accelsearch` ran perfectly, exited 0, wrote a good ACCEL file
+    and was then scored as **zero candidates on every realisation**.  Both
+    accelsearch arms read 0.0% detection and a false-alarm floor of `-inf`, which
+    is exactly what a code that detects nothing looks like.  Run 1 was on bla0,
+    where the import happens to work, so nothing caught it.
+
+    The failure is a missing shared library, which is fixed by the ENVIRONMENT
+    (`LD_LIBRARY_PATH`) and cannot be fixed from inside a running interpreter --
+    the loader has already read it.  So the only useful thing to do is refuse to
+    start and say which directory is missing; `launch_fitzroy.sh` exports it.
+    """
+    try:
+        from presto import sifting                      # noqa: F401
+    except Exception as exc:
+        raise RuntimeError(
+            f"cannot import presto.sifting ({exc!r}).\n"
+            "    accelsearch candidates are scored through it, so the run would\n"
+            "    record 0 candidates on every realisation and read as 0% detection.\n"
+            "    This is normally a missing shared library: point LD_LIBRARY_PATH at\n"
+            "    the presto env's lib64/ and lib/ (and /usr/local/lib for liberfa),\n"
+            "    e.g.  export LD_LIBRARY_PATH=<pixi-env>/lib64:/usr/local/lib\n"
+            "    Verify with:  python -c 'from presto import sifting'") from exc
+
+
 def parse_accel(path):
     """ACCEL_0 -> candidates carrying PRESTO's SINGLE-TRIAL sigma.
 
     `presto.sifting` recomputes `candidate_sigma(opt_ipow, 1, 1)` from the
     optimised harmonic powers, which is the number to compare -- not the sigma
     printed in the ACCEL file, which carries accelsearch's own trials
-    correction.  `prelim_reject=False`: the default rejection applies a sigma
-    cut, and this study needs the sub-threshold values.
+    correction.  (`read_candidates`'s `prelim_reject` applies a sigma cut, which
+    is why this calls `candlist_from_candfile` directly: the study needs the
+    sub-threshold values.)
+
+    **Nothing here is caught.**  A missing import or an unparsable file used to
+    return `[]`, which is indistinguishable from a search that found nothing --
+    see `check_presto_python`.  Now it raises: the caller records the realisation
+    as an error and the first-realisation guard in `main` stops the run.
     """
     if not os.path.isfile(path):
         return []
-    try:
-        from presto import sifting
-    except ImportError:
-        return []
-    try:
-        cl = sifting.candlist_from_candfile(path)
-    except Exception:
-        return []
+    from presto import sifting
+    cl = sifting.candlist_from_candfile(path)
     return [Cand(c.f, c.sigma, None, {"numharm": c.numharm, "snr": c.snr})
             for c in cl.cands if getattr(c, "sigma", None) is not None]
 
@@ -581,7 +611,7 @@ def _search_all(rec, draws, null_draws, stem, args, tools, T, keep_prof=False):
     # MEASURED null, so prepfold can join the FAP-matched table as a proper
     # ceiling instead of sitting beside it at a nominal cut that means nothing.
     pf, t_pf = [], 0.0
-    for i, d in enumerate(draws if draws else null_draws):
+    for i, d in enumerate(() if args.arms != "all" else (draws if draws else null_draws)):
         o = f"{stem}_pf{i}"
         cmd = [tools["prepfold"], "-f", repr(d["f0"]), "-nosearch", "-fine",
                "-noxwin", "-nopdsearch", "-o", os.path.basename(o)]
@@ -598,10 +628,11 @@ def _search_all(rec, draws, null_draws, stem, args, tools, T, keep_prof=False):
             continue
         sig, prof = read_bestprof(best[0])
         pf.append(score_bestprof(sig, prof, d["f0"], args, keep_profile=keep_prof))
-    rec["timing"]["prepfold"] = t_pf
-    # Targeted: no false-alarm column of its own, so the empty realisations'
-    # folds are filed separately -- `mc_analyze` reads them as prepfold's null.
-    rec["results"]["prepfold_null" if not draws else "prepfold"] = pf
+    if args.arms == "all":
+        rec["timing"]["prepfold"] = t_pf
+        # Targeted: no false-alarm column of its own, so the empty realisations'
+        # folds are filed separately -- `mc_analyze` reads them as prepfold's null.
+        rec["results"]["prepfold_null" if not draws else "prepfold"] = pf
 
     # --- accelsearch, on BOTH the raw and the de-reddened FFT ---------------
     # Run 1 gave accelsearch the raw `.fft` while `coherent_search` got
@@ -622,6 +653,9 @@ def _search_all(rec, draws, null_draws, stem, args, tools, T, keep_prof=False):
         hits, fa = score(ac, inj, T, tol)
         rec["results"][name] = dict(hits=hits, false=fa_summary(fa, args.fa_top), ncand=len(ac),
                                     ok=(rc == 0))
+
+    if args.arms != "all":            # accelsearch-only repair pass; see --arms
+        return
 
     # --- rseek, config A ----------------------------------------------------
     def rseek(cfg):
@@ -756,6 +790,25 @@ def which(name, override, extra=()):
     raise SystemExit(f"cannot find {name}; pass --{name}")
 
 
+def load_indices(paths):
+    """{index: [injected f0, ...]} from existing run output, for the repair pass."""
+    files = []
+    for p in paths:
+        files += glob.glob(os.path.join(p, "*.jsonl")) if os.path.isdir(p) else glob.glob(p)
+    out = {}
+    for f in sorted(files):
+        with open(f) as fh:
+            for line in fh:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if "error" in r or r.get("patch") or "index" not in r:
+                    continue
+                out.setdefault(r["index"], [d["f0"] for d in r.get("injections", [])])
+    return out
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -832,6 +885,23 @@ def main(argv=None):
     ap.add_argument("--fa-top", type=int, default=800,
                     help="false-alarm statistics stored per code per realisation")
     ap.add_argument("--accel-sigma", type=float, default=1.0)
+    ap.add_argument("--arms", choices=("all", "accel"), default="all",
+                    help="which searches to run.  'accel' is the REPAIR pass: it "
+                         "regenerates the noise (which depends only on the "
+                         "realisation index and --master-seed, so it is bit-for-bit "
+                         "the original) and runs ONLY the two accelsearch arms, "
+                         "writing patch records that `mc_analyze` merges into the "
+                         "full ones by index.  ~12 s a realisation against ~137, "
+                         "which is what makes repairing a bad accelsearch column "
+                         "cheaper than re-running the study")
+    ap.add_argument("--indices-from", nargs="+", default=None, metavar="PATH",
+                    help="take the realisation indices from these .jsonl files or "
+                         "directories instead of from --start/--nreal, and CHECK "
+                         "each regenerated realisation against the injection "
+                         "frequencies stored there.  A mismatch means the "
+                         "population arguments differ from the original run and the "
+                         "noise does too, so the patch would be scored against the "
+                         "wrong signals; it aborts rather than writing that")
     ap.add_argument("--tol-bins", type=float, default=3.0)
     ap.add_argument("--coh-threads", type=int, default=1)
     ap.add_argument("--workdir", default=None, help="scratch for the ~200 MB of transient files per realisation (default: /dev/shm if present)")
@@ -894,6 +964,12 @@ def main(argv=None):
             rc |= p.wait()
         return rc
 
+    # Before anything else: the accelsearch arms are scored through
+    # `presto.sifting`, and an environment where it does not import produces a
+    # perfect-looking run in which both of them detect nothing.  See
+    # `check_presto_python`.
+    check_presto_python()
+
     extra = [args.presto_bin] if args.presto_bin else []
     tools = dict(julia=args.julia,
                  rseek=which("rseek", args.rseek, extra),
@@ -926,7 +1002,13 @@ def main(argv=None):
     args.strat = list(strat) if strat else None
     pop = MP.Population(tpa=tpa, strat=strat)
 
-    outfile = os.path.join(args.outdir, f"mc_{os.uname().nodename}_{args.worker:03d}.jsonl")
+    # The repair pass writes to its OWN files, never into the originals: the
+    # main run may still be appending to those, and a patch is a different kind
+    # of row.  `mc_analyze.load` merges them back by index.
+    src = load_indices(args.indices_from) if args.indices_from else None
+    stem_out = "mc" if args.arms == "all" else f"mcpatch_{args.arms}"
+    outfile = os.path.join(args.outdir,
+                           f"{stem_out}_{os.uname().nodename}_{args.worker:03d}.jsonl")
     done = set()
     if os.path.isfile(outfile):
         with open(outfile) as fh:
@@ -940,8 +1022,11 @@ def main(argv=None):
     # overlap produce identical rows rather than silently different ones.
     root = np.random.SeedSequence(args.master_seed)
 
-    idxs = [args.start + i for i in range(args.nreal)
-            if (args.start + i) % args.nworkers == args.worker]
+    if src is not None:
+        idxs = [i for i in sorted(src) if i % args.nworkers == args.worker]
+    else:
+        idxs = [args.start + i for i in range(args.nreal)
+                if (args.start + i) % args.nworkers == args.worker]
     idxs = [i for i in idxs if i not in done]
     print(f"[worker {args.worker}] {len(idxs)} realisations -> {outfile}", flush=True)
 
@@ -954,6 +1039,28 @@ def main(argv=None):
                     rec = realisation(idx, args, pop, tools, seed)
                 except Exception as exc:      # one bad realisation must not end the run
                     rec = dict(index=idx, error=repr(exc), host=os.uname().nodename)
+                if src is not None and "error" not in rec:
+                    got = [d["f0"] for d in rec["injections"]]
+                    want = src[idx]
+                    if len(got) != len(want) or any(
+                            abs(a - b) > 1e-9 * max(1.0, abs(b))
+                            for a, b in zip(got, want)):
+                        sys.stderr.write(
+                            f"\n*** ABORTING: realisation {idx} regenerated "
+                            f"different injections than the run it is patching\n"
+                            f"    stored:      {want}\n    regenerated: {got}\n"
+                            "    The noise differs too, so the patch would score the "
+                            "wrong data.  Match --master-seed, --nsamp, --dt, "
+                            "--injections, --noise-every, --snr-range, --strat and "
+                            "--tpa to the original run.\n")
+                        return 2
+                if args.arms != "all":
+                    rec = dict(index=idx, host=rec["host"], patch=True,
+                               t_start=rec["t_start"], t_end=rec.get("t_end"),
+                               results={k: v for k, v in rec["results"].items()
+                                        if k.startswith("accelsearch")},
+                               timing={k: v for k, v in rec["timing"].items()
+                                       if k.startswith("accelsearch")})
                 fh.write(json.dumps(rec) + "\n")
                 print(f"[worker {args.worker}] {n + 1}/{len(idxs)} idx={idx} "
                       f"{time.perf_counter() - t0:.1f}s", flush=True)
@@ -965,12 +1072,21 @@ def main(argv=None):
                 # coherent_search could not find it) and it would otherwise have
                 # burned a whole night.  Better to stop now than to produce a
                 # confident, entirely wrong table in the morning.
+                # A search that returns NO candidates at all is the second
+                # failure mode, and `ok` cannot see it: run 2's accelsearch
+                # exited 0 with a good ACCEL file on disk and was parsed to an
+                # empty list.  Every code here reports its whole list down to a
+                # permissive floor -- the observed minima are ~4 (accelsearch),
+                # ~12 (coherent) and ~180 (rseek_A) per realisation -- so an
+                # empty list on realisation 0 is a broken parser, not a quiet
+                # sky, and is worth stopping for.
                 if n == 0:
                     dead = [m for m in ("rseek_A", "rseek_B", "accelsearch",
                                         "accelsearch_red", "coherent",
                                         "coherent_tier", "coherent_deep")
                             if m in rec.get("results", {})
-                            and not rec["results"][m].get("ok", True)]
+                            and (not rec["results"][m].get("ok", True)
+                                 or rec["results"][m].get("ncand", 1) == 0)]
                     if dead or "error" in rec:
                         sys.stderr.write(
                             f"\n*** ABORTING: {dead or rec.get('error')} failed on the "

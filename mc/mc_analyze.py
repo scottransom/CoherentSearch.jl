@@ -87,8 +87,8 @@ def load(paths, with_profiles=False):
     float objects once parsed.  Only `sec_drizzle` needs them, and it is the one
     section that asks.
     """
-    recs, seen = [], set()
-    files = []
+    recs, seen = [], {}
+    files, patches = [], []
     for p in paths:
         files += glob.glob(os.path.join(p, "*.jsonl")) if os.path.isdir(p) else glob.glob(p)
     for f in sorted(files):
@@ -98,15 +98,30 @@ def load(paths, with_profiles=False):
                     r = json.loads(line)
                 except Exception:
                     continue
-                if "error" in r or r.get("index") in seen:
+                if "error" in r:
                     continue
-                seen.add(r["index"])
+                # A PATCH row carries one arm re-run on the same realisation --
+                # `mc_simulate --arms accel` regenerates the noise from the index
+                # and re-scores only accelsearch.  Hold them and merge after, so
+                # a patch file sorting before its parent still lands.
+                if r.get("patch"):
+                    patches.append(r)
+                    continue
+                if r.get("index") in seen:
+                    continue
+                seen[r["index"]] = r
                 if not with_profiles:
                     for k in ("prepfold", "prepfold_null"):
                         for d in (r.get("results", {}).get(k) or []):
                             if d:
                                 d.pop("prof", None)
                 recs.append(r)
+    for pr in patches:
+        base = seen.get(pr["index"])
+        if base is None:                       # patched a realisation we do not have
+            continue
+        base.setdefault("results", {}).update(pr.get("results", {}))
+        base.setdefault("timing", {}).update(pr.get("timing", {}))
     recs.sort(key=lambda r: r["index"])
     return recs
 

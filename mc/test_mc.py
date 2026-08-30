@@ -250,6 +250,52 @@ def test_one_in():
     check("one_in(., 0) is never", not any(MS.one_in(i, 0) for i in range(100)))
 
 
+# --- 6. the two guards that run 2's accelsearch failure went past ----------
+def test_silent_failures():
+    """A parser that returns nothing must not look like a search that found nothing.
+
+    Run 2 lost 1.5 days to exactly this: `presto.sifting` would not import on
+    fitzroy, `parse_accel` caught the ImportError and returned `[]`, and both
+    accelsearch arms read 0.0% detection with a false-alarm floor of `-inf`
+    while `accelsearch` itself exited 0 on a perfectly good ACCEL file.
+    """
+    import json
+    import tempfile
+    import mc_analyze as MA
+    import mc_simulate as MS
+
+    with tempfile.TemporaryDirectory() as d:
+        bad = os.path.join(d, "notacandfile_ACCEL_0")
+        open(bad, "w").write("this is not an ACCEL file\n")
+        try:
+            MS.parse_accel(bad)
+            raised = False
+        except Exception:
+            raised = True
+        check("parse_accel RAISES on an unreadable file", raised,
+              "returning [] is indistinguishable from a search that found nothing")
+        check("parse_accel is silent only about a MISSING file",
+              MS.parse_accel(os.path.join(d, "nope_ACCEL_0")) == [])
+
+        # A patch row must overwrite the arm it repairs, and only that arm.
+        base = dict(index=7, results={"accelsearch": {"ncand": 0}, "coherent": {"ncand": 12}},
+                    timing={"accelsearch": 2.0, "coherent": 29.0})
+        patch = dict(index=7, patch=True, results={"accelsearch": {"ncand": 19}},
+                     timing={"accelsearch": 1.9})
+        # The patch file sorts BEFORE its parent, which is the case that breaks a
+        # merge written as a single pass.
+        with open(os.path.join(d, "a_patch.jsonl"), "w") as fh:
+            fh.write(json.dumps(patch) + "\n")
+        with open(os.path.join(d, "b_main.jsonl"), "w") as fh:
+            fh.write(json.dumps(base) + "\n")
+        got = MA.load([d])
+        check("a patch row merges into its parent by index",
+              len(got) == 1 and got[0]["results"]["accelsearch"]["ncand"] == 19
+              and got[0]["results"]["coherent"]["ncand"] == 12
+              and got[0]["timing"]["accelsearch"] == 1.9,
+              str(got[0]["results"]) if got else "no record")
+
+
 if __name__ == "__main__":
     test_ladder()
     test_drizzle()
@@ -257,6 +303,7 @@ if __name__ == "__main__":
     test_model()
     test_strat()
     test_one_in()
+    test_silent_failures()
     print()
     if FAIL:
         print(f"{len(FAIL)} FAILED: {FAIL}")

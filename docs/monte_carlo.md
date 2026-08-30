@@ -819,3 +819,71 @@ constant from a single ratio.
 * The `--normalize` per-region threshold in the search itself. Run 2 measures the
   tiered configuration by running two invocations, which is the right *experiment*
   but is not how anyone would want to ship it.
+
+## 18. Run 2's accelsearch column was empty, and the cause was a swallowed import
+
+Scott spotted it 1.5 days in, from the analysis of 10,210 realisations: both
+accelsearch arms read **0.0% detection at every S/N, every duty and every
+frequency**, 0.00 false alarms per realisation at every cut, and a false-alarm
+floor of `-inf`. That is a code that emitted no candidates at all, not a code
+that detected nothing.
+
+**It emitted plenty.** `accelsearch` ran in 2.0 s, exited 0, and left a normal
+`_ACCEL_0` on disk with candidates in it. What failed was `parse_accel`:
+
+```
+>>> from presto import sifting
+ImportError: libpresto.so: cannot open shared object file
+```
+
+and the old `parse_accel` caught that and returned `[]`. The pixi environment on
+fitzroy ships `libpresto.so` in `lib64/` — on no default loader path — and
+`libpresto.so` in turn wants `liberfa.so.1` from `/usr/local/lib`. Run 1 was on
+bla0, where the import happens to work, so nothing in the design caught it: this
+is a HOST portability failure that only shows up as a scientific result.
+
+Reparsed with `LD_LIBRARY_PATH` set, on 21 realisations recovered live from the
+running job's scratch, accelsearch behaves entirely normally — 4–21 candidates
+per realisation, single-trial sigma 4.8–12.2, and 29 of 48 injections recovered,
+which is the right neighbourhood for `-numharm 16 -zmax 0` at these S/N.
+
+**Two guards existed and neither could see it.** The first-realisation abort
+checks `ok`, which is `rc == 0`, and the tool really did exit 0. §10's lesson
+("a search that does not run reads as 0% detection, not as a crash") was
+recorded, and the guard written for it only covers the case where the *search*
+fails, not where the *parser* does. Three changes:
+
+* **`parse_accel` no longer catches anything** except a missing file. An
+  unparsable file or a failed import now raises, the realisation is recorded as
+  an error, and the guard stops the run.
+* **`check_presto_python()` runs before any compute** and refuses to start with
+  the remedy in the message. The failure is a loader path, which cannot be fixed
+  from inside a running interpreter, so refusing is the only useful action.
+  `launch_fitzroy.sh` exports `LD_LIBRARY_PATH` and checks the import itself.
+* **The first-realisation guard also aborts on `ncand == 0`.** Every code here
+  reports its whole list down to a permissive floor — the observed minima are ~4
+  (accelsearch), ~12 (`coherent`) and ~180 (`rseek_A`) — so an empty list on
+  realisation 0 is a broken parser, not a quiet sky.
+
+**The 1.5 days are not lost.** The noise depends only on the realisation index
+and `--master-seed`, so `mc_simulate.py --arms accel --indices-from <run>`
+regenerates each realisation bit-for-bit and re-runs *only* the two accelsearch
+arms: ~12 s against ~137 s, so ~2.5 h at 15 workers for 10,000 realisations
+against the ~35 h it would cost to redo them. It writes `mcpatch_accel_*.jsonl`
+beside the originals and never touches them (the main run may still be appending
+to those); `mc_analyze.load` merges a patch row into its parent by index,
+overwriting the bad arm. Verified end to end: a repair pass over a 3-realisation
+smoke run reproduced the original `ncand` exactly (19/21, 8/13, 11/13), and
+loading a deliberately-zeroed copy plus the patch gives records identical to the
+unbroken ones.
+
+The pass **checks that it is patching what it thinks it is**: it compares the
+regenerated injection frequencies against the ones stored in the record and
+aborts on any mismatch, because a mismatch means the population arguments differ
+and so does the noise. `mc/repair_accel_fitzroy.sh` carries the matching
+arguments.
+
+`mc/test_mc.py` pins all of it: that `parse_accel` raises rather than returning
+`[]`, that it is silent only about a genuinely missing file, and that a patch row
+merges into its parent (with the patch file sorting *before* the parent, which is
+the case a single-pass merge gets wrong).
