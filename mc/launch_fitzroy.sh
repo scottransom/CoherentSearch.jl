@@ -19,14 +19,16 @@ NWORK=${NWORK:-15}
 
 mkdir -p "$OUT"
 
-# **`presto.sifting` must import, and on fitzroy it does not by default.**  The
-# pixi environment puts `libpresto.so` in `lib64/`, which is on no loader path,
-# and `libpresto.so` itself wants `liberfa.so.1` from `/usr/local/lib`.  Without
-# both, `from presto import sifting` raises -- and run 2 spent 1.5 days scoring
-# every accelsearch candidate as no candidate at all, because the parser used to
-# swallow that.  `lib64/` holds only libpresto.so, so prepending it shadows
-# nothing.  The check below is belt and braces: `mc_simulate.py` also refuses to
-# start if the import fails.
+# **`presto.sifting` must import, and this script does not run activated.**  It
+# calls the interpreter by absolute path on purpose -- no `pixi shell` needed --
+# but pixi's activation is also what exports
+# `LD_LIBRARY_PATH="$CONDA_PREFIX/lib64:..."`, and `libpresto.so` lives in that
+# `lib64/`.  Unactivated it is on no loader path, `from presto import sifting`
+# raises, and run 2 spent 1.5 days scoring every accelsearch candidate as no
+# candidate at all because the parser used to swallow that.  `/usr/local/lib` is
+# for `liberfa.so.1`, which `libpresto.so` needs in turn.  `lib64/` holds only
+# libpresto.so, so prepending it shadows nothing.  The check below is belt and
+# braces: `mc_simulate.py` also refuses to start if the import fails.
 export LD_LIBRARY_PATH="$PIXI/../lib64:/usr/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 $PIXI/python -c 'from presto import sifting' || {
     echo "presto.sifting will not import -- fix LD_LIBRARY_PATH before running" >&2

@@ -3,8 +3,10 @@
 #
 # Why this exists: run 2 scored `accelsearch` and `accelsearch_red` as zero
 # candidates on every realisation for its first 1.5 days, because
-# `from presto import sifting` failed on fitzroy and `parse_accel` swallowed the
-# ImportError (see `check_presto_python` in mc_simulate.py).  Everything else in
+# `from presto import sifting` failed -- the job was started without the pixi
+# environment activated, so `$CONDA_PREFIX/lib64` (where `libpresto.so` lives)
+# was on no loader path -- and `parse_accel` swallowed the ImportError (see
+# `check_presto_python` in mc_simulate.py).  Everything else in
 # those realisations is good, so the cheap repair is to regenerate the noise --
 # which depends only on the realisation index and `--master-seed`, so it is
 # bit-for-bit the original -- and re-run the ~12 s of accelsearch work rather

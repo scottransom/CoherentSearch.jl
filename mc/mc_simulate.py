@@ -221,18 +221,27 @@ def check_presto_python():
     """Import `presto.sifting`, or raise with the remedy.  Called BEFORE any compute.
 
     **This is the run-2 bug, and it cost 1.5 days.**  `parse_accel` used to
-    swallow the ImportError and return no candidates, so on fitzroy -- where the
-    pixi environment ships `libpresto.so` in `lib64/`, which is on no default
-    loader path -- `accelsearch` ran perfectly, exited 0, wrote a good ACCEL file
-    and was then scored as **zero candidates on every realisation**.  Both
-    accelsearch arms read 0.0% detection and a false-alarm floor of `-inf`, which
-    is exactly what a code that detects nothing looks like.  Run 1 was on bla0,
-    where the import happens to work, so nothing caught it.
+    swallow the ImportError and return no candidates, so `accelsearch` ran
+    perfectly, exited 0, wrote a good ACCEL file and was then scored as **zero
+    candidates on every realisation**.  Both accelsearch arms read 0.0% detection
+    and a false-alarm floor of `-inf`, which is exactly what a code that detects
+    nothing looks like.
 
-    The failure is a missing shared library, which is fixed by the ENVIRONMENT
-    (`LD_LIBRARY_PATH`) and cannot be fixed from inside a running interpreter --
-    the loader has already read it.  So the only useful thing to do is refuse to
-    start and say which directory is missing; `launch_fitzroy.sh` exports it.
+    **The trigger is ACTIVATION, not the install.**  fitzroy's pixi environment
+    puts `libpresto.so` in `$CONDA_PREFIX/lib64`, and pixi's own activation hook
+    exports `LD_LIBRARY_PATH="$CONDA_PREFIX/lib64:$LD_LIBRARY_PATH"` -- so inside
+    `pixi shell` or `pixi run` the import has always worked.  `launch_fitzroy.sh`
+    calls the interpreter by ABSOLUTE PATH precisely so it does not need the
+    environment activated, and that is the gap: unactivated, `lib64` is on no
+    loader path.  Nothing strips it later (the thread pinning mutates `os.environ`
+    in place, and both `Popen` and `subprocess.run` inherit), so the workers see
+    whatever the run was started in.
+
+    `LD_LIBRARY_PATH` is read by the loader at process start and cannot be fixed
+    from inside a running interpreter, so the only useful thing to do here is
+    refuse to start and say what is missing.  `launch_fitzroy.sh` exports it
+    explicitly, which is what makes the launcher activation-independent in fact
+    and not just in intent.
     """
     try:
         from presto import sifting                      # noqa: F401

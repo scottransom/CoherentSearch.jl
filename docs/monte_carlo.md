@@ -836,11 +836,33 @@ that detected nothing.
 ImportError: libpresto.so: cannot open shared object file
 ```
 
-and the old `parse_accel` caught that and returned `[]`. The pixi environment on
-fitzroy ships `libpresto.so` in `lib64/` — on no default loader path — and
-`libpresto.so` in turn wants `liberfa.so.1` from `/usr/local/lib`. Run 1 was on
-bla0, where the import happens to work, so nothing in the design caught it: this
-is a HOST portability failure that only shows up as a scientific result.
+and the old `parse_accel` caught that and returned `[]`.
+
+**The trigger is activation, not the install** (Scott, correcting a first draft of
+this section that blamed the layout). fitzroy's pixi environment puts
+`libpresto.so` in `$CONDA_PREFIX/lib64`, and pixi's own activation hook exports
+`LD_LIBRARY_PATH="$CONDA_PREFIX/lib64:$LD_LIBRARY_PATH"` — so inside `pixi shell`
+or `pixi run` the import has always worked, and it works today.
+`launch_fitzroy.sh` calls the interpreter by absolute path *precisely so it does
+not need the environment activated*, and that is the gap: unactivated,
+`$CONDA_PREFIX/lib64` is on no loader path. A login shell there has
+`/usr/local/lib:/opt/rh/gcc-toolset-14/...` and no pixi `lib64`; `libpresto.so`
+in turn wants `liberfa.so.1`, which does come from `/usr/local/lib`.
+
+Nothing strips the variable on the way to the workers — the thread pinning mutates
+`os.environ` in place and both `Popen` and `subprocess.run` inherit — so the
+workers saw whatever the run was started in, and run 2 was started unactivated.
+Scott's reading of how: the job runs under `screen`, and a `screen` window
+inherits the environment the SESSION was created with, not the one you reattached
+from, so activating pixi and then reattaching to a session created earlier gives a
+shell without it. Not verified after the fact — the evidence is gone — but it is
+the right shape, and the durable lesson is that **the environment you think you
+launched from is not evidence about the environment the job got.** Which is why
+the check belongs in the launcher and in the driver rather than in a habit.
+Run 1 was on bla0 and did not hit it. The generalisable part is that this is an
+ENVIRONMENT failure that surfaces only as a scientific result, on a launcher whose
+whole design intent was to be activation-independent; the fix makes it so in fact
+by exporting the path itself.
 
 Reparsed with `LD_LIBRARY_PATH` set, on 21 realisations recovered live from the
 running job's scratch, accelsearch behaves entirely normally — 4–21 candidates
@@ -857,9 +879,10 @@ fails, not where the *parser* does. Three changes:
   unparsable file or a failed import now raises, the realisation is recorded as
   an error, and the guard stops the run.
 * **`check_presto_python()` runs before any compute** and refuses to start with
-  the remedy in the message. The failure is a loader path, which cannot be fixed
-  from inside a running interpreter, so refusing is the only useful action.
-  `launch_fitzroy.sh` exports `LD_LIBRARY_PATH` and checks the import itself.
+  the remedy in the message. `LD_LIBRARY_PATH` is read by the loader at process
+  start and cannot be fixed from inside a running interpreter, so refusing is the
+  only useful action. `launch_fitzroy.sh` exports it explicitly and checks the
+  import itself, so the launcher no longer depends on how it was invoked.
 * **The first-realisation guard also aborts on `ncand == 0`.** Every code here
   reports its whole list down to a permissive floor — the observed minima are ~4
   (accelsearch), ~12 (`coherent`) and ~180 (`rseek_A`) — so an empty list on
