@@ -93,20 +93,20 @@ it, against the always-on `coherent`:
 | `coherent` | analytic | `_red.fft` | every — the shipped, deployed config |
 | `coherent_meas` | measured | `_red.fft` | `--sigma-every` (3) |
 | `coherent_rawmeas` | measured | `.fft` | `--sigma-every` (3) |
-| `coherent_raw` | analytic | `.fft` | `--raw-every` (10) |
 
-The first three are the useful cells and they run on the same realisations, so
-every comparison is paired. **The fourth is not a sensitivity measurement.**
-`realfft` emits an un-normalised FFT and it is `rednoise` that normalises, so
-(analytic, raw) is not "skipped the de-reddening" — it is an input the code does
-not support, and no PRESTO tool produces the interesting case (normalised but
-still red). `coherent_rawmeas` is the well-posed "can I skip `rednoise`?" arm,
-because the MAD adapts to any normalisation. `coherent_raw` is kept only to turn
-"the analytic default is unsafe on an un-normalised file" into a measured
-statement: `sigma_warn` and `sigma_ratio_seen` are recorded whenever the search's
-own guard fires, which on the smoke run was 3 of 3 at ratios 3.5e-5 to 3.7e-4.
-It sits on a thinner subset because a wrong sigma also makes the search **2.5x
-slower** — the gate stops rejecting and the exact rescan runs on everything.
+All three run on the same realisations, so every comparison is paired.
+
+**There is deliberately no analytic-on-raw arm.** `realfft` emits an
+un-normalised FFT — unit-variance noise gives mean Fourier power `N`, not 1 — and
+it is `rednoise` that normalises, so analytic sigma on a raw file is off by
+`sqrt(N)` and is a *usage error*, not a configuration worth a column. It was
+tried: the search's own guard caught it on 3 of 3 smoke realisations at ratios
+3.5e-5 to 3.7e-4, and the wrong sigma also made the search 2.5x slower (the gate
+stops rejecting and the exact rescan runs on everything). The interesting case —
+normalised but still red — has no PRESTO tool that produces it, so
+`coherent_rawmeas` is the well-posed "can I skip `rednoise`?" arm: the MAD adapts
+to any normalisation. `sigma_warn` and `sigma_ratio_seen` are still recorded on
+every arm, since that guard is what protects a real user from the same mistake.
 
 **`coherent_deep` is parked and `rseek_B` is thinned to 1-in-10.** Run 2 measured
 the deep arm at 70.6% against the default's 71.0% for 2.6x the cost, and answered
@@ -139,10 +139,28 @@ the 2x2 is paid for out of the questions run 2 closed.
   (`sigma_red` 4.5) and refuses 2.5 (40.3). It induces a mild knee/alpha
   correlation (mean alpha 2.00 below 8 Hz, 1.86 above 20), which is why both are
   recorded rather than assumed independent.
-* **Thresholds must be matched WITHIN a knee bin.** The false-alarm rate is
+* **Thresholds are matched WITHIN a knee bin.** The false-alarm rate is
   knee-dependent, so a threshold matched over the pooled run belongs to none of
-  the levels in it. `mc_analyze.py` prints a loud warning when the records carry
-  red noise; the per-bin analysis is still to be written.
+  the levels in it — the same argument that makes the *codes* comparable, one
+  level down. `mc_analyze.py --sections knee` does the split; every other section
+  still pools, and the header warns loudly whenever the records carry red noise.
+
+  ```sh
+  # give it BOTH run directories: run 2 becomes the `white` row, i.e. the zero point
+  mc_analyze.py /data/mc/run2 /data/mc/run3 --sections knee
+  mc_analyze.py /data/mc/run3 --sections knee --knee-by sigma
+  ```
+
+  `--knee-by sigma` bins on the *realised* `sigma_got` rather than the drawn
+  knee, which is the finer covariate for the reason above. The section also
+  reports how often the search's own sigma guard fired per bin — on a whitened
+  file it should be silent, and where it is not, `rednoise` left a residual and
+  the analytic default is reporting inflated S/N.
+
+  **Still to write, deliberately:** the degradation curve (S/N at 50% detection
+  against knee) and the comparison to Lazarus's factor 1.1–2. Those depend on
+  what the data actually looks like, so they get written against data rather than
+  guessed at now.
 * **No RFI, on purpose.** Frequency-domain zapping is what a real pipeline does,
   but riptide has no zapping stage — it detrends in the time domain — so
   FFT → zap → iFFT would be a preprocessing step *we* impose on it, unfair either

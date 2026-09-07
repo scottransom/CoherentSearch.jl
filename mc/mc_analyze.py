@@ -53,24 +53,25 @@ import mc_model as MM
 
 # Every method that can appear, in report order.  `coh+tier` is DERIVED here (the
 # union of the default search and the low-frequency deep tier), not recorded.
-# `coherent_meas` / `coherent_raw` / `coherent_rawmeas` complete run 3's
-# sigma x rednoise 2x2 against the always-on `coherent` (analytic, _red.fft).
+# `coherent_meas` and `coherent_rawmeas` answer run 3's 'measured or analytic?'
+# against the always-on `coherent` (analytic, _red.fft).  There is deliberately no
+# analytic-on-raw arm: that is a usage error, not a configuration.
 METHODS = ("prepfold_chi2", "prepfold_snr1", "accelsearch", "accelsearch_red",
            "rseek_A", "rseek_B", "coherent", "coherent_tier", "coherent_deep",
-           "coherent_meas", "coherent_raw", "coherent_rawmeas", "coh+tier")
+           "coherent_meas", "coherent_rawmeas", "coh+tier")
 SEARCHES = ("accelsearch", "accelsearch_red", "rseek_A", "rseek_B",
             "coherent", "coherent_tier", "coherent_deep",
-            "coherent_meas", "coherent_raw", "coherent_rawmeas", "coh+tier")
+            "coherent_meas", "coherent_rawmeas", "coh+tier")
 RECORDED = ("accelsearch", "accelsearch_red", "rseek_A", "rseek_B",
             "coherent", "coherent_tier", "coherent_deep",
-            "coherent_meas", "coherent_raw", "coherent_rawmeas")
+            "coherent_meas", "coherent_rawmeas")
 # The union arm: a candidate list is the two arms' lists concatenated, which is
 # what a tiered search would actually report.
 UNION = {"coh+tier": ("coherent", "coherent_tier")}
 # Statistics that are the same quantity (riptide's snr1), so their VALUES may be
 # compared and not only their detection fractions.
 SNR1_LIKE = ("prepfold_snr1", "rseek_A", "rseek_B", "coherent", "coherent_tier",
-             "coherent_deep", "coherent_meas", "coherent_raw", "coherent_rawmeas",
+             "coherent_deep", "coherent_meas", "coherent_rawmeas",
              "coh+tier")
 
 BINS = {
@@ -861,6 +862,106 @@ def sec_drizzle(recs, args):
           "   wrong would matter.  At dt/bin > 30 the correction is ~1 either way.)")
 
 
+# ---------------------------------------------------------------------------
+# Red noise: everything, per knee bin
+# ---------------------------------------------------------------------------
+# Bin edges in Hz.  Chosen to straddle the measured knees (Parkes 1.6-1.8,
+# GBT GUPPI 6.7, Arecibo 31.5) rather than to divide the sampled range evenly,
+# so a row can be read against a real telescope.
+KNEE_EDGES = (0.1, 0.5, 2.0, 6.0, 15.0, 50.0)
+SIGMA_EDGES = (0.0, 0.1, 0.5, 2.0, 6.0, 1e9)
+
+
+def knee_bins(recs, by="knee"):
+    """`(label, [records])` per red-noise bin, with the injection-free... no:
+    with the WHITE realisations first when any are present.
+
+    Run 2's records carry `rednoise: null`, so pointing this at run 2 and run 3
+    together puts the paired white control in the first row -- which is the
+    comparison the whole red-noise study is built on, and it costs nothing to
+    make it a row rather than a separate report.
+    """
+    edges = KNEE_EDGES if by == "knee" else SIGMA_EDGES
+    key = "fknee" if by == "knee" else "sigma_got"
+    out, white = [], [r for r in recs if not r.get("rednoise")]
+    if white:
+        out.append(("white", white))
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        sub = [r for r in recs
+               if r.get("rednoise") and lo <= (r["rednoise"].get(key) or 0.0) < hi]
+        if sub:
+            hi_s = "inf" if hi >= 1e8 else f"{hi:g}"
+            out.append((f"{lo:g}-{hi_s}", sub))
+    return out
+
+
+def sec_knee(recs, args, rng):
+    """Matched threshold and detection fraction per red-noise bin.
+
+    THE POINT OF THE SECTION: the false-alarm rate is a function of the knee, so
+    a threshold matched over the pooled run is matched to a MIXTURE of noise
+    levels and is correct for none of them.  Every cut below is measured INSIDE
+    its own bin, which is the only thing that makes these columns comparable to
+    each other -- exactly the argument that makes the codes comparable in the
+    first place, applied one level down.
+
+    Read the `white` row as the zero point (give this both run directories), and
+    read ACROSS a row for the degradation.  Lazarus et al. (2015) measured a
+    factor 1.1-2 in Smin at P = 0.1-2 s and DM > 150 for PALFA -- quote their
+    HIGH-DM figure, because their DM dependence is RFI confusability and this
+    study models red noise only.
+    """
+    groups = knee_bins(recs, args.knee_by)
+    if len(groups) < 2:
+        print("\n--- no red-noise bins to split (records carry no `rednoise`) ---")
+        return
+    unit = "knee, Hz" if args.knee_by == "knee" else "realised sigma_red/sigma_w"
+    print(f"\n--- per red-noise bin ({unit}), every threshold matched INSIDE its bin "
+          f"at {args.fap:g} false alarms/realisation ---")
+
+    ms, det, thr, warn = [], {}, {}, {}
+    for lab, sub in groups:
+        curves = fa_curves(sub, present_recs(sub, SEARCHES))
+        t = pick_thresholds(curves, args.fap)
+        rws = rows(sub)
+        apply_weights(rws, args.weight)
+        for m in present(rws, SEARCHES):
+            if m not in ms:
+                ms.append(m)
+            p, se, _ = boot_det(rws, m, t.get(m, float("inf")), args.boot, rng)
+            det[(m, lab)] = (p, se)
+            thr[(m, lab)] = t.get(m, float("inf"))
+        n = sum(1 for r in sub for v in r.get("results", {}).values()
+                if isinstance(v, dict) and v.get("sigma_warn"))
+        warn[lab] = n
+
+    labs = [l for l, _ in groups]
+    head = f'{"method":>17} ' + " ".join(f"{l:>14}" for l in labs)
+    for title, tab, fmt in (("detection % (bootstrap se over realisations)", det, "det"),
+                            ("matched threshold", thr, "thr")):
+        print(f"\n  {title}")
+        print(head)
+        for m in ms:
+            cells = []
+            for l in labs:
+                if fmt == "det":
+                    v = tab.get((m, l))
+                    cells.append("             ." if v is None or not np.isfinite(v[0])
+                                 else f"{100 * v[0]:8.1f}+-{100 * v[1]:4.1f}")
+                else:
+                    v = tab.get((m, l))
+                    cells.append("             ." if v is None or not np.isfinite(v)
+                                 else f"{v:14.2f}")
+            print(f"{m:>17} " + " ".join(cells))
+    print(f'\n{"realisations":>17} ' + " ".join(f"{len(s):>14d}" for _, s in groups))
+    if any(warn.values()):
+        print(f'{"sigma_warn fired":>17} ' + " ".join(f"{warn[l]:>14d}" for l in labs))
+        print("  (the search's own guard: analytic sigma disagreeing with the measured"
+              " one by >10%.\n   On a whitened file it should be silent -- where it is"
+              " not, `rednoise` left a residual\n   and the analytic default is"
+              " reporting inflated S/N.)")
+
+
 def sec_duty(rws, args):
     """Duty recovery as bias + scatter, against the realised `ducy_got`."""
     ms = [m for m in present(rws, SEARCHES) if any(r.get(m + "_ducy") for r in rws)]
@@ -1014,7 +1115,7 @@ def add_model(rws, nharms, maxdecim, quiet=False):
 # ---------------------------------------------------------------------------
 SECTIONS = ("header", "cost", "falarm", "roc", "table", "pairs", "decompose",
             "scatter", "recovery", "model", "prepfold", "drizzle", "duty", "2d",
-            "s50", "harm")
+            "s50", "harm", "knee")
 
 
 def main(argv=None):
@@ -1026,6 +1127,12 @@ def main(argv=None):
                          "false alarms per realisation (default 1e-2)")
     ap.add_argument("--threshold", type=float, default=6.0,
                     help="nominal cut for methods with no false-alarm column (prepfold)")
+    ap.add_argument("--knee-by", default="knee", choices=("knee", "sigma"),
+                    help="bin the `knee` section by the DRAWN knee frequency or by "
+                         "the REALISED sigma_red/sigma_w.  The latter is the finer "
+                         "covariate -- at fixed knee the realised level spans "
+                         "0.55-1.50x, because the red variance is dominated by a "
+                         "few low-frequency bins")
     ap.add_argument("--by", default="snr,ducy,f0",
                     help="comma-separated binning axes for the detection tables")
     ap.add_argument("--ref", default="coherent",
@@ -1144,6 +1251,8 @@ def main(argv=None):
         sec_s50(rws, thr, args)
     if "harm" in want:
         sec_harm(rws)
+    if "knee" in want:
+        sec_knee(recs, args, rng)
     return 0
 
 

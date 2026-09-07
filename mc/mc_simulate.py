@@ -122,18 +122,17 @@ COH_LOFREQ, COH_HIFREQ, COH_NHARMS, COH_MAXDECIM = 0.1, 125.0, 60, 6
 # metric phases.  Run 2 could not separate them because it was pure white, where
 # `rednoise` has nothing to remove.
 #
-# THE FOUR CELLS ARE NOT EQUALLY INFORMATIVE, and `coherent_raw` is the odd one.
-# PRESTO's `realfft` emits an UN-normalised FFT and it is `rednoise` that
-# normalises it, so (analytic, raw) is not "no de-reddening" -- it is an input
-# our code does not support at all, and the interesting question ("normalised but
-# still red") has no PRESTO tool that produces it.  Measured on the raw file
-# (`coherent_rawmeas`) IS well posed and is the real "can I skip rednoise?" arm,
-# because the MAD adapts to any normalisation.  `coherent_raw` is kept only to
-# turn "the analytic default is unsafe on an un-normalised file" into a measured
-# statement -- `sigma_warn` fired on 3 of 3 smoke realisations at ratios 3.5e-5
-# to 3.7e-4 -- and it is on its OWN thinner subset because a wrong sigma also
-# makes it 2.5x SLOWER (5.4 s against 2.2 s: the gate stops rejecting anything
-# and the exact rescan runs on everything).
+# THERE IS NO (analytic, raw .fft) ARM, and that is deliberate.  `realfft` emits
+# an un-normalised FFT -- unit-variance noise gives mean Fourier power N, not 1 --
+# and it is `rednoise` that normalises, so analytic sigma on a raw file is off by
+# sqrt(N) and is simply a USAGE ERROR, not a configuration worth measuring.  It
+# was tried: the search's own guard caught it on 3 of 3 smoke realisations at
+# ratios 3.5e-5 to 3.7e-4, and a wrong sigma also made it 2.5x slower.  The
+# interesting case -- normalised but still red -- has no PRESTO tool that
+# produces it, so `coherent_rawmeas` is the well-posed "can I skip rednoise?"
+# arm: the MAD adapts to any normalisation.  `sigma_warn` / `sigma_ratio_seen`
+# are still recorded on every arm, since the guard is what protects a real user
+# from the same mistake.
 COH_ARMS = {
     "coherent":         dict(lofreq=0.1, hifreq=125.0, nharms=60,  maxdecim=6,
                              sigma="analytic", input="_red.fft", every=1),
@@ -141,8 +140,6 @@ COH_ARMS = {
                              sigma="analytic", input="_red.fft", every=1),
     "coherent_meas":    dict(lofreq=0.1, hifreq=125.0, nharms=60,  maxdecim=6,
                              sigma="measured", input="_red.fft", every="sigma"),
-    "coherent_raw":     dict(lofreq=0.1, hifreq=125.0, nharms=60,  maxdecim=6,
-                             sigma="analytic", input=".fft",     every="raw"),
     "coherent_rawmeas": dict(lofreq=0.1, hifreq=125.0, nharms=60,  maxdecim=6,
                              sigma="measured", input=".fft",     every="sigma"),
     # PARKED for run 3 (`--deep-coh-every` defaults to 0): run 2 measured it at
@@ -153,8 +150,7 @@ COH_ARMS = {
                              sigma="analytic", input="_red.fft", every=5),
 }
 # Arms governed by `--sigma-every`: they run on the SAME realisations, so each is
-# paired against the always-on `coherent`.  `coherent_raw` is deliberately not
-# among them (see above) and takes `--raw-every` instead.
+# paired against the always-on `coherent`.
 SIGMA_ARMS = ("coherent_meas", "coherent_rawmeas")
 
 RSEEK_A = dict(Pmin=1.0 / (COH_HIFREQ * COH_MAXDECIM), Pmax=10.0, bmin=20, bmax=120)
@@ -881,8 +877,6 @@ def _search_all(rec, draws, null_draws, stem, args, tools, T, keep_prof=False):
     for name, cfg in COH_ARMS.items():
         if name == "coherent_deep":
             every = args.deep_coh_every
-        elif name == "coherent_raw":
-            every = args.raw_every
         elif name in SIGMA_ARMS:
             every = args.sigma_every
         else:
@@ -1035,16 +1029,10 @@ def main(argv=None):
     ap.add_argument("--sigma-every", type=int, default=3,
                     help="every Nth realisation also gets the three arms that "
                          "answer 'measured or analytic?' (coherent_meas, on the "
-                         "de-reddened file, and coherent_rawmeas, on the raw one).  "
+                         "de-reddened file, and coherent_rawmeas, on the raw one -- "
+                         "there is no analytic-on-raw arm; see COH_ARMS).  "
                          "They run on the SAME realisations, so both are paired "
                          "against the always-on `coherent`; 0 disables")
-    ap.add_argument("--raw-every", type=int, default=10,
-                    help="every Nth realisation also gets analytic sigma on the "
-                         "UN-normalised raw .fft -- a configuration the code does "
-                         "not support, kept only to measure how reliably the "
-                         "sanity guard catches it.  Thinner than --sigma-every "
-                         "because a wrong sigma makes the search 2.5x slower; "
-                         "0 disables")
     ap.add_argument("--deep-every", type=int, default=10,
                     help="every Nth realisation also gets the deep rseek tiling "
                          "(121 s, the single largest cost, and already losing by "
