@@ -53,20 +53,25 @@ import mc_model as MM
 
 # Every method that can appear, in report order.  `coh+tier` is DERIVED here (the
 # union of the default search and the low-frequency deep tier), not recorded.
+# `coherent_meas` / `coherent_raw` / `coherent_rawmeas` complete run 3's
+# sigma x rednoise 2x2 against the always-on `coherent` (analytic, _red.fft).
 METHODS = ("prepfold_chi2", "prepfold_snr1", "accelsearch", "accelsearch_red",
            "rseek_A", "rseek_B", "coherent", "coherent_tier", "coherent_deep",
-           "coh+tier")
+           "coherent_meas", "coherent_raw", "coherent_rawmeas", "coh+tier")
 SEARCHES = ("accelsearch", "accelsearch_red", "rseek_A", "rseek_B",
-            "coherent", "coherent_tier", "coherent_deep", "coh+tier")
+            "coherent", "coherent_tier", "coherent_deep",
+            "coherent_meas", "coherent_raw", "coherent_rawmeas", "coh+tier")
 RECORDED = ("accelsearch", "accelsearch_red", "rseek_A", "rseek_B",
-            "coherent", "coherent_tier", "coherent_deep")
+            "coherent", "coherent_tier", "coherent_deep",
+            "coherent_meas", "coherent_raw", "coherent_rawmeas")
 # The union arm: a candidate list is the two arms' lists concatenated, which is
 # what a tiered search would actually report.
 UNION = {"coh+tier": ("coherent", "coherent_tier")}
 # Statistics that are the same quantity (riptide's snr1), so their VALUES may be
 # compared and not only their detection fractions.
 SNR1_LIKE = ("prepfold_snr1", "rseek_A", "rseek_B", "coherent", "coherent_tier",
-             "coherent_deep", "coh+tier")
+             "coherent_deep", "coherent_meas", "coherent_raw", "coherent_rawmeas",
+             "coh+tier")
 
 BINS = {
     "snr":  [5.5, 6.5, 7.5, 8.5, 9.5, 10.5, 11.5],
@@ -256,7 +261,7 @@ def split_coverage(rws, ms, frac=0.95):
     """Split methods into those that ran on (nearly) everything and those that
     ran on a subset.
 
-    The subset arms (`rseek_B`, `coherent_deep`) are 1-in-5, so intersecting
+    The subset arms (`rseek_B` 1-in-10, the three sigma arms 1-in-3) so intersecting
     EVERY table down to what all eight methods saw would throw away 80% of the
     run to make one comparison fair.  The report instead prints two blocks: the
     always-run methods over the whole set, and every method over the subset they

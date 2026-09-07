@@ -45,9 +45,12 @@ rate. `mc_quicklook.py` still takes `--fap` explicitly and warns without it.
 
 ## Red noise (run 3)
 
-Run 2 was pure white noise, and **only `accelsearch_red` ever saw a whitened
-file** — the `coherent` arms all ran on the raw `.fft`, which is correct for
-white noise but is *not* the configuration a real search deploys.
+Run 2 was pure white noise. The `coherent` arms have always searched
+`_red.fft` — run 1's asymmetry was the *opposite* way round (accelsearch got the
+raw `.fft` while we got the de-reddened one), which is why `accelsearch_red`
+exists. So run 2's `coherent` column already **is** the deployed configuration:
+analytic sigma on a whitened file. What run 2 could not do is separate the two
+choices a user has, because on white noise `rednoise` has nothing to remove.
 
 ```sh
 # run 3: the same population, with a red-noise knee drawn per realisation
@@ -78,6 +81,38 @@ little to no coloured noise". Their **factor 1.1–2 at `P = 0.1–2 s`, DM > 15
 is the number run 3's `coherent` arm should reproduce — quote their high-DM
 figure, because their DM dependence is RFI confusability, and we model red noise
 only.
+
+### The sigma x rednoise 2x2
+
+The standard procedure is "make a `_red.fft`, zap it, run `coherent_search.jl`",
+so the choice that matters is **measured or analytic noise scale**. Run 3 measures
+it, against the always-on `coherent`:
+
+| arm | sigma | input | how often |
+|---|---|---|---|
+| `coherent` | analytic | `_red.fft` | every — the shipped, deployed config |
+| `coherent_meas` | measured | `_red.fft` | `--sigma-every` (3) |
+| `coherent_rawmeas` | measured | `.fft` | `--sigma-every` (3) |
+| `coherent_raw` | analytic | `.fft` | `--raw-every` (10) |
+
+The first three are the useful cells and they run on the same realisations, so
+every comparison is paired. **The fourth is not a sensitivity measurement.**
+`realfft` emits an un-normalised FFT and it is `rednoise` that normalises, so
+(analytic, raw) is not "skipped the de-reddening" — it is an input the code does
+not support, and no PRESTO tool produces the interesting case (normalised but
+still red). `coherent_rawmeas` is the well-posed "can I skip `rednoise`?" arm,
+because the MAD adapts to any normalisation. `coherent_raw` is kept only to turn
+"the analytic default is unsafe on an un-normalised file" into a measured
+statement: `sigma_warn` and `sigma_ratio_seen` are recorded whenever the search's
+own guard fires, which on the smoke run was 3 of 3 at ratios 3.5e-5 to 3.7e-4.
+It sits on a thinner subset because a wrong sigma also makes the search **2.5x
+slower** — the gate stops rejecting and the exact rescan runs on everything.
+
+**`coherent_deep` is parked and `rseek_B` is thinned to 1-in-10.** Run 2 measured
+the deep arm at 70.6% against the default's 71.0% for 2.6x the cost, and answered
+what the deep tiling was for; `--deep-coh-every 5` brings it back. With the new
+arms the run costs **146.5 s per realisation against run 2's 152.6 (0.96x)**, so
+the 2x2 is paid for out of the questions run 2 closed.
 
 **Things that are deliberate here too:**
 

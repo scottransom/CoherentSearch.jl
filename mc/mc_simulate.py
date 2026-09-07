@@ -109,11 +109,53 @@ COH_LOFREQ, COH_HIFREQ, COH_NHARMS, COH_MAXDECIM = 0.1, 125.0, 60, 6
 #                  measure section 4's prediction that a blanket deep search is a net
 #                  LOSS (2-4x the trials, and worse at 5-12% duty because the
 #                  shallowest rung becomes H=20 instead of H=10).
+# `input` is the suffix each arm searches and `sigma` the noise scale it uses.
+# `coherent` is the SHIPPED and DEPLOYED configuration -- analytic sigma on the
+# de-reddened FFT -- and has been since run 1; run 2's `coherent` column is
+# exactly it.  (Run 1's asymmetry was the other way round: accelsearch got the
+# raw `.fft` while we got `_red.fft`, which is why `accelsearch_red` exists.)
+#
+# The extra arms complete the 2x2 a user chooses between: measured vs analytic
+# noise scale, crossed with whether `rednoise` was run.  Analytic assumes unit
+# mean Fourier power, so it is exactly right on a whitened file and blind to any
+# residual; measured adapts but carries ~1% sampling error and costs ~15% of the
+# metric phases.  Run 2 could not separate them because it was pure white, where
+# `rednoise` has nothing to remove.
+#
+# THE FOUR CELLS ARE NOT EQUALLY INFORMATIVE, and `coherent_raw` is the odd one.
+# PRESTO's `realfft` emits an UN-normalised FFT and it is `rednoise` that
+# normalises it, so (analytic, raw) is not "no de-reddening" -- it is an input
+# our code does not support at all, and the interesting question ("normalised but
+# still red") has no PRESTO tool that produces it.  Measured on the raw file
+# (`coherent_rawmeas`) IS well posed and is the real "can I skip rednoise?" arm,
+# because the MAD adapts to any normalisation.  `coherent_raw` is kept only to
+# turn "the analytic default is unsafe on an un-normalised file" into a measured
+# statement -- `sigma_warn` fired on 3 of 3 smoke realisations at ratios 3.5e-5
+# to 3.7e-4 -- and it is on its OWN thinner subset because a wrong sigma also
+# makes it 2.5x SLOWER (5.4 s against 2.2 s: the gate stops rejecting anything
+# and the exact rescan runs on everything).
 COH_ARMS = {
-    "coherent":      dict(lofreq=0.1, hifreq=125.0, nharms=60,  maxdecim=6,  every=1),
-    "coherent_tier": dict(lofreq=0.1, hifreq=5.0,   nharms=120, maxdecim=12, every=1),
-    "coherent_deep": dict(lofreq=0.1, hifreq=62.5,  nharms=120, maxdecim=12, every=5),
+    "coherent":         dict(lofreq=0.1, hifreq=125.0, nharms=60,  maxdecim=6,
+                             sigma="analytic", input="_red.fft", every=1),
+    "coherent_tier":    dict(lofreq=0.1, hifreq=5.0,   nharms=120, maxdecim=12,
+                             sigma="analytic", input="_red.fft", every=1),
+    "coherent_meas":    dict(lofreq=0.1, hifreq=125.0, nharms=60,  maxdecim=6,
+                             sigma="measured", input="_red.fft", every="sigma"),
+    "coherent_raw":     dict(lofreq=0.1, hifreq=125.0, nharms=60,  maxdecim=6,
+                             sigma="analytic", input=".fft",     every="raw"),
+    "coherent_rawmeas": dict(lofreq=0.1, hifreq=125.0, nharms=60,  maxdecim=6,
+                             sigma="measured", input=".fft",     every="sigma"),
+    # PARKED for run 3 (`--deep-coh-every` defaults to 0): run 2 measured it at
+    # 70.6% against the default arm's 71.0% for 2.6x the cost -- it wins 806
+    # paired detections to 563 and gives all of it back to a threshold 0.10
+    # higher.  One flag brings it back.
+    "coherent_deep":    dict(lofreq=0.1, hifreq=62.5,  nharms=120, maxdecim=12,
+                             sigma="analytic", input="_red.fft", every=5),
 }
+# Arms governed by `--sigma-every`: they run on the SAME realisations, so each is
+# paired against the always-on `coherent`.  `coherent_raw` is deliberately not
+# among them (see above) and takes `--raw-every` instead.
+SIGMA_ARMS = ("coherent_meas", "coherent_rawmeas")
 
 RSEEK_A = dict(Pmin=1.0 / (COH_HIFREQ * COH_MAXDECIM), Pmax=10.0, bmin=20, bmax=120)
 # riptide-at-its-best: narrow bins ranges where periods are long, but a WIDE one
@@ -837,7 +879,14 @@ def _search_all(rec, draws, null_draws, stem, args, tools, T, keep_prof=False):
     # default arm's threshold.  The ~2 s of Julia start-up per arm is ~4% of a
     # realisation and buys a threshold that is measured rather than assumed.
     for name, cfg in COH_ARMS.items():
-        every = args.deep_coh_every if name == "coherent_deep" else cfg["every"]
+        if name == "coherent_deep":
+            every = args.deep_coh_every
+        elif name == "coherent_raw":
+            every = args.raw_every
+        elif name in SIGMA_ARMS:
+            every = args.sigma_every
+        else:
+            every = cfg["every"]
         if every != 1 and not one_in(rec["index"], every):
             continue
         out_f = f"{stem}_{name}.cohout"
@@ -846,13 +895,27 @@ def _search_all(rec, draws, null_draws, stem, args, tools, T, keep_prof=False):
                "--threshold", str(args.threshold), "--noprogress",
                "--lofreq", repr(cfg["lofreq"]), "--hifreq", repr(cfg["hifreq"]),
                "--nharms", str(cfg["nharms"]), "--maxdecim", str(cfg["maxdecim"]),
-               "--ncands", str(args.ncands), "-o", out_f, stem + "_red.fft"]
+               "--sigma", cfg["sigma"],
+               "--ncands", str(args.ncands), "-o", out_f, stem + cfg["input"]]
         t, _, err, rc = run(cmd)
         rec["timing"][name] = t
         ch = parse_cohout(out_f) if rc == 0 else []
         hits, fa = score(ch, inj, T, tol)
         rec["results"][name] = dict(hits=hits, false=fa_summary(fa, args.fa_top), ncand=len(ch),
                                     ok=(rc == 0))
+        # `--sigma analytic` on an un-whitened file inflates every S/N, and the
+        # search says so on stderr rather than switching estimator.  Whether the
+        # guard FIRED is a result in its own right -- it is the thing that tells a
+        # user whether the default was safe on their data -- so record it, and the
+        # ratio it reported, instead of throwing the stderr away on rc == 0.
+        if "analytic noise scale disagrees" in err:
+            rec["results"][name]["sigma_warn"] = True
+            m = re.search(r"ratio ([0-9.eE+-]+)\)", err)
+            if m:
+                try:
+                    rec["results"][name]["sigma_ratio_seen"] = float(m.group(1))
+                except ValueError:
+                    pass
         if rc != 0:
             rec["results"][name]["stderr"] = err[-2000:]
 
@@ -969,11 +1032,24 @@ def main(argv=None):
     ap.add_argument("--injections", type=int, default=6)
     ap.add_argument("--noise-every", type=int, default=10,
                     help="every Nth realisation gets NO injections (false-alarm calibration); 0 disables")
-    ap.add_argument("--deep-every", type=int, default=5,
+    ap.add_argument("--sigma-every", type=int, default=3,
+                    help="every Nth realisation also gets the three arms that "
+                         "answer 'measured or analytic?' (coherent_meas, on the "
+                         "de-reddened file, and coherent_rawmeas, on the raw one).  "
+                         "They run on the SAME realisations, so both are paired "
+                         "against the always-on `coherent`; 0 disables")
+    ap.add_argument("--raw-every", type=int, default=10,
+                    help="every Nth realisation also gets analytic sigma on the "
+                         "UN-normalised raw .fft -- a configuration the code does "
+                         "not support, kept only to measure how reliably the "
+                         "sanity guard catches it.  Thinner than --sigma-every "
+                         "because a wrong sigma makes the search 2.5x slower; "
+                         "0 disables")
+    ap.add_argument("--deep-every", type=int, default=10,
                     help="every Nth realisation also gets the deep rseek tiling "
                          "(121 s, the single largest cost, and already losing by "
                          "7.3 points); 0 disables")
-    ap.add_argument("--deep-coh-every", type=int, default=5,
+    ap.add_argument("--deep-coh-every", type=int, default=0,
                     help="every Nth realisation also gets the FULL-BAND deep coherent "
                          "arm (nharms 120, maxdecim 12, hifreq 62.5) -- the arm that "
                          "measures whether a blanket deep search is the net loss "
