@@ -443,31 +443,148 @@ def fa_summary(fa, cap=800):
                 floor=(round(s[-1], 3) if s else None))
 
 
-def add_rednoise(x, dt, fcorner, alpha, rng):
+# ---------------------------------------------------------------------------
+# Red noise
+# ---------------------------------------------------------------------------
+# Run 3's population, anchored to measured spectra rather than invented.  Fitting
+# P(r) = 1 + (r/r_knee)^-alpha to four real dedispersed observations gives
+#
+#   PALFA / Arecibo       T= 269 s   f_knee 31.5 Hz   alpha 1.88   sigma_red 4.5
+#   Terzan 5 / GBT GUPPI  T=4915 s   f_knee  6.7 Hz   alpha 1.95   sigma_red 6.0
+#   PM0063 / Parkes MB    T=2097 s   f_knee  1.8 Hz   alpha 0.86   sigma_red 0.07
+#   Parkes 70cm           T= 158 s   f_knee  1.6 Hz   alpha 0.23   sigma_red 0.05
+#
+# so where red noise matters at all the index sits at ~1.9-2.0 -- a random walk,
+# which is what receiver gain drift and atmospheric opacity produce -- while the
+# amplitude ranges over EIGHT orders of magnitude.  Alpha is the stable quantity
+# and the knee is the variable one, so alpha is a tight nuisance parameter and
+# the knee is the study axis, not the other way round.  Deriving alpha from a
+# drawn amplitude (the obvious alternative) would make it wander over exactly the
+# range the measurements say it does not.
+#
+# The knee range reaching tens of Hz is corroborated twice over by Lazarus et al.
+# (2015): PALFA's measured sensitivity degradation sets in at P ~ 100 ms (10 Hz),
+# and PRESTO's own `rednoise` grows its block size to 100 bins above 6 Hz "where
+# there is little to no coloured noise".
+RED_KNEE = (0.1, 50.0)                 # Hz, log-uniform -- the study axis
+RED_ALPHA = (2.0, 0.3, 1.2, 2.8)       # mean, sd, truncation lo/hi
+RED_SIGMA_CAP = 30.0                   # sigma_red/sigma_white; ~100x peak wander
+
+
+def _psum(alpha, M, K=1000):
+    """Sum_{k=1}^{M} k**-alpha: exact for the first K terms, Euler-Maclaurin after.
+
+    M is N/2 (8.4M at run-3 size) and this is called once per realisation, so the
+    tail matters for speed, not accuracy -- but alpha can reach 1.2, where the
+    tail is still 1% of the total, and truncating it would bias sigma low exactly
+    where the red noise is strongest.
+    """
+    K = min(M, K)
+    s = float(np.sum(np.arange(1, K + 1, dtype=np.float64) ** -alpha))
+    if M > K:
+        s += (K ** (1.0 - alpha) - M ** (1.0 - alpha)) / (alpha - 1.0)
+        s += 0.5 * (M ** -alpha - K ** -alpha)
+        s += (alpha / 12.0) * (K ** (-alpha - 1.0) - M ** (-alpha - 1.0))
+    return s
+
+
+def red_sigma_ratio(fknee, alpha, N, dt):
+    """sigma_red / sigma_white for the spectrum `add_rednoise` actually builds.
+
+    The added series has variance `(2/N) * sum_k (r_knee/k)**alpha` with
+    `r_knee = fknee * T`, so this is exact for that spectrum rather than an
+    estimate of it, and it is what `RED_SIGMA_CAP` is applied to.
+
+    It grows as `T**((alpha-1)/2)` at fixed `fknee` -- a longer observation drifts
+    further on the same spectrum -- so the sampled region depends on T and this
+    cap does NOT transfer to a run with a different `--nsamp` / `--dt`.
+
+    It is an EXPECTATION, not what any one realisation gets.  The red variance is
+    dominated by the handful of lowest Fourier bins, each exponentially
+    distributed, so it is a few-degree-of-freedom random variable: over 400 draws
+    the mean VARIANCE matches this to 0.3-1.1% (the formula is exact) while the
+    realised SD spans 0.55-1.50x it between the 5th and 95th percentiles.  That
+    scatter is physical -- real observations at the same nominal red level vary
+    that much for the same reason -- so it is recorded rather than removed, and
+    `rednoise.sigma_got` is the covariate to bin on when the drawn knee proves
+    too coarse.  One consequence: `RED_SIGMA_CAP` caps the EXPECTED wander, and
+    individual realisations will exceed it.
+    """
+    return math.sqrt(2.0 / N * (fknee * N * dt) ** alpha * _psum(alpha, N // 2))
+
+
+def rng_for_rednoise(seedseq):
+    """The realisation's red-noise stream, spawned from its seed.
+
+    Red noise draws off a SEPARATE stream so that switching it on perturbs
+    nothing else: the population draws, the injected S/N values, the phases and
+    the white noise are bit-for-bit what run 2 got at the same index.  That makes
+    run 2 a PAIRED control for run 3 -- same signals in the same white noise,
+    with red added -- rather than an independent sample of the same population.
+    Sharing one stream would have silently destroyed that, and the damage would
+    have looked like ordinary Monte Carlo scatter.
+    """
+    return np.random.default_rng(np.random.SeedSequence(
+        entropy=seedseq.entropy, spawn_key=tuple(seedseq.spawn_key) + (1,)))
+
+
+def draw_rednoise(rng, N, dt, knee=RED_KNEE, alpha=RED_ALPHA, cap=RED_SIGMA_CAP,
+                  tries=1000):
+    """Draw one realisation's `(f_knee, alpha)`.
+
+    `f_knee` is log-uniform over `knee` and `alpha` is normal, truncated.  A pair
+    whose implied wander exceeds `cap` is REDRAWN; that rejection is the only
+    coupling between the two, and it removes the "high knee AND steep index"
+    corner that no telescope produces -- at f_knee = 10 Hz the cap admits
+    alpha = 2.0 (sigma_red 4.5) and refuses alpha = 2.5 (40.3).  About 6.5% of
+    pairs are rejected at the defaults.  Both values are recorded so the analysis
+    can measure the induced correlation instead of assuming independence.
+    """
+    lo, hi = knee
+    mu, sd, alo, ahi = alpha
+    for _ in range(tries):
+        fk = math.exp(rng.uniform(math.log(lo), math.log(hi)))
+        al = float(np.clip(rng.normal(mu, sd), alo, ahi))
+        s = red_sigma_ratio(fk, al, N, dt)
+        if s <= cap:
+            return dict(fknee=fk, alpha=al, sigma_ratio=s)
+    raise RuntimeError(f"red-noise draw failed {tries} times: knee={knee}, "
+                       f"alpha={alpha}, cap={cap} describes an empty region")
+
+
+def add_rednoise(x, dt, fknee, alpha, rng):
     """Add a power-law red-noise component to `x` in place.
 
-    `fcorner` is where the red power equals the white: `P(f) = (fcorner/f)^alpha`
-    for `f > 0`, so the added variance is roughly `fcorner^alpha * T^(alpha-1)`
-    and only values well below `1/sqrt(T)` are sane -- at `alpha = 2` and
-    `T = 1006 s`, `fcorner = 0.01 Hz` adds ~10% of the white variance and
-    `fcorner = 1 Hz` adds a thousand times it.
+    `fknee` is the knee of the NORMALISED power spectrum: the added component has
+    `P(f)/P_white = (fknee/f)**alpha`, so `fknee` is exactly where a search sees
+    the red power cross the white floor.
 
-    OFF by default and untouched by run 2 -- everything measured so far is pure
-    white noise, which is the regime where our analytic sigma is exactly right and
-    where riptide's per-profile sigma-hat has no compensating advantage, so a
-    red-noise run is a SEPARATE study whose numbers must not be pooled with the
-    white ones (the FAP calibration and the paired-noise design both have to be
-    redone per subset).  The flag exists so that study is one
-    argument away rather than a fresh code change.
+    The time-domain amplitude that implies is `red_sigma_ratio`, and NOT the
+    `fcorner**alpha * T**(alpha-1)` this docstring claimed until 2026-09-07 --
+    that was short by `2*dt*zeta(alpha)`, a factor of ~5000 at run-3 parameters.
+    It said `fcorner = 0.01 Hz, alpha = 2` adds "~10% of the white variance"
+    (it adds 2e-5) and that 1 Hz adds "a thousand times it" (0.199), and the CLI
+    help repeated it as "sane values are ~0.003-0.05".  Those knees are ~100x
+    below every real observation measured above and add ~2% of the white sigma,
+    so a red-noise run configured from that advice would have measured nothing.
+    The CODE was always right; only the guidance was wrong.
+
+    A red-noise run is a SEPARATE study whose numbers must not be pooled with the
+    white ones: the false-alarm rate is knee-dependent, so thresholds have to be
+    matched WITHIN a knee bin and never across the run.
+
+    Returns the REALISED sd of the component it added -- free here, and a better
+    covariate than the drawn knee for the reason in `red_sigma_ratio`.
     """
     n = len(x)
     F = np.fft.rfft(rng.normal(size=n))
     f = np.fft.rfftfreq(n, dt)
     g = np.zeros_like(f)
-    g[1:] = (fcorner / f[1:]) ** (0.5 * alpha)
+    g[1:] = (fknee / f[1:]) ** (0.5 * alpha)
     F *= g
-    x += np.fft.irfft(F, n)
-    return x
+    r = np.fft.irfft(F, n)
+    x += r
+    return float(r.std())
 
 
 def one_in(idx, n):
@@ -512,11 +629,32 @@ def realisation(idx, args, pop, tools, seedseq):
     empty = one_in(idx, args.noise_every)
     ninj = 0 if empty else args.injections
 
+    # Red noise, on its own stream (see `rng_for_rednoise`): drawing it here
+    # costs the main stream nothing, so this index's white noise and injections
+    # are identical to run 2's and the two runs are PAIRED.
+    rng_red = red = None
+    if args.rednoise_knee or args.rednoise:
+        rng_red = rng_for_rednoise(seedseq)
+        if args.rednoise_knee:
+            red = draw_rednoise(rng_red, N, dt, tuple(args.rednoise_knee),
+                                tuple(args.rednoise_alpha_pop), args.rednoise_cap)
+        else:                                   # fixed knee: controls and pins
+            red = dict(fknee=args.rednoise, alpha=args.rednoise_alpha,
+                       sigma_ratio=red_sigma_ratio(args.rednoise,
+                                                   args.rednoise_alpha, N, dt))
+
     rec = dict(index=idx, host=os.uname().nodename, t_start=time.time(),
                N=N, dt=dt, T=T, empty=empty, injections=[], timing={}, results={},
+               rednoise=red,
                config=dict(coh=COH_ARMS, rseek_A=RSEEK_A, tol_bins=args.tol_bins,
                            threshold=args.threshold, trials=tools.get("trials"),
-                           strat=args.strat, rednoise=args.rednoise))
+                           strat=args.strat,
+                           rednoise=(list(args.rednoise_knee) if args.rednoise_knee
+                                     else args.rednoise),
+                           rednoise_alpha=(list(args.rednoise_alpha_pop)
+                                           if args.rednoise_knee
+                                           else args.rednoise_alpha),
+                           rednoise_cap=args.rednoise_cap))
 
     # On an injection-free realisation, draw the SAME number of pulsars anyway --
     # not to inject them, but to give prepfold somewhere to fold.  Folding pure
@@ -549,8 +687,8 @@ def realisation(idx, args, pop, tools, seedseq):
     # --- build the time series ---------------------------------------------
     t0 = time.perf_counter()
     x = rng.normal(size=N)
-    if args.rednoise:
-        add_rednoise(x, dt, args.rednoise, args.rednoise_alpha, rng)
+    if red is not None:
+        red["sigma_got"] = add_rednoise(x, dt, red["fknee"], red["alpha"], rng_red)
     for d in draws:
         prof, info = MP.make_profile(d["ducy"], d["w10_w50"])
         MP.inject(x, dt, d["period"], d["phase0"], prof, d["snr"])
@@ -855,11 +993,28 @@ def main(argv=None):
                          "The default raises the fraction below 0.5%% duty from 1.5%% "
                          "to 3.7%% at 0.85 effective sample size.  Pass '0 0 1' for "
                          "the unstratified population")
+    ap.add_argument("--rednoise-knee", type=float, nargs=2, default=None,
+                    metavar=("LO", "HI"),
+                    help="draw a red-noise KNEE per realisation, log-uniform over "
+                         "LO..HI Hz -- this is run 3's mode.  '0.1 50' spans the "
+                         "measured range (real observations fit at 1.6-31 Hz).  "
+                         "Off by default, which is run 2 (pure white)")
+    ap.add_argument("--rednoise-alpha-pop", type=float, nargs=4,
+                    default=list(RED_ALPHA), metavar=("MU", "SD", "LO", "HI"),
+                    help="the spectral index is a NUISANCE parameter, not an axis: "
+                         "measured spectra put it at 1.9-2.0 wherever red noise "
+                         "matters, so it is drawn tight and truncated")
+    ap.add_argument("--rednoise-cap", type=float, default=RED_SIGMA_CAP,
+                    help="reject a (knee, alpha) pair implying sigma_red/sigma_w "
+                         "above this (~100x peak baseline wander).  Rejects ~6.5%% "
+                         "at the defaults, all of it the high-knee/steep corner")
     ap.add_argument("--rednoise", type=float, default=0.0,
-                    help="add power-law red noise with this corner frequency in Hz "
-                         "(0 = off, which is what run 2 uses).  Sane values are "
-                         "~0.003-0.05 at T = 1006 s; see add_rednoise for why")
-    ap.add_argument("--rednoise-alpha", type=float, default=2.0)
+                    help="FIXED knee in Hz, for controls and pins; ignored when "
+                         "--rednoise-knee is given.  0 = off.  Note this is a "
+                         "search-band frequency, NOT the ~0.003-0.05 the help here "
+                         "used to advise -- see add_rednoise")
+    ap.add_argument("--rednoise-alpha", type=float, default=2.0,
+                    help="fixed spectral index, used with a fixed --rednoise")
     ap.add_argument("--nsamp", type=int, default=1 << 24)
     ap.add_argument("--dt", type=float, default=60.0e-6)
     ap.add_argument("--snrs", type=float, nargs="+", default=None,

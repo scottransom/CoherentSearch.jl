@@ -43,6 +43,85 @@ rate. `mc_quicklook.py` still takes `--fap` explicitly and warns without it.
 | `mc_quicklook.py` | one page of diagnostic plots |
 | `test_mc.py` | pins for both models, the sampler and the subset selector |
 
+## Red noise (run 3)
+
+Run 2 was pure white noise, and **only `accelsearch_red` ever saw a whitened
+file** — the `coherent` arms all ran on the raw `.fft`, which is correct for
+white noise but is *not* the configuration a real search deploys.
+
+```sh
+# run 3: the same population, with a red-noise knee drawn per realisation
+mc/mc_simulate.py --outdir /data/mc/run3 --rednoise-knee 0.1 50 ...
+```
+
+**The knee is the axis; the spectral index is a nuisance parameter.** Fitting
+`P(r) = 1 + (r/r_knee)^-alpha` to four real dedispersed observations:
+
+| observation | T | f_knee | alpha | sigma_red/sigma_w |
+|---|---|---|---|---|
+| PALFA / Arecibo | 269 s | 31.5 Hz | 1.88 | 4.5 |
+| Terzan 5 / GBT GUPPI | 4915 s | 6.7 Hz | 1.95 | 6.0 |
+| PM0063 / Parkes MB | 2097 s | 1.8 Hz | 0.86 | 0.07 |
+| Parkes 70cm | 158 s | 1.6 Hz | 0.23 | 0.05 |
+
+Where red noise matters at all the index is **1.9–2.0** — a random walk, which is
+what gain drift and atmospheric opacity produce — while the amplitude spans
+**eight orders of magnitude**. So `alpha ~ N(2.0, 0.3)` truncated to [1.2, 2.8],
+and the knee log-uniform over 0.1–50 Hz carries the variation. Deriving `alpha`
+from a drawn amplitude, the obvious alternative, would make it wander over
+exactly the range the measurements say it does not.
+
+The knee range reaching tens of Hz is corroborated independently by Lazarus
+et al. (2015): PALFA's measured degradation sets in at `P ~ 100 ms` (10 Hz), and
+PRESTO's `rednoise` grows its block size to 100 bins above 6 Hz "where there is
+little to no coloured noise". Their **factor 1.1–2 at `P = 0.1–2 s`, DM > 150**
+is the number run 3's `coherent` arm should reproduce — quote their high-DM
+figure, because their DM dependence is RFI confusability, and we model red noise
+only.
+
+**Things that are deliberate here too:**
+
+* **Injected S/N stays defined against the WHITE floor.** `inject` normalises
+  analytically against unit-variance noise, so red noise *eats* S/N rather than
+  moving the axis under it. Renormalising against the realised variance would
+  make run 2 useless as a zero point.
+* **Red noise draws off a SEPARATE RNG stream** (`rng_for_rednoise`), so
+  switching it on perturbs nothing else: at a given index the population draws,
+  the injected S/N, the phases and the white noise are bit-for-bit run 2's.
+  **Run 2 is therefore a paired control for run 3**, not an independent sample —
+  verified end to end. Sharing one stream would have destroyed that silently,
+  and the damage would have looked like ordinary Monte Carlo scatter.
+* **`sigma_ratio` is an expectation; `sigma_got` is what the realisation got.**
+  The red variance is dominated by a few exponential low-frequency bins, so it is
+  a few-DOF random variable: the mean *variance* matches the closed form to
+  0.3–1.1%, but the realised *sd* spans 0.55–1.50x it (5th–95th). That scatter is
+  physical, so both are recorded and `sigma_got` is the finer covariate. It also
+  means `--rednoise-cap` caps the *expected* wander and individual realisations
+  will exceed it.
+* **The cap is a backstop, not a design driver.** `sigma_red <= 30` (~100x peak
+  baseline wander) rejects ~6.5% of pairs, all of it the "high knee AND steep
+  index" corner no telescope produces — at 10 Hz it admits `alpha = 2.0`
+  (`sigma_red` 4.5) and refuses 2.5 (40.3). It induces a mild knee/alpha
+  correlation (mean alpha 2.00 below 8 Hz, 1.86 above 20), which is why both are
+  recorded rather than assumed independent.
+* **Thresholds must be matched WITHIN a knee bin.** The false-alarm rate is
+  knee-dependent, so a threshold matched over the pooled run belongs to none of
+  the levels in it. `mc_analyze.py` prints a loud warning when the records carry
+  red noise; the per-bin analysis is still to be written.
+* **No RFI, on purpose.** Frequency-domain zapping is what a real pipeline does,
+  but riptide has no zapping stage — it detrends in the time domain — so
+  FFT → zap → iFFT would be a preprocessing step *we* impose on it, unfair either
+  way. White and red are the two noise types always present and native to both
+  pipelines. Revisit only if a referee asks.
+
+**One bug this work fixed:** `add_rednoise`'s docstring claimed the added
+variance was `fcorner^alpha * T^(alpha-1)` — short by `2*dt*zeta(alpha)`, a
+factor of ~5000 at run-3 size — and the CLI help repeated it as "sane values are
+~0.003-0.05 Hz". Those knees are ~100x below any real observation and add ~2% of
+the white sigma, so **a red-noise run configured from that advice would have
+measured nothing.** The code was always right; only the guidance was wrong.
+`test_mc.py` pins the number so it cannot come back.
+
 `--tpa` wants the MeerKAT TPA supplementary `table_1.csv`
 (`stab2775_supplemental_file.zip`). Without it the sampler falls back to the
 recorded quantiles of that table, which is close but does not carry the real

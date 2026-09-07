@@ -447,6 +447,20 @@ def sec_header(recs, rws, args):
     nempty = sum(1 for r in recs if r.get("empty"))
     print(f"{len(recs)} realisations ({nempty} injection-free), {len(rws)} injections")
     print(f"weighting: {args.weight}   effective sample size {ess(rws):.0f} injections")
+
+    # Run 3 carries a per-realisation red-noise knee, and the false-alarm rate is
+    # a function of it -- so a threshold matched over the whole run is matched to
+    # a MIXTURE of noise levels and belongs to none of them.  Everything below
+    # still pools.  Refuse to be quiet about that.
+    red = [r["rednoise"] for r in recs if r.get("rednoise")]
+    if red:
+        ks = sorted(x["fknee"] for x in red)
+        print(f"\n  *** {len(red)} of {len(recs)} realisations carry RED NOISE "
+              f"(knee {ks[0]:.2f}-{ks[-1]:.2f} Hz, median {ks[len(ks)//2]:.2f}).")
+        print("  *** Every threshold below is matched over the POOLED run, i.e. over a")
+        print("  *** mixture of noise levels, and is therefore correct for none of them.")
+        print("  *** Split by knee before quoting anything: the red-noise study needs")
+        print("  *** per-bin thresholds, and the white run is its own zero point.\n")
     cov = {m: sum(1 for r in rws if m in r) for m in present(rws, SEARCHES)}
     print("coverage (injections each method ran on): " +
           "  ".join(f"{m} {v}" for m, v in cov.items()))

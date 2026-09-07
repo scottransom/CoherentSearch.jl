@@ -296,6 +296,100 @@ def test_silent_failures():
               str(got[0]["results"]) if got else "no record")
 
 
+
+def test_rednoise():
+    """The red-noise generator: the spectrum it claims, and the pairing it promises."""
+    import mc_simulate as MS
+
+    N, dt = 1 << 20, 6.0e-5
+    T = N * dt
+
+    # 1. The closed form is exact in the MEAN VARIANCE.  Pinning the mean SD
+    #    instead would read ~6% low and look like a bug: the red variance is
+    #    dominated by a few exponential low-frequency bins, so sqrt() is biased
+    #    by Jensen.  See red_sigma_ratio.
+    worst = 0.0
+    for fk, al in [(2.0, 2.0), (10.0, 2.0), (5.0, 2.5)]:
+        pred = MS.red_sigma_ratio(fk, al, N, dt)
+        v = []
+        for s in range(200):
+            r = np.zeros(N)
+            MS.add_rednoise(r, dt, fk, al, np.random.default_rng(s))
+            v.append(r.var())
+        worst = max(worst, abs(float(np.mean(v)) / pred ** 2 - 1.0))
+    check("red_sigma_ratio is exact in the mean variance", worst < 0.03,
+          f"worst |mean var / predicted - 1| = {worst:.4f}")
+
+    # 2. `fknee` really is the knee of the NORMALISED spectrum: red power equals
+    #    white there, so the total reads 2.  This is the definition every other
+    #    number in the study leans on.
+    fk, al = 20.0, 2.0
+    x = np.random.default_rng(7).normal(size=N)
+    MS.add_rednoise(x, dt, fk, al, np.random.default_rng(8))
+    P = np.abs(np.fft.rfft(x)) ** 2 / N
+    f = np.fft.rfftfreq(N, dt)
+    m = (f > fk / 1.15) & (f < fk * 1.15)
+    at_knee = float(np.median(P[m])) / math.log(2.0)       # median -> mean, chi2_2
+    hi = float(np.median(P[f > 10 * fk])) / math.log(2.0)
+    check("P(f_knee) is twice the white floor", abs(at_knee / hi - 2.0) < 0.15,
+          f"P(knee)/white = {at_knee / hi:.3f}, white floor {hi:.3f}")
+
+    # 3. The index is what was asked for, fitted well inside the red-dominated
+    #    part (bins 10 .. r_knee/4, where red is >=16x white so the +1 from the
+    #    white floor cannot tilt the slope).  Powers are exponential, so the
+    #    per-bin median is converted to a mean by /ln2 before fitting.
+    N2 = 1 << 22
+    x2 = np.random.default_rng(7).normal(size=N2)
+    MS.add_rednoise(x2, dt, fk, al, np.random.default_rng(8))
+    P2 = np.abs(np.fft.rfft(x2)) ** 2 / N2
+    rk = fk * N2 * dt
+    e = np.unique(np.round(np.logspace(1, math.log10(rk / 4.0), 40)).astype(int))
+    rf, rv = [], []
+    for lo, hi_ in zip(e[:-1], e[1:]):
+        if hi_ - lo >= 6:
+            rf.append(math.sqrt(lo * (hi_ - 1)))
+            rv.append(float(np.median(P2[lo:hi_])) / math.log(2.0))
+    a_fit = -np.polyfit(np.log(rf), np.log(rv), 1)[0]
+    check("the synthesised index recovers the drawn one", abs(a_fit - al) < 0.10,
+          f"drawn {al}, fitted {a_fit:.3f} over {len(rf)} log bins")
+
+    # 4. The cap rejects the high-knee/steep corner and nothing else.  These two
+    #    points are the worked example in draw_rednoise's docstring.
+    lo_ok = MS.red_sigma_ratio(10.0, 2.0, 1 << 24, dt)
+    hi_no = MS.red_sigma_ratio(10.0, 2.5, 1 << 24, dt)
+    check("the sigma cap admits alpha=2 at 10 Hz and refuses alpha=2.5",
+          lo_ok < MS.RED_SIGMA_CAP < hi_no,
+          f"sigma_red = {lo_ok:.1f} (a=2.0) and {hi_no:.1f} (a=2.5), cap {MS.RED_SIGMA_CAP}")
+
+    # 5. THE PAIRING PIN.  Red noise must draw off its own stream, or run 3 is
+    #    an independent sample of run 2 rather than a paired one -- and the
+    #    damage would look exactly like ordinary Monte Carlo scatter.
+    seed = np.random.SeedSequence(entropy=20260828, spawn_key=(7,))
+    rng = np.random.default_rng(seed)
+    a = rng.normal(size=8)
+    red = MS.draw_rednoise(MS.rng_for_rednoise(seed), 1 << 24, dt)
+    b = rng.normal(size=8)
+    clean = np.random.default_rng(
+        np.random.SeedSequence(entropy=20260828, spawn_key=(7,))).normal(size=16)
+    check("drawing red noise does not perturb the realisation's own stream",
+          np.array_equal(np.concatenate([a, b]), clean),
+          "the main stream advanced -- run 2 is no longer a paired control")
+    check("draw_rednoise returns knee, alpha and the implied sigma",
+          set(red) == {"fknee", "alpha", "sigma_ratio"}
+          and MS.RED_KNEE[0] <= red["fknee"] <= MS.RED_KNEE[1]
+          and MS.RED_ALPHA[2] <= red["alpha"] <= MS.RED_ALPHA[3],
+          str(red))
+
+    # 6. Regression on the docstring bug fixed 2026-09-07: the old guidance said
+    #    fknee = 0.01 Hz, alpha = 2 adds "~10% of the white variance".  It adds
+    #    2e-5.  Anyone re-deriving that formula must fail here, not discover it
+    #    after a week of compute that measured nothing.
+    s = MS.red_sigma_ratio(0.01, 2.0, 1 << 24, dt)
+    check("fknee=0.01 Hz is NEGLIGIBLE, not '10% of the white variance'",
+          1e-5 < s ** 2 < 1e-4,
+          f"variance ratio {s ** 2:.3e} (sigma {s:.5f}) -- expected ~2e-5")
+
+
 if __name__ == "__main__":
     test_ladder()
     test_drizzle()
@@ -304,6 +398,7 @@ if __name__ == "__main__":
     test_strat()
     test_one_in()
     test_silent_failures()
+    test_rednoise()
     print()
     if FAIL:
         print(f"{len(FAIL)} FAILED: {FAIL}")
