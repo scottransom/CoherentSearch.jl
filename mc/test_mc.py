@@ -249,6 +249,26 @@ def test_one_in():
           all(MS.one_in(i, 1) for i in range(100)))
     check("one_in(., 0) is never", not any(MS.one_in(i, 0) for i in range(100)))
 
+    # Run 3's bug: two selectors off the same stream with `n` in a divides
+    # relation are the SAME set, silently.  `--deep-every 10` beside
+    # `--noise-every 10` gave a deep tiling on 330 of 330 injection-free
+    # realisations -- 13% of the run's compute spent where nothing could be
+    # detected -- and `--keep-profiles 10` stored profiles for exactly those.
+    N = 20000
+    empty = [i for i in range(N) if MS.one_in(i, 10)]
+    for name, n, salt in (("deep", 10, MS.SALT_DEEP), ("deep-5", 5, MS.SALT_DEEP),
+                          ("coh", 3, MS.SALT_COH), ("profiles", 10, MS.SALT_PROFILES)):
+        sub = [i for i in range(N) if MS.one_in(i, n, salt=salt)]
+        frac = len(set(sub) & set(empty)) / len(sub)
+        check(f"1-in-{n} subset '{name}' is independent of the empty selector",
+              0.6 / 10 < frac < 1.4 / 10, f"empty fraction {frac:.3f}, want ~0.100")
+    check("salt 0 is unchanged (run 2 pairing)",
+          all(MS.one_in(i, n) == MS.one_in(i, n, salt=0) for n in (3, 5, 10)
+              for i in range(2000)))
+    check("different salts are different subsets",
+          set(i for i in range(N) if MS.one_in(i, 10, salt=1))
+          != set(i for i in range(N) if MS.one_in(i, 10, salt=2)))
+
 
 # --- 6. the two guards that run 2's accelsearch failure went past ----------
 def test_silent_failures():

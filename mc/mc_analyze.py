@@ -343,7 +343,16 @@ def saturation(recs, method):
                 floor=max(cap, rep))
 
 
-FA_GRID = np.arange(3.0, 30.0, 0.05)
+# The grid every matched threshold is read off.  It runs well past anything a
+# calibrated statistic reaches, on purpose: under red noise `rseek`'s statistic
+# is not calibrated at all -- its 0.01/realisation cut is 23 at a 0.5-2 Hz knee
+# and 280 above 15 Hz -- and a grid that stopped at 30 returned `inf`, which the
+# tables then printed beside a detection fraction of 0.0% as though the code had
+# been scored.  It had not been: no threshold existed on the grid.  Past 30 the
+# spacing coarsens, since nothing at that end is a close call.
+FA_GRID = np.concatenate([np.arange(3.0, 30.0, 0.05),
+                          np.arange(30.0, 100.0, 0.5),
+                          np.arange(100.0, 1000.0, 5.0)])
 
 
 def fa_curves(recs, methods):

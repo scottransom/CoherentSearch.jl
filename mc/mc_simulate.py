@@ -153,6 +153,16 @@ COH_ARMS = {
 # paired against the always-on `coherent`.
 SIGMA_ARMS = ("coherent_meas", "coherent_rawmeas")
 
+# One independent `one_in` stream per subset.  They MUST differ: two selectors
+# off the same stream with `n` in a divides relation pick the same realisations,
+# which is how run 3's `rseek_B` came to run on nothing but injection-free
+# realisations.  Salt 0 is the noise selector and is not listed here on purpose:
+# changing it would change which realisations are empty, and break run 2's
+# pairing with run 3.
+SALT_DEEP = 1          # --deep-every, the rseek deep tiling
+SALT_COH = 2           # --sigma-every / --deep-coh-every, the coherent subsets
+SALT_PROFILES = 3      # --keep-profiles, stored prepfold profiles
+
 RSEEK_A = dict(Pmin=1.0 / (COH_HIFREQ * COH_MAXDECIM), Pmax=10.0, bmin=20, bmax=120)
 # riptide-at-its-best: narrow bins ranges where periods are long, but a WIDE one
 # at the short end -- a literal pipeline-style tiling there pins b near 22 and is
@@ -625,8 +635,8 @@ def add_rednoise(x, dt, fknee, alpha, rng):
     return float(r.std())
 
 
-def one_in(idx, n):
-    """True on 1-in-`n` realisations, spread EVENLY over the workers.
+def one_in(idx, n, salt=0):
+    """True on 1-in-`n` realisations of stream `salt`, spread EVENLY over the workers.
 
     `idx % n` looks right and is not.  Worker `w` of `W` takes the indices with
     `idx % W == w`, so whenever `n` divides `W` -- 15 workers with
@@ -646,12 +656,28 @@ def one_in(idx, n):
     `n`.  Caught by `test_mc.py` at `W = 20, n = 4`, where the per-worker counts
     were `0..300` against an ideal 75.  This is splitmix64's finaliser, which
     mixes every bit into every other.
+
+    **`salt` is the second half of the lesson, and run 3 needed it.**  Every
+    subset used to come off the SAME hash, so two selectors whose `n` divide
+    each other are the same set: `h % 10 == 0` implies `h % 5 == 0`.  Run 3 ran
+    `--deep-every 10` beside `--noise-every 10` and got a deep tiling on **100%
+    injection-free realisations** -- 330 of 330 -- so `rseek_B` measured false
+    alarms and could not, even in principle, detect anything, for ~13% of the
+    run's compute.  Run 2's `--deep-every 5` was the milder version: half its
+    deep subset was empty.  `--keep-profiles 10` is the third instance, and
+    stored profiles for exactly the injection-free realisations.
+
+    The symptom is a subset whose empty fraction is 0% or 100% instead of
+    `1/noise_every`, with nothing anywhere reporting an error.  Salting makes
+    each selector an independent stream, so it cannot recur however the `every`
+    values are chosen.  **`salt = 0` is the noise selector and must stay so** --
+    it is what keeps run 2 the paired control for run 3.
     """
     if n <= 0:
         return False
     if n == 1:
         return True
-    z = (idx + 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
+    z = (idx + (salt + 1) * 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
     z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF
     z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & 0xFFFFFFFFFFFFFFFF
     return ((z ^ (z >> 31)) % n) == 0
@@ -664,7 +690,7 @@ def realisation(idx, args, pop, tools, seedseq):
     rng = np.random.default_rng(seedseq)
     N, dt = args.nsamp, args.dt
     T = N * dt
-    empty = one_in(idx, args.noise_every)
+    empty = one_in(idx, args.noise_every)          # salt 0: see `one_in`
     ninj = 0 if empty else args.injections
 
     # Red noise, on its own stream (see `rng_for_rednoise`): drawing it here
@@ -751,7 +777,8 @@ def realisation(idx, args, pop, tools, seedseq):
     try:
         _search_all(rec, draws, null_draws, stem, args, tools, T,
                     keep_prof=(args.keep_profiles > 0
-                               and (empty or one_in(idx, args.keep_profiles))))
+                               and (empty or one_in(idx, args.keep_profiles,
+                                                    salt=SALT_PROFILES))))
     finally:
         if not args.keep:
             for f in glob.glob(stem + "*"):
@@ -855,7 +882,7 @@ def _search_all(rec, draws, null_draws, stem, args, tools, T, keep_prof=False):
                                      ok=(rc == 0))
 
     # --- rseek, deep tiling, on a subset ------------------------------------
-    if one_in(rec["index"], args.deep_every):
+    if one_in(rec["index"], args.deep_every, salt=SALT_DEEP):
         allc, tt, ok = [], 0.0, True
         for cfg in RSEEK_B:
             t, out, _, rc = rseek(cfg)
@@ -881,7 +908,7 @@ def _search_all(rec, draws, null_draws, stem, args, tools, T, keep_prof=False):
             every = args.sigma_every
         else:
             every = cfg["every"]
-        if every != 1 and not one_in(rec["index"], every):
+        if every != 1 and not one_in(rec["index"], every, salt=SALT_COH):
             continue
         out_f = f"{stem}_{name}.cohout"
         cmd = [tools["julia"], f"--project={REPO}", f"-t{args.coh_threads}",

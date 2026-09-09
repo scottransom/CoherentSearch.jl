@@ -357,6 +357,19 @@ not — raise `--deep-every`, or lower `--workers`.
   See the `one_in` note above. Run 1's deep tiling was configured 1-in-3 and
   finished at 14.4%. The symptom is a subset fraction well under `1/N` with no
   errors anywhere, which reads as attrition and is not.
+* **Two 1-in-N subsets off the SAME hash are the same set.** The fix above
+  hashes the index, but every selector hashed it the same way, so `h % 10 == 0`
+  implies `h % 5 == 0`. Run 3 was launched with `--deep-every 10` beside
+  `--noise-every 10`, and `rseek_B` ran on **330 of 330 injection-free
+  realisations**: it measured false alarms and could not, even in principle,
+  detect anything, at 121 s a realisation -- ~13% of the run's compute. Run 2's
+  `--deep-every 5` was the milder version (half its deep subset was empty), and
+  `--keep-profiles 10` is the third instance: it stored profiles for exactly the
+  empties and for no injected fold. `one_in` now takes a `salt`, one stream per
+  subset, pinned in `test_mc.py`; **salt 0 stays the noise selector**, since
+  changing it would change which realisations are empty and break run 2's
+  pairing with run 3. The symptom is a subset whose empty fraction is 0% or 100%
+  instead of `1/noise_every`, with nothing reporting an error.
 * **Buffered output hides a slow script.** Every analysis command here prints as
   it goes; run them with `python -u`, and never pipe into `head`/`tail` while
   waiting, or the first output you see is the last.
