@@ -157,6 +157,51 @@ the 2x2 is paid for out of the questions run 2 closed.
   file it should be silent, and where it is not, `rednoise` left a residual and
   the analytic default is reporting inflated S/N.
 
+* **Thresholds are matched WITHIN a frequency band too, and this is not
+  optional under red noise.** `rseek` emits ONE candidate list from 1.33 ms to
+  10 s, and its dereddening is a running median -- a high-pass at
+  `1/rmed_width`, so it cannot touch red noise above ~0.25 Hz and no width can
+  without eating the signal (30 Hz would need a 30 ms window). At a knee of
+  8-50 Hz its slow trials throw false alarms to S/N 128 while its fast folds
+  stay clean: a real S/N-10 pulsar above 100 Hz reads **9.15** there and rseek
+  reports it on **98%** of injections. One pooled cut is set by the junk at the
+  slow end and buries them, which is why run 3's pooled table read
+  **0.0% at every frequency** -- an artifact of pooling, not a measurement.
+
+  ```sh
+  mc_analyze.py /data/mc/run3 --sections band          # per (knee, f0) cell
+  mc_analyze.py /data/mc/run3 --sections band --fap 0.1  # what a night resolves
+  ```
+
+  The section cuts inside the band and counts detections inside the band, so
+  `--fap` is false alarms per realisation *in that band*. That needs the
+  frequency of each stored false alarm, so `fa_summary` keeps a **per-band
+  tail** beside the pooled one, in the `FA_BAND_EDGES` bands `mc_analyze`
+  already tabulates `f0` over. It also fixes a censoring the single tail had:
+  one shared cap lets low-frequency junk crowd out the fast end. **Records
+  written before this have no `bands` key and the section says so rather than
+  reading them as zero.**
+
+  prepfold has the same disease one level down -- its null depends on the fold
+  PERIOD (at knee 8-50 Hz the null `snr1` median runs 2.8 below 5 ms and 44.9
+  above 2 s) -- so its cut is matched within (knee, period) from the null folds,
+  the period recovered exactly as `nbins * dt_per_bin * dt`. A cell whose null
+  sample cannot resolve the requested rate is marked `c` and its detection
+  fraction is a lower bound; `--fap 1e-2` needs ~10x a night's data, `--fap 0.1`
+  does not.
+
+  **Which arm was hurt by preprocessing rather than by its search is now a
+  measured statement, not an inference.** On one knee-20 Hz realisation with
+  pulsars injected at 200 Hz, 10 Hz and 0.5 Hz, rseek reports 172 candidates on
+  white noise, 917 on the red one, and **~170 on the same red data whitened**
+  (`realfft`, `rednoise`, `realfft -inv`) -- with the 200 Hz pulsar back at 11.1
+  against 11.2 on white, and its top false alarm back at 7.5 from 155.8. So
+  whitening restores riptide exactly and costs its fast detections nothing. The
+  0.5 Hz pulsar stays gone, because at that knee the red noise really did bury it
+  (our arm reads 5.79 there). **There is deliberately no whitened-rseek arm** --
+  per-band matching already makes the fast end a fair comparison, and the arm
+  costs ~28 s a realisation to answer a question this one-off already answers.
+
   **Still to write, deliberately:** the degradation curve (S/N at 50% detection
   against knee) and the comparison to Lazarus's factor 1.1–2. Those depend on
   what the data actually looks like, so they get written against data rather than

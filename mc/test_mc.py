@@ -270,6 +270,53 @@ def test_one_in():
           != set(i for i in range(N) if MS.one_in(i, 10, salt=2)))
 
 
+# --- 5b. the per-band false-alarm tails -------------------------------------
+def test_fa_bands():
+    """A false-alarm tail with no frequency in it cannot be re-cut per band.
+
+    Run 3 stored statistics only, so when `rseek`'s low-frequency contamination
+    set one threshold for its whole 1.33 ms - 10 s candidate list, the detection
+    fraction read 0.0% at EVERY frequency -- including above 100 Hz, where its
+    folds are clean and it reported the pulsar on 98% of injections -- and
+    nothing in the record could undo it.
+    """
+    import mc_simulate as MS
+    import mc_analyze as MA
+
+    fa = [MS.Cand(0.5, 20.0), MS.Cand(0.7, 9.0), MS.Cand(3.0, 7.0),
+          MS.Cand(250.0, 6.5), MS.Cand(700.0, 6.1), MS.Cand(0.9, 8.0)]
+    d = MS.fa_summary(fa, cap=4000)
+    check("the band tails partition the pooled tail",
+          sorted(v for b in d["bands"].values() for v in b["top"]) == sorted(d["top"]),
+          f'{d["bands"]} vs {d["top"]}')
+    check("a candidate lands in the band containing its frequency",
+          d["bands"]["0-1"]["n"] == 3 and d["bands"]["1-5"]["n"] == 1
+          and d["bands"]["200-400"]["n"] == 1 and d["bands"]["400-inf"]["n"] == 1,
+          str({k: v["n"] for k, v in d["bands"].items()}))
+
+    rec = dict(index=0, empty=False, results=dict(x=dict(hits=[], ncand=6, ok=True,
+                                                         false=d)),
+               config=dict(fa_bands=list(MS.FA_BAND_EDGES)))
+    labs = MA.fa_band_labels([rec])
+    check("the analysis reads the band edges off the record",
+          labs[0] == "0-1" and labs[-1] == "400-inf", str(labs))
+    check("a band's cut is that band's order statistic, not the pooled one",
+          MA.matched_threshold([rec], "x", 1.0, band="0-1")[0] == 20.0
+          and MA.matched_threshold([rec], "x", 1.0)[0] == 20.0
+          and MA.matched_threshold([rec], "x", 1.0, band="1-5")[0] == 7.0,
+          "per-band thresholds")
+    check("a band with fewer candidates than the rate asks for is -inf, not 0",
+          MA.matched_threshold([rec], "x", 5.0, band="1-5")[0] == float("-inf"))
+    # A record from before the split must read as "no data", never as "no false
+    # alarms": counting it as zero would flatter every code that ran on it.
+    old = dict(index=1, empty=False, config={},
+               results=dict(x=dict(hits=[], ncand=1, ok=True,
+                                   false=dict(n=1, top=[9.0], truncated=False,
+                                              floor=9.0))))
+    t, n, _ = MA.matched_threshold([old], "x", 1.0, band="0-1")
+    check("a pre-band record is skipped, not counted as zero", n == 0, f"n={n}")
+
+
 # --- 6. the two guards that run 2's accelsearch failure went past ----------
 def test_silent_failures():
     """A parser that returns nothing must not look like a search that found nothing.
@@ -417,6 +464,7 @@ if __name__ == "__main__":
     test_model()
     test_strat()
     test_one_in()
+    test_fa_bands()
     test_silent_failures()
     test_rednoise()
     print()

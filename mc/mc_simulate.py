@@ -471,11 +471,43 @@ def score(cands, injections, T, tol_bins):
     return hits, fa
 
 
-def fa_summary(fa, cap=800):
-    """False alarms, as a count and as the sorted statistics of the top few.
+# Frequency bands the false-alarm tail is kept in, Hz.  These are the `f0` bins
+# `mc_analyze` already tabulates detection fraction over, so a per-band tail and
+# a per-band detection fraction are the same cells.
+FA_BAND_EDGES = (0.0, 1.0, 5.0, 20.0, 100.0, 200.0, 400.0, float("inf"))
+
+
+def fa_band(freq):
+    """Index of the `FA_BAND_EDGES` band a candidate frequency falls in."""
+    for i in range(len(FA_BAND_EDGES) - 1):
+        if freq < FA_BAND_EDGES[i + 1]:
+            return i
+    return len(FA_BAND_EDGES) - 2
+
+
+def fa_summary(fa, cap=800, band_cap=None):
+    """False alarms, as a count and as the sorted statistics of the top few --
+    for the whole band, and separately WITHIN each `FA_BAND_EDGES` band.
 
     Keeping the top values (not just a count at one threshold) is what lets the
     analysis build a false-alarm RATE curve per code without re-running anything.
+
+    **The per-band split is what makes a red-noise run readable at all.**  A
+    threshold matched over a code's whole output is only meaningful where its
+    noise is stationary across that output.  Ours is (we search a whitened FFT,
+    and the measured false-alarm tail is flat in red-noise knee: top false alarm
+    6.42 in every knee bin).  `rseek`'s is not: it emits ONE candidate list over
+    1.33 ms to 10 s, its running-median dereddening is a high-pass at
+    `1/rmed_width` and so cannot touch red noise above ~0.25 Hz, and at a knee of
+    8-50 Hz its low-frequency trials produce false alarms up to S/N 128.  Its
+    fast folds are fine over exactly the same realisations -- a real S/N-10
+    pulsar above 100 Hz reads 9.15 there, and rseek reports it on 98% of
+    injections -- but one pooled threshold is set by the junk at the slow end and
+    buries them, which run 3 read as a detection fraction of 0.0% at EVERY
+    frequency.  That is an artifact of pooling, not a measurement, and without
+    the frequency of each stored false alarm it cannot be undone at analysis
+    time.  prepfold has the same disease one level down (its null depends on the
+    fold period), and `mc_analyze` conditions on period there.
 
     **800, not run 1's 200.**  `rseek_B` reports a median of 432 candidates and up
     to 503 on a 2^24 file at `--smin 6`, so 200 truncated its tail on **100% of
@@ -486,9 +518,22 @@ def fa_summary(fa, cap=800):
     ceiling rather than as missing data, which is the kind of quiet wrong answer
     that is hard to spot later, so the cheap fix is the right one.
     """
-    s = sorted((c.stat for c in fa), reverse=True)
-    return dict(n=len(s), top=[round(v, 3) for v in s[:cap]], truncated=len(s) > cap,
-                floor=(round(s[-1], 3) if s else None))
+    if band_cap is None:
+        band_cap = max(200, cap // 8)
+
+    def summarise(vals, lim):
+        v = sorted(vals, reverse=True)
+        return dict(n=len(v), top=[round(x, 3) for x in v[:lim]], truncated=len(v) > lim,
+                    floor=(round(v[-1], 3) if v else None))
+
+    out = summarise([c.stat for c in fa], cap)
+    bands = {}
+    for i in range(len(FA_BAND_EDGES) - 1):
+        sel = [c.stat for c in fa if fa_band(c.freq) == i]
+        if sel:
+            bands[f"{FA_BAND_EDGES[i]:g}-{FA_BAND_EDGES[i + 1]:g}"] = summarise(sel, band_cap)
+    out["bands"] = bands
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -712,7 +757,9 @@ def realisation(idx, args, pop, tools, seedseq):
                rednoise=red,
                config=dict(coh=COH_ARMS, rseek_A=RSEEK_A, tol_bins=args.tol_bins,
                            threshold=args.threshold, trials=tools.get("trials"),
-                           strat=args.strat,
+                           strat=args.strat, fa_bands=list(FA_BAND_EDGES),
+                           fa_top=args.fa_top, ncands=args.ncands,
+                           reporting_floor=args.threshold,
                            rednoise=(list(args.rednoise_knee) if args.rednoise_knee
                                      else args.rednoise),
                            rednoise_alpha=(list(args.rednoise_alpha_pop)

@@ -154,10 +154,23 @@ def _merge_union(res, name):
                 best = h
         hits.append(best)
     top = sorted((v for p in parts for v in p["false"]["top"]), reverse=True)[:1600]
+    floors = [p["false"]["floor"] for p in parts if p["false"].get("floor") is not None]
+    false = dict(n=sum(p["false"]["n"] for p in parts), top=top,
+                 truncated=any(p["false"].get("truncated") for p in parts),
+                 floor=(min(floors) if floors else None))
+    if all(p["false"].get("bands") is not None for p in parts):
+        bands = {}
+        for lab in {k for p in parts for k in p["false"]["bands"]}:
+            sub = [p["false"]["bands"][lab] for p in parts if lab in p["false"]["bands"]]
+            fl = [b["floor"] for b in sub if b.get("floor") is not None]
+            bands[lab] = dict(n=sum(b["n"] for b in sub),
+                              top=sorted((v for b in sub for v in b["top"]),
+                                         reverse=True)[:1600],
+                              truncated=any(b.get("truncated") for b in sub),
+                              floor=(min(fl) if fl else None))
+        false["bands"] = bands
     return dict(hits=hits, ncand=sum(p["ncand"] for p in parts),
-                ok=all(p.get("ok", True) for p in parts),
-                false=dict(n=sum(p["false"]["n"] for p in parts), top=top,
-                           truncated=any(p["false"].get("truncated") for p in parts)))
+                ok=all(p.get("ok", True) for p in parts), false=false)
 
 
 def rows(recs, dt=None):
@@ -282,13 +295,21 @@ def ess(rws):
 # ---------------------------------------------------------------------------
 # False alarms and thresholds
 # ---------------------------------------------------------------------------
-def fa_rates(recs, method, thresholds, empty_only=False):
+def fa_rates(recs, method, thresholds, empty_only=False, band=None):
     """False alarms per realisation at each threshold, from the stored top-N tails.
 
     Counted on EVERY realisation, not only the injection-free ones: a false alarm
     is a candidate matching no injection at any simple harmonic ratio, which is
     well defined either way, and run 1 verified the two agree to <= 0.10 in
     threshold at FAP 1e-2 -- so the larger sample is free.
+
+    `band` restricts to one `false["bands"]` entry, i.e. to the false alarms a
+    code produced in one frequency band.  A realisation the method RAN on still
+    counts in the denominator when it made no false alarm in that band -- that is
+    a rate of zero, not a missing measurement.  Records written before run 3's
+    per-band tails have no `bands` key at all, and those realisations are skipped
+    rather than counted as zero, so an old run reads as "no data" instead of "no
+    false alarms".
     """
     n = 0
     counts = np.zeros(len(thresholds))
@@ -299,8 +320,17 @@ def fa_rates(recs, method, thresholds, empty_only=False):
         d = res.get(method) or (_merge_union(res, method) if method in UNION else None)
         if not d or not d.get("ok", True):
             continue
+        if band is None:
+            tail = d["false"]["top"]
+        else:
+            bands = d["false"].get("bands")
+            if bands is None:
+                continue                        # pre-run-3 record: no band split
+            tail = (bands.get(band) or {}).get("top", [])
         n += 1
-        top = np.asarray(d["false"]["top"], dtype=float)
+        if not tail:
+            continue
+        top = np.asarray(tail, dtype=float)
         counts += (top[:, None] >= np.asarray(thresholds)[None, :]).sum(axis=0)
     return (counts / n if n else counts), n
 
@@ -904,6 +934,268 @@ def knee_bins(recs, by="knee"):
     return out
 
 
+def fa_band_labels(recs):
+    """The frequency bands the run stored its false-alarm tails in, in order.
+
+    Read off the records rather than hardcoded, so the analysis follows the
+    driver.  Returns `[]` for a run written before per-band tails existed.
+    """
+    edges = None
+    for r in recs:
+        e = (r.get("config") or {}).get("fa_bands")
+        if e:
+            edges = e
+            break
+    if not edges:
+        seen = set()
+        for r in recs:
+            for v in (r.get("results") or {}).values():
+                if isinstance(v, dict) and isinstance(v.get("false"), dict):
+                    seen |= set(v["false"].get("bands") or {})
+        if not seen:
+            return []
+        def lo_of(lab):
+            return float(lab.split("-")[0])
+        return sorted(seen, key=lo_of)
+    out = []
+    for i in range(len(edges) - 1):
+        hi = edges[i + 1]
+        out.append(f"{edges[i]:g}-" + ("inf" if not np.isfinite(hi) else f"{hi:g}"))
+    return out
+
+
+def band_range(lab):
+    lo, hi = lab.split("-")
+    return float(lo), (float("inf") if hi == "inf" else float(hi))
+
+
+def prepfold_null_thresholds(recs, labs, args):
+    """prepfold's matched cut per frequency band, from its null folds.
+
+    prepfold folds at a KNOWN period, so its null has to come from the
+    injection-free realisations -- and under red noise that null is entirely a
+    function of the fold PERIOD.  Measured at a knee of 8-50 Hz, the null `snr1`
+    median runs 2.8 at P < 5 ms to 44.9 above 2 s.  Pooling those gave one cut of
+    191 for every period, and both prepfold columns then read 0.0% at every
+    frequency INCLUDING the millisecond band, where its folds are clean.  That is
+    the same pooling error `rseek` suffers across its candidate list, one level
+    down.
+
+    The fold period is not stored directly; `nbins * dt_per_bin * dt` is it
+    exactly, which is why those three are recorded.
+
+    `fap` is per REALISATION and each null realisation contributes several folds
+    per band, so the per-FOLD tail probability wanted is `fap` divided by the
+    folds per realisation in that band.  A cell can only resolve a rate its
+    sample reaches: the returned `censored` flag marks a band where the
+    requested rate needs fewer than `_NULL_MIN_ABOVE` folds above the cut, and
+    those cells are never quoted as matched.
+    """
+    per_band = {lab: [] for lab in labs}
+    nreal = 0
+    for r in recs:
+        pn = r["results"].get("prepfold_null")
+        if not r.get("empty") or not pn:
+            continue
+        nreal += 1
+        dt = r.get("dt") or 60e-6
+        for d in pn:
+            if not d:
+                continue
+            nb, dpb = d.get("nbins"), d.get("dt_per_bin")
+            if not nb or not dpb:
+                continue
+            f0 = 1.0 / (nb * dpb * dt)
+            for lab in labs:
+                lo, hi = band_range(lab)
+                if lo <= f0 < hi:
+                    for key, col in (("chi2_sigma", "prepfold_chi2"),
+                                     ("snr1", "prepfold_snr1")):
+                        v = d.get(key)
+                        if v is not None and np.isfinite(v):
+                            per_band[lab].append((col, v))
+                    break
+    out = {}
+    for lab in labs:
+        byc = defaultdict(list)
+        for col, v in per_band[lab]:
+            byc[col].append(v)
+        for col, vals in byc.items():
+            v = np.sort(np.asarray(vals))[::-1]
+            folds_per_real = len(v) / max(nreal, 1)
+            per = args.fap / max(folds_per_real, 1e-9)
+            k = int(round(per * len(v)))
+            censored = k < _NULL_MIN_ABOVE
+            k = max(k, _NULL_MIN_ABOVE)
+            out[(col, lab)] = (float(v[k - 1]) if len(v) >= k else float("inf"),
+                               censored, len(v))
+    return out
+
+
+# A matched cut read off fewer than this many null folds above it is a number the
+# sample cannot resolve, and is reported as censored rather than as a threshold.
+_NULL_MIN_ABOVE = 3
+
+
+def matched_threshold(recs, method, fap, band=None):
+    """The exact cut at `fap` false alarms per realisation, from the tails.
+
+    `pick_thresholds` reads its cut off `FA_GRID`, which is right for the pooled
+    tables (one scan builds every FAP in the report).  Per band it is the wrong
+    shape: the same scan would run once per (knee, band, method) cell, ~7x the
+    pooled cost on a seventh of the data each time.  The cut wanted is just an
+    order statistic of the pooled tail -- the `round(fap * nreal)`-th largest --
+    which is exact rather than rounded to the grid, and one sort instead of a
+    thousand comparisons per record.
+
+    Returns `(threshold, nreal, ncand)`; the threshold is `-inf` when the band
+    holds fewer candidates than the rate asks for, which means the cut is set by
+    the code's reporting floor and not by these data.
+    """
+    vals, n = [], 0
+    for r in recs:
+        res = r["results"]
+        d = res.get(method) or (_merge_union(res, method) if method in UNION else None)
+        if not d or not d.get("ok", True):
+            continue
+        if band is None:
+            tail = d["false"]["top"]
+        else:
+            bands = d["false"].get("bands")
+            if bands is None:
+                continue
+            tail = (bands.get(band) or {}).get("top", [])
+        n += 1
+        vals.extend(tail)
+    if not n:
+        return float("nan"), 0, 0
+    k = max(1, int(round(fap * n)))
+    if len(vals) < k:
+        return float("-inf"), n, len(vals)
+    v = np.partition(np.asarray(vals, dtype=float), -k)[-k:]
+    return float(v.min()), n, len(vals)
+
+
+def band_floor(recs, method, lab):
+    """The code's own reporting floor, as seen INSIDE one frequency band.
+
+    Below it a rate curve is flat by construction -- no candidate below it was
+    ever emitted -- so a matched cut that lands there is not a measurement, and a
+    detection fraction counted above it is not either.  A band in which a code
+    made no false alarm at all has no floor of its own; fall back to its pooled
+    one, which is the same number measured on more candidates.
+    """
+    inb, pooled = [], []
+    for r in recs:
+        res = r["results"]
+        d = res.get(method) or (_merge_union(res, method) if method in UNION else None)
+        if not d or not isinstance(d.get("false"), dict):
+            continue
+        f = d["false"].get("floor")
+        if f is not None:
+            pooled.append(f)
+        b = (d["false"].get("bands") or {}).get(lab)
+        if b and b.get("floor") is not None:
+            inb.append(b["floor"])
+    src = inb or pooled
+    return float(np.median(src)) if src else float("-inf")
+
+
+def sec_band(recs, args, rng):
+    """Matched threshold and detection fraction per FREQUENCY band.
+
+    THE POINT OF THE SECTION, and it is the same argument as `sec_knee` one axis
+    over: a threshold matched over a code's whole output is meaningful only where
+    that code's noise is stationary across the output.  Ours is -- we search a
+    whitened FFT and the false-alarm tail is flat in knee -- but `rseek` emits one
+    candidate list from 1.33 ms to 10 s, and its time-domain dereddening is a
+    high-pass at `1/rmed_width` that cannot reach red noise above ~0.25 Hz.  At a
+    knee of 8-50 Hz its slow trials throw false alarms to S/N 128 while its fast
+    folds stay clean: a real S/N-10 pulsar above 100 Hz reads 9.15 and is reported
+    on 98% of injections.  One pooled cut is set by the junk and buries them, and
+    run 3's pooled table read 0.0% at EVERY frequency as a result.
+
+    So: cut inside the band, count detections inside the band.  The rate is
+    `--fap` false alarms per realisation IN THAT BAND, so the pooled rate over
+    `nbands` bands is up to `nbands x fap` -- that is deliberate, because the
+    question here is "at equal false-alarm rate here, who detects more here?".
+    The pooled table is still the operational number (one threshold is what a
+    pipeline really applies), and both belong in the report.
+    """
+    labs = fa_band_labels(recs)
+    if not labs:
+        print("\n--- no per-band false-alarm tails in these records: "
+              "re-run the driver to record them ---")
+        return
+    groups = knee_bins(recs, args.knee_by) if any(r.get("rednoise") for r in recs) \
+        else [("all", recs)]
+    print(f"\n--- per FREQUENCY band, every threshold matched INSIDE the band at "
+          f"{args.fap:g} false alarms/realisation ---")
+    pf_cols = ("prepfold_chi2", "prepfold_snr1")
+    for glab, sub in groups:
+        pfthr = prepfold_null_thresholds(sub, labs, args)
+        rws_all = rows(sub)
+        apply_weights(rws_all, args.weight)
+        ms = present_recs(sub, SEARCHES)
+        ms = [m for m in ms if any(m in r for r in rws_all)]
+        ms += [c for c in pf_cols if any(c in r for r in rws_all)]
+        det, thr, note, nrow = {}, {}, {}, {}
+        for lab in labs:
+            lo, hi = band_range(lab)
+            rws = [r for r in rws_all if lo <= r["f0"] < hi]
+            nrow[lab] = len(rws)
+            for m in ms:
+                if m in pf_cols:
+                    t, censored, nnull = pfthr.get((m, lab), (float("inf"), True, 0))
+                    note[(m, lab)] = "c" if censored else ""
+                else:
+                    t, n, _ = matched_threshold(sub, m, args.fap, band=lab)
+                    fl = band_floor(sub, m, lab)
+                    if not n:
+                        note[(m, lab)] = "-"
+                    elif t <= fl:
+                        # The band produced too few false alarms to set a cut, so
+                        # the binding constraint is the code's own reporting
+                        # floor.  Quote THAT and mark it: `rseek` makes no false
+                        # alarm above 20 Hz at any knee, and a cut of 3.00 read
+                        # off the bottom of the grid would count every candidate
+                        # it ever emitted as a detection.
+                        t, note[(m, lab)] = fl, "c"
+                    else:
+                        note[(m, lab)] = ""
+                thr[(m, lab)] = t
+                det[(m, lab)] = boot_det(rws, m, t, args.boot, rng)[:2] if rws \
+                    else (float("nan"), float("nan"))
+        title = f"  knee {glab} Hz" if glab != "all" else "  all realisations"
+        print(f"\n{title}   (injections per band: " +
+              " ".join(f"{lab} {nrow[lab]}" for lab in labs) + ")")
+        head = f'{"method":>17} ' + " ".join(f"{l:>13}" for l in labs)
+        for what in ("det", "thr"):
+            print(f"\n  {'detection %' if what == 'det' else 'matched threshold'}")
+            print(head)
+            for m in ms:
+                cells = []
+                for lab in labs:
+                    if what == "det":
+                        pval, se = det[(m, lab)]
+                        cells.append("            ." if not np.isfinite(pval)
+                                     else f"{100 * pval:8.1f}+-{100 * se:3.1f}")
+                    else:
+                        t = thr[(m, lab)]
+                        mark = note.get((m, lab), "")
+                        cells.append("            ." if not np.isfinite(t)
+                                     else f"{t:12.2f}{mark or ' '}")
+                print(f"{m:>17} " + " ".join(cells))
+        print("  ('c' on a search = the band made too few false alarms to set a cut, so the\n"
+              "   code's own reporting floor is quoted instead and its detection fraction\n"
+              "   is an upper bound;\n"
+              "   'c' on prepfold = its null sample cannot resolve a rate this low in this band,\n"
+              "   so the cut shown is the lowest rate it CAN resolve and the detection\n"
+              "   fraction beside it is therefore a lower bound -- `--fap 0.1` resolves\n"
+              "   these on a night's data, where 1e-2 needs roughly ten times more;\n"
+              "   '-' = the run stored no per-band tail for this method)")
+
+
 def sec_knee(recs, args, rng):
     """Matched threshold and detection fraction per red-noise bin.
 
@@ -1124,7 +1416,7 @@ def add_model(rws, nharms, maxdecim, quiet=False):
 # ---------------------------------------------------------------------------
 SECTIONS = ("header", "cost", "falarm", "roc", "table", "pairs", "decompose",
             "scatter", "recovery", "model", "prepfold", "drizzle", "duty", "2d",
-            "s50", "harm", "knee")
+            "s50", "harm", "knee", "band")
 
 
 def main(argv=None):
@@ -1262,6 +1554,8 @@ def main(argv=None):
         sec_harm(rws)
     if "knee" in want:
         sec_knee(recs, args, rng)
+    if "band" in want:
+        sec_band(recs, args, rng)
     return 0
 
 

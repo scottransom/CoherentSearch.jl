@@ -2273,6 +2273,19 @@ function _sigma_sanity_check(ft::FFTFile, params::SearchParams, ws::Workspace,
         c = nsample == 1 ? 1 : 1 + ((i - 1) * (nchunks - 1)) ÷ (nsample - 1)
         i0 = (c - 1) * Nprof
         n = min(Nprof, total - i0)
+        # The MEASURED side is the noisy one, and a trailing stub chunk cannot
+        # measure anything.  A chunk spans `n * lodr` Fourier bins at the
+        # fundamental, so the last chunk of a narrow band -- 57 trials over
+        # 0.1-5 Hz at `nharms = 120`, i.e. 0.24 of one bin -- hands every rung
+        # the same few Fourier amplitudes over and over.  Measured on white
+        # noise there, the deepest rungs' MAD scatters +-7% against the true
+        # sd while every FULL chunk agrees to 3%, so the guard fired on ~40% of
+        # a clean Monte Carlo run and the warning meant nothing.  Take full
+        # chunks only, and fall back to the longest available if none is full
+        # (a search shorter than one chunk still gets checked).
+        if n < Nprof && total >= Nprof
+            continue                            # a full chunk will be checked
+        end
         n >= 8 || continue                      # too short for a meaningful MAD
         rstart = r_lo + i0 * lodr
         fill_chunk_profiles!(ws, dplans, ft, params, rstart, lodr, n; t0 = i0)
