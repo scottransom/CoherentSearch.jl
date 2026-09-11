@@ -386,6 +386,89 @@ def test_silent_failures():
 
 
 
+def _fa(top):
+    return dict(n=len(top), top=list(top), truncated=False,
+                floor=(min(top) if top else None))
+
+
+def _rec(idx, red=None, hits=None, top=(6.1, 6.4)):
+    """One realisation with one injection at f0 = 10 Hz, T = 1000 s."""
+    inj = dict(f0=10.0, snr=9.0, ducy=0.05, msp=False, w10_w50=1.8, weight=1.0)
+    res = {}
+    for m, h in (hits or {}).items():
+        res[m] = dict(hits=[h], ncand=1, ok=True, false=_fa(top))
+    return dict(index=idx, empty=False, T=1000.0, dt=6e-5, N=1 << 24, rednoise=red,
+                injections=[inj], results=res, timing={},
+                config=dict(tol_bins=3.0, fa_bands=[0.0, 1.0, 5.0, 20.0, float("inf")]))
+
+
+# --- 5c. chance coincidences: a far hit is not a detection -------------------
+def test_hit_scoring():
+    """A candidate 2 bins from a SUBHARMONIC of f0 is red noise, not the pulsar.
+
+    Run 3's rseek at knee > 15 Hz, f0 5-20 Hz: 84% of its hits were more than 0.1
+    bin from their target, at labels 1/8, 1/7, 1/6, with a median statistic of 25
+    against an injected ~8 -- and because `score()` removes a claimed candidate
+    from the false-alarm list, its detection fraction ROSE with knee (80.5%
+    against 65.7% at knee < 0.5) with nothing in the matched threshold able to
+    see it.  Run 2's white noise puts real hits within 0.23 bins (99th pct).
+    """
+    import mc_analyze as MA
+
+    junk = dict(stat=25.0, freq=1.2520, harmonic="1/8", ducy=0.30)   # 2.0 bins off
+    real = dict(stat=8.0, freq=10.0002, harmonic="1", ducy=0.05)     # 0.2 bins off
+    rec = _rec(0, hits={"coherent": junk, "coherent_tier": real})
+    r = MA.rows([rec])[0]
+    check("a hit 2 bins from its target is scored as a miss",
+          not np.isfinite(r["coherent"]) and r["coherent_junk"] == 25.0
+          and abs(r["coherent_off"] - 2.0) < 1e-6,
+          f'{r.get("coherent")}, off {r.get("coherent_off")}')
+    check("a hit 0.2 bins away stands", r["coherent_tier"] == 8.0)
+    # The union must take the WEAKER arm's real hit over the stronger arm's junk.
+    check("a union arm prefers the valid hit, not the stronger one",
+          r["coh+tier"] == 8.0, str(r.get("coh+tier")))
+    r_inf = MA.rows([rec], hit_tol=float("inf"))[0]
+    check("--hit-tol inf scores hits exactly as recorded",
+          r_inf["coherent"] == 25.0 and "coherent_junk" not in r_inf)
+
+
+# --- 5d. matching thresholds per cell ---------------------------------------
+def test_match_modes():
+    """On records with no red noise, per-knee matching IS pooled matching.
+
+    That is what keeps run 2's report unchanged by the default becoming `knee`,
+    and it is the reason the white row of a combined run is a zero point rather
+    than a differently-cut column.
+    """
+    import mc_analyze as MA
+
+    hit = {"coherent": dict(stat=8.0, freq=10.0002, harmonic="1", ducy=0.05)}
+    white = [_rec(i, hits=hit, top=(6.0 + 0.01 * i, 6.5)) for i in range(40)]
+    bk, bp = MA.CutBook(white, "knee"), MA.CutBook(white, "pooled")
+    check("a white run falls back to pooled matching", bk.match == "pooled")
+    check("and gives the identical cuts",
+          bk.at(0.5) == bp.at(0.5) and np.isfinite(bk.at(0.5).get("coherent", np.nan)),
+          f"{bk.at(0.5)} vs {bp.at(0.5)}")
+
+    red = [_rec(100 + i, red=dict(fknee=30.0, alpha=2.0, sigma_ratio=5.0,
+                                  sigma_got=5.0), hits=hit, top=(20.0, 30.0))
+           for i in range(40)]
+    book = MA.CutBook(white + red, "knee")
+    cuts = book.at(0.5)
+    ms = [m for m in cuts if isinstance(cuts[m], MA.Cut)]
+    check("with red records the cuts become per-cell", bool(ms), str(cuts))
+    if ms:
+        c = cuts[ms[0]]
+        wr, rr = MA.rows(white), MA.rows(red)
+        check("a white row is cut at the white bin, a red row at its knee bin",
+              c.vec(wr).max() < c.vec(rr).min(),
+              f"white {c.vec(wr)[:2]} vs red {c.vec(rr)[:2]}")
+    check("knee_label puts a realisation in its bin, and white without red noise",
+          MA.knee_label(dict(fknee=None)) == "white"
+          and MA.knee_label(dict(fknee=0.3)) == "0.1-0.5"
+          and MA.knee_label(dict(fknee=30.0)) == "15-50")
+
+
 def test_rednoise():
     """The red-noise generator: the spectrum it claims, and the pairing it promises."""
     import mc_simulate as MS
@@ -487,6 +570,8 @@ if __name__ == "__main__":
     test_strat()
     test_one_in()
     test_fa_bands()
+    test_hit_scoring()
+    test_match_modes()
     test_silent_failures()
     test_rednoise()
     print()

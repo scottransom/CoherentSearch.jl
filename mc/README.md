@@ -151,6 +151,54 @@ the 2x2 is paid for out of the questions run 2 closed.
   mc_analyze.py /data/mc/run3 --sections knee --knee-by sigma
   ```
 
+  **That command did nothing of the kind until 2026-09-11.** `load()`
+  de-duplicated by realisation index across every path, and the two runs share
+  their indices *by design*, so it kept whichever sorted first: run 2 as the
+  `white` row and **no red bins at all**. A run is now a DIRECTORY, and the key
+  is `(directory, index)` — the directory rather than the argument, because run
+  3's restart from 24 workers to 15 re-partitioned the index space across worker
+  files and a shell-expanded file list still has to collapse those.
+
+### Reading a red-noise run
+
+* **Every threshold is matched per red-noise bin by default** (`--match knee`),
+  not over the pooled run, and `--match knee,band` adds the f0 band. The
+  `knee` section prints both matchings side by side, so the operational number
+  (one cut per observation) and the per-band one are in the same table. On
+  records with no red noise all three modes are *identical*, which is what
+  keeps run 2's report unchanged and makes its white row a zero point rather
+  than a differently-cut column; `test_mc.py` pins that.
+* **A hit further than `--hit-tol` (0.5) Fourier bins from its target is a
+  chance coincidence, and is scored as a miss.** `score()` claims a candidate
+  for an injection within `tol_bins` (3.0) of ANY ratio n/m ≤ 8 of f0, and a
+  claimed candidate leaves the false-alarm list — so where a code floods, the
+  coincidences enter as detections and **no matched threshold can see them**.
+  Measured on run 3: at knee > 15 Hz and f0 5–20 Hz only **16%** of `rseek_A`'s
+  hits lie within 0.1 bin of their target (median offset 8 bins, median
+  statistic 25, labels 1/8, 1/7, 1/6), and its detection fraction there **rose
+  with knee** — 80.5% against 65.7% at knee < 0.5. Run 2's white noise is clean:
+  above every code's matched cut the 99th-percentile offset is 0.15–0.23 bins
+  and ≤ 0.07% lie beyond 0.5, so the cut costs the white numbers nothing.
+  `--sections hits` reports what it removed and, from the uniform sideband, what
+  it left behind. `--hit-tol inf` scores as recorded.
+* **`--sections paired` is the run-2/run-3 comparison the pairing was built
+  for**: the same injection in the same white noise, so the degradation is a
+  per-injection difference and the population scatter cancels. It prints the
+  median paired (red − white) statistic by knee × f0, the paired detections
+  lost and gained, and the S/N at 50% detection with the **red/white ratio** —
+  the quantity to set against Lazarus et al. (2015)'s factor 1.1–2.
+* **`mc_quicklook.py` writes a second page** whenever the records carry red
+  noise (`<out>_red.png`), because every panel on it is cut inside a
+  red-noise bin. Eight panels: detection vs knee under both matchings, the
+  paired degradation against f0, S/N(50%) vs knee, the false-alarm tail per
+  knee bin (ours flat, rseek's not), detection vs f0 per knee bin, the hit
+  offset distributions that expose the coincidences, and the drawn population.
+* **The `sigma_warn` row is NOT a red-noise diagnostic** — it was read as one
+  once. It fires only on `coherent_tier`, at a rate flat in knee, and fires the
+  same way on pure white noise: the guard's third sample point is the last
+  chunk, a stub in a narrow band, whose measured sigma scatters ±7% against a
+  10% tolerance. The `knee` section now breaks it out per arm and says so.
+
   `--knee-by sigma` bins on the *realised* `sigma_got` rather than the drawn
   knee, which is the finer covariate for the reason above. The section also
   reports how often the search's own sigma guard fired per bin — on a whitened

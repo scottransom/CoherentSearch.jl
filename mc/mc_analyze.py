@@ -29,6 +29,22 @@ WHAT THIS DOES NOT DO IMPLICITLY, and why (each of these was a wrong answer once
   * **Put error bars on injections.**  Six injections share one noise
     realisation, so they are not independent.  Every interval here is bootstrapped
     by REALISATION.
+  * **Match a threshold over a mixture of noise levels.**  The false-alarm rate
+    is a function of the red-noise knee, so a cut matched over a red run belongs
+    to none of the levels in it -- `rseek`'s 0.01/realisation cut runs 7.95 at
+    knee < 0.5 Hz and 285 above 15.  Every threshold is matched per red-noise bin
+    (`--match knee`, the default), or per (bin, f0 band).  On records with no red
+    noise the modes are identical, so a white run is unaffected.
+  * **Count a chance coincidence as a detection.**  `score()` claims a candidate
+    within `tol_bins` of ANY ratio n/m <= 8 of f0 and then removes it from the
+    false-alarm list, so a flooding code's coincidences enter as detections where
+    no matched threshold can see them: at knee > 15 Hz, f0 5-20 Hz, only 16% of
+    `rseek`'s hits were within 0.1 bin of their target and its detection fraction
+    ROSE with knee.  `--hit-tol` (0.5 bins) scores those as misses; `--sections
+    hits` reports what went and what is left.
+  * **Read a cell with no threshold as a detection fraction of zero.**  A method
+    that produced no cut in a cell (an older run with no per-band tails, say) has
+    made no measurement there, and its rows leave the denominator.
   * **Quote prepfold's `snr1` raw.**  PRESTO's `fold()` drizzles each sample
     across the bins it covers and so correlates them; `snr1` assumes independence
     and reads up to 20% high in the MSP band, where prepfold is the ceiling
@@ -45,6 +61,7 @@ import math
 import os
 import sys
 from collections import defaultdict
+from fractions import Fraction
 
 import numpy as np
 
@@ -211,11 +228,16 @@ def _desc(a):
     return np.sort(a)[::-1]
 
 
-def rows(recs, dt=None):
+def rows(recs, dt=None, hit_tol=None):
     """One row per injection: every method's statistic, plus what it needs to be
     interpreted.  A method that did not RUN on a realisation leaves its key
     ABSENT (not nan), so a denominator can count what a method was actually
-    given."""
+    given.
+
+    A hit further than `hit_tol` Fourier bins from its target is scored as a miss
+    (see `HIT_TOL`); `float("inf")` reproduces the scoring as recorded."""
+    if hit_tol is None:
+        hit_tol = HIT_TOL
     out = []
     for r in recs:
         if r.get("empty"):
@@ -226,8 +248,13 @@ def rows(recs, dt=None):
             if u:
                 res[name] = u
         _dt = r.get("dt", dt) or 60e-6
+        T = r.get("T") or (r["N"] * _dt if r.get("N") else None)
+        red = r.get("rednoise") or {}
+        tol = (r.get("config") or {}).get("tol_bins")
         for i, inj in enumerate(r["injections"]):
-            row = dict(index=r["index"], snr=inj["snr"], ducy=inj["ducy"],
+            row = dict(index=r["index"], inj=i, run=r.get("run"), tol_bins=tol,
+                       fknee=red.get("fknee"), sigma_got=red.get("sigma_got"),
+                       snr=inj["snr"], ducy=inj["ducy"],
                        f0=inj["f0"], msp=inj["msp"], w10_w50=inj["w10_w50"],
                        weight=float(inj.get("weight", 1.0)), dt=_dt,
                        ducy_got=(inj.get("profile") or {}).get("ducy_got", inj["ducy"]),
@@ -250,11 +277,21 @@ def rows(recs, dt=None):
                     s1 * MM.drizzle_boxcar_corr(nb, dpb, w)
                     if (s1 is not None and nb and dpb and w) else s1)
                 row["prepfold_ducy"] = pf.get("ducy")
+            valid = {}
             for m in RECORDED:
                 d = res.get(m)
                 if d is None:
                     continue
                 h = d["hits"][i] if i < len(d["hits"]) else None
+                off = _hit_offset(h, inj["f0"], T)
+                if off is not None:
+                    row[m + "_off"] = off
+                    if off > hit_tol:
+                        # A coincidence, not a detection: kept for the diagnostics
+                        # (`sec_hits`), scored as a miss everywhere else.
+                        row[m + "_junk"] = h["stat"]
+                        h = None
+                valid[m] = h
                 row[m] = h["stat"] if h else float("nan")
                 row[m + "_harm"] = h["harmonic"] if h else None
                 row[m + "_ducy"] = h.get("ducy") if h else None
@@ -262,15 +299,57 @@ def rows(recs, dt=None):
                     row[m + "_b"] = int(round(h["width"] / h["ducy"]))
                 if h and h.get("nharm"):
                     row[m + "_nharm"] = h["nharm"]
-            for name in UNION:
+            for name, parts in UNION.items():
                 if name in res:
-                    d = res[name]
-                    h = d["hits"][i] if i < len(d["hits"]) else None
+                    # From the parts' VALID hits: a junk hit in one part must not
+                    # outrank a real one in the other just by being stronger.
+                    h = None
+                    for p in parts:
+                        x = valid.get(p)
+                        if x and (h is None or x["stat"] > h["stat"]):
+                            h = x
                     row[name] = h["stat"] if h else float("nan")
                     row[name + "_harm"] = h["harmonic"] if h else None
                     row[name + "_ducy"] = h.get("ducy") if h else None
             out.append(row)
     return out
+
+
+# How far a hit may sit from its target, in the CANDIDATE's own Fourier bins,
+# and still count as a detection.  `score()` in the driver accepts anything
+# within `tol_bins` (3.0) of ANY ratio n/m <= 8 of f0, and a candidate it claims
+# leaves the false-alarm list -- so where a code emits a flood of candidates,
+# coincidences become "detections" that no matched threshold can see.  Under red
+# noise rseek does exactly that at slow periods: at knee > 15 Hz and f0 5-20 Hz
+# only 16% of its hits lie within 0.1 bin of their target, the rest are spread
+# across the window at labels 1/8, 1/7, 1/6 with a median statistic of 25, and
+# its detection fraction there ROSE with knee (80.5%, against 65.7% at knee < 0.5).
+# Real hits are tight: on run 2's white noise, above each code's matched cut, the
+# 99th percentile offset is 0.15-0.23 bins and <= 0.07% lie beyond 0.5, for every
+# code.  So 0.5 keeps essentially every real detection and passes ~1/6 of a
+# uniformly spread coincidence; `sec_hits` estimates what is left of those.
+#
+# The one thing this cannot undo: the driver stores ONE hit per injection,
+# fundamental first and then strongest, so a junk candidate at the fundamental
+# ratio can have displaced a real one.  Rejecting it scores a miss the code may
+# not have made.  That errs AGAINST the flooding code, and only where its matched
+# cut is already far above a real pulsar's statistic -- see `sec_hits`.
+HIT_TOL = 0.5
+
+# Below this many detections in a cell, `sec_hits` quotes counts rather than a
+# percentage of them.
+_HITS_MIN_DET = 20
+
+
+def _hit_offset(h, f0, T):
+    """`|freq - ratio * f0|` in Fourier bins, or None where it cannot be computed."""
+    if not h or h.get("freq") is None or not T:
+        return None
+    try:
+        ratio = float(Fraction(h["harmonic"]))
+    except (ValueError, ZeroDivisionError, TypeError):
+        return None
+    return abs(h["freq"] - ratio * f0) * T
 
 
 def present(rws, pool=METHODS):
@@ -467,7 +546,13 @@ def _det(rws, m, t):
     v, w, ok, _ = _cols(rws, m)
     if not ok.any():
         return float("nan"), 0.0
-    d = np.where(np.isnan(v), False, v >= t) & ok
+    # A cell with NO cut (nan -- e.g. a run that stored no per-band tails) is a
+    # missing measurement, not a miss.  Counting those rows in the denominator
+    # read as a detection fraction of zero, which is the artifact this whole
+    # per-cell machinery exists to remove.
+    tv = _tv(rws, t)
+    ok = ok & ~np.isnan(tv)
+    d = np.where(np.isnan(v), False, v >= tv) & ok
     den = float(np.sum(w * ok))
     return (float(np.sum(w * d)) / den if den else float("nan")), den
 
@@ -484,7 +569,9 @@ def boot_det(rws, m, t, nboot, rng):
     if nboot <= 0 or not np.isfinite(p) or not rws:
         return p, float("nan"), wsum
     v, w, ok, idx = _cols(rws, m)
-    d = (np.where(np.isnan(v), False, v >= t) & ok).astype(float)
+    tv = _tv(rws, t)
+    ok = ok & ~np.isnan(tv)            # no cut in this cell: no measurement
+    d = (np.where(np.isnan(v), False, v >= tv) & ok).astype(float)
     uniq, inv = np.unique(idx, return_inverse=True)
     num = np.bincount(inv, weights=w * d, minlength=len(uniq))
     den = np.bincount(inv, weights=w * ok, minlength=len(uniq))
@@ -499,11 +586,11 @@ def mcnemar(rws, m1, m2, t1, t2):
     """Discordant pairs.  `1054 vs 181` says far more than `71.6% vs 64.3%`, and
     paired noise is exactly what the design bought."""
     n01 = n10 = both = neither = 0
-    for r in rws:
+    for r, u1, u2 in zip(rws, _tv(rws, t1), _tv(rws, t2)):
         if m1 not in r or m2 not in r:
             continue
-        a = np.isfinite(r[m1]) and r[m1] >= t1
-        b = np.isfinite(r[m2]) and r[m2] >= t2
+        a = np.isfinite(r[m1]) and r[m1] >= u1
+        b = np.isfinite(r[m2]) and r[m2] >= u2
         if a and b:
             both += 1
         elif a:
@@ -526,17 +613,30 @@ def _fmt(v, n=1):
     return "--" if not np.isfinite(v) else f"{v:.{n}f}"
 
 
-def sec_header(recs, rws, args):
+def sec_header(recs, rws, args, book=None):
     nempty = sum(1 for r in recs if r.get("empty"))
     print(f"{len(recs)} realisations ({nempty} injection-free), {len(rws)} injections")
     print(f"weighting: {args.weight}   effective sample size {ess(rws):.0f} injections")
 
     # Run 3 carries a per-realisation red-noise knee, and the false-alarm rate is
     # a function of it -- so a threshold matched over the whole run is matched to
-    # a MIXTURE of noise levels and belongs to none of them.  Everything below
-    # still pools.  Refuse to be quiet about that.
+    # a MIXTURE of noise levels and belongs to none of them.  `--match pooled`
+    # does exactly that.  Refuse to be quiet about it.
     red = [r["rednoise"] for r in recs if r.get("rednoise")]
-    if red:
+    nwhite = len(recs) - len(red)
+    if red and book is not None and book.match != "pooled":
+        ks = sorted(x["fknee"] for x in red)
+        print(f"\n  {len(red)} of {len(recs)} realisations carry RED NOISE (knee "
+              f"{ks[0]:.2f}-{ks[-1]:.2f} Hz, median {ks[len(ks)//2]:.2f})"
+              + (f", {nwhite} are white" if nwhite else "") + ".")
+        print(f"  Every threshold is matched per {book.match.replace(',', ' x ')} cell, so "
+              "each table is a mixture\n  of cells each cut at its own rate -- read "
+              "the `knee` section for the split.")
+        n = sum(1 for r in rws for m in RECORDED if r.get(m + "_junk") is not None)
+        print(f"  {n} recorded hits sit more than {args.hit_tol:g} bins from their "
+              "target and are scored as misses\n  (chance coincidences; `hits` "
+              "section).\n")
+    elif red:
         ks = sorted(x["fknee"] for x in red)
         print(f"\n  *** {len(red)} of {len(recs)} realisations carry RED NOISE "
               f"(knee {ks[0]:.2f}-{ks[-1]:.2f} Hz, median {ks[len(ks)//2]:.2f}).")
@@ -603,8 +703,9 @@ def sec_falarm(recs, args, thr=None):
             warn.append(f"    {m}: {100 * s['frac']:.0f}% of stored tails hit the "
                         f"top-N cap, so the curve is a CEILING below "
                         f"{s['cap_floor']:.2f} -- raise --fa-top")
-        if thr and np.isfinite(thr.get(m, np.nan)) and thr[m] <= floor + 0.15:
-            warn.append(f"    {m}: its matched threshold {thr[m]:.2f} is within 0.15 of "
+        tm = _tmin(thr.get(m, np.nan)) if thr else np.nan
+        if thr and np.isfinite(tm) and tm <= floor + 0.15:
+            warn.append(f"    {m}: its matched threshold {tm:.2f} is within 0.15 of "
                         f"its reporting floor {floor:.2f} -- FLOOR-LIMITED, lower the "
                         f"code's own reporting cut and re-run before quoting it")
     print("  ('c' = at or below that code's reporting floor, where the curve is flat by\n"
@@ -624,9 +725,13 @@ def present_recs(recs, pool):
     return out
 
 
-def sec_roc(recs, rws, curves, args, rng):
+def sec_roc(recs, rws, book, args, rng):
     """Detection fraction vs false-alarm rate.  That the ordering is invariant
-    from FAP 1 to 1e-3 is itself the result: it does not hinge on one threshold."""
+    from FAP 1 to 1e-3 is itself the result: it does not hinge on one threshold.
+
+    Under `--match knee` every point is matched per red-noise bin, so a cell's
+    threshold is a set of cuts, not a number: it prints `@knee`, and the `knee`
+    section lists them."""
     faps = [1.0, 0.3, 0.1, 0.03, 0.01, 0.003, 0.001]
     full, part = split_coverage(rws, present(rws, SEARCHES))
     for ms in ([full] if not part else [full, full + part]):
@@ -635,11 +740,14 @@ def sec_roc(recs, rws, curves, args, rng):
               f"({len(sub)} injections{', the subset every arm ran' if len(ms) > len(full) else ''}) ---")
         print(f"{'FAP':>8} " + " ".join(f"{m:>16}" for m in ms))
         for f in faps:
-            t = pick_thresholds(curves, f)
+            t = book.at(f)
             cells = []
             for m in ms:
                 p, _ = _det(sub, m, t.get(m, np.inf))
-                cells.append(f"{100 * p:10.1f}% @{t.get(m, float('nan')):4.2f}")
+                tt = t.get(m, float("nan"))
+                at = (f"@{tt:4.2f}" if not isinstance(tt, Cut)
+                      else ("@knee" if tt.kind == "knee" else "@k,band"))
+                cells.append(f"{100 * p:10.1f}% {at}")
             print(f"{f:>8g} " + " ".join(f"{c:>16}" for c in cells))
 
 
@@ -697,17 +805,29 @@ def sec_decompose(rws, thr, args):
     # and has no false-alarm column unless the run measured one, is not a
     # quantity -- run 1's report would have printed `nan` for it.
     ms = [m for m in present(rws, SNR1_LIKE)
-          if m != args.ref and np.isfinite(thr.get(m, np.nan))]
-    if args.ref not in present(rws, SNR1_LIKE) or not np.isfinite(thr.get(args.ref, np.nan)):
+          if m != args.ref and _tfinite(thr.get(m, np.nan))]
+    if args.ref not in present(rws, SNR1_LIKE) or not _tfinite(thr.get(args.ref, np.nan)):
         return
     print(f"\n--- advantage decomposition: {args.ref} vs each snr1-comparable code ---")
     for m in ms:
         g = common(rws, [args.ref, m])
         if not g:
             continue
-        dthr = thr.get(m, np.nan) - thr.get(args.ref, np.nan)
-        print(f"\n  {args.ref} vs {m}:  threshold gap {dthr:+.2f} "
-              f"(theirs {thr.get(m, float('nan')):.2f}, ours {thr.get(args.ref, float('nan')):.2f})")
+        tm, tr = thr.get(m, np.nan), thr.get(args.ref, np.nan)
+        # Per-cell cuts: the gap is per ROW (each injection against the cuts of
+        # its own cell), and quoted as its median.
+        percell = isinstance(tm, Cut) or isinstance(tr, Cut)
+        if percell:
+            gap = _tv(g, tm) - _tv(g, tr)
+            gid = {id(r): x for r, x in zip(g, gap)}
+            fg = gap[np.isfinite(gap)]
+            dthr = float(np.median(fg)) if len(fg) else float("nan")
+            print(f"\n  {args.ref} vs {m}:  threshold gap {dthr:+.2f}, median over "
+                  f"injections (theirs {tm:.2f}, ours {tr:.2f}, per cell)")
+        else:
+            dthr = tm - tr
+            print(f"\n  {args.ref} vs {m}:  threshold gap {dthr:+.2f} "
+                  f"(theirs {thr.get(m, float('nan')):.2f}, ours {thr.get(args.ref, float('nan')):.2f})")
         print(f"  {'duty':>10} {'n':>7} {'median dstat':>13} {'effective margin':>18}")
         for lo, hi in zip(BINS["ducy"][:-1], BINS["ducy"][1:]):
             cell = [r for r in g if lo <= r["ducy"] < hi
@@ -715,10 +835,13 @@ def sec_decompose(rws, thr, args):
             if len(cell) < 20:
                 continue
             d = np.median([r[args.ref] - r[m] for r in cell])
-            print(f"  {f'{lo:g}-{hi:g}':>10} {len(cell):>7} {d:>13.2f} {d + dthr:>18.2f}")
+            em = (np.median([r[args.ref] - r[m] + gid[id(r)] for r in cell])
+                  if percell else d + dthr)
+            print(f"  {f'{lo:g}-{hi:g}':>10} {len(cell):>7} {d:>13.2f} {em:>18.2f}")
         # Counterfactual: how much of the win survives if we are held to their cut?
         p_ours, _ = _det(g, args.ref, thr.get(args.ref, 6.0))
-        p_theirs_cut, _ = _det(g, args.ref, thr.get(m, 6.0))
+        p_theirs_cut, _ = _det(g, args.ref,
+                               _tv(g, tm) if percell else thr.get(m, 6.0))
         p_them, _ = _det(g, m, thr.get(m, 6.0))
         print(f"  counterfactual: {args.ref} at its own cut {100 * p_ours:.1f}%, "
               f"at {m}'s cut {100 * p_theirs_cut:.1f}%, against {m}'s {100 * p_them:.1f}%"
@@ -804,8 +927,8 @@ def sec_model(rws, thr, args):
         eff = np.array([r["model_eff"] for r in g])
         snr = np.array([r["snr"] for r in g])
         w = np.array([r["weight"] for r in g])
-        pred = np.sum(w * 0.5 * np.array([math.erfc((t - e * s) / math.sqrt(2.0))
-                                          for e, s in zip(eff, snr)])) / w.sum()
+        pred = np.sum(w * 0.5 * np.array([math.erfc((tt - e * s) / math.sqrt(2.0))
+                                          for e, s, tt in zip(eff, snr, _tv(g, t))])) / w.sum()
         v = np.array([r[m] / r["snr"] for r in g if np.isfinite(r[m])])
         meas, _ = _det(g, m, t)
         print(f"{f'{lo:g}-{hi:g}':>12} {len(g):>7} {np.median(eff):10.3f} "
@@ -1007,7 +1130,7 @@ def band_range(lab):
     return float(lo), (float("inf") if hi == "inf" else float(hi))
 
 
-def prepfold_null_thresholds(recs, labs, args):
+def prepfold_null_thresholds(recs, labs, fap):
     """prepfold's matched cut per frequency band, from its null folds.
 
     prepfold folds at a KNOWN period, so its null has to come from the
@@ -1061,7 +1184,7 @@ def prepfold_null_thresholds(recs, labs, args):
         for col, vals in byc.items():
             v = np.sort(np.asarray(vals))[::-1]
             folds_per_real = len(v) / max(nreal, 1)
-            per = args.fap / max(folds_per_real, 1e-9)
+            per = fap / max(folds_per_real, 1e-9)
             k = int(round(per * len(v)))
             censored = k < _NULL_MIN_ABOVE
             k = max(k, _NULL_MIN_ABOVE)
@@ -1140,6 +1263,223 @@ def band_floor(recs, method, lab):
     return float(np.median(src)) if src else float("-inf")
 
 
+# ---------------------------------------------------------------------------
+# Matched thresholds per CELL -- what makes the pooled sections valid under red noise
+# ---------------------------------------------------------------------------
+# `pooled`: one cut per method over the whole run (run 2's report).
+# `knee`: one per red-noise bin -- what a pipeline tuned to one observation's
+#   noise level applies, and the default.
+# `knee,band`: one per (red-noise bin, f0 band) -- rescues a code whose noise is
+#   not stationary ACROSS its own output (rseek), at the price of making the
+#   false-alarm rate per band.
+# On records with no red noise all three are the same thing, so a white run's
+# report is unchanged by the choice.
+MATCH = ("pooled", "knee", "knee,band")
+PF_COLS = ("prepfold_chi2", "prepfold_snr1")
+
+
+def knee_label(row, by="knee"):
+    """The `knee_bins` label of a row's realisation; `white` without red noise."""
+    if row.get("fknee") is None:
+        return "white"
+    edges = KNEE_EDGES if by == "knee" else SIGMA_EDGES
+    v = (row["fknee"] if by == "knee" else row.get("sigma_got")) or 0.0
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        if lo <= v < hi:
+            return f"{lo:g}-" + ("inf" if hi >= 1e8 else f"{hi:g}")
+    return None
+
+
+def band_label(f0, labs):
+    for lab in labs:
+        lo, hi = band_range(lab)
+        if lo <= f0 < hi:
+            return lab
+    return None
+
+
+class Cut:
+    """One method's matched threshold, one value per CELL of the rows it meets.
+
+    `kind` says what a cell is: `knee` (the realisation's red-noise bin) or
+    `knee,band` (that, and the injection's f0 band).  A row in a cell with no cut
+    gets `missing` -- `inf` for a search, i.e. no threshold there means no
+    detection, and the nominal cut for prepfold, as in the pooled report.
+    """
+
+    def __init__(self, kind, cuts, knee_by, labs, missing=np.inf):
+        self.kind, self.cuts, self.knee_by, self.labs = kind, cuts, knee_by, labs
+        self.missing = missing
+
+    def key(self, r):
+        k = knee_label(r, self.knee_by)
+        return k if self.kind == "knee" else (k, band_label(r["f0"], self.labs))
+
+    def vec(self, rws):
+        return np.array([self.cuts.get(self.key(r), self.missing) for r in rws],
+                        dtype=float)
+
+    def finite(self):
+        return [v for v in self.cuts.values() if np.isfinite(v)]
+
+    def __format__(self, spec):
+        v = self.finite()
+        if not v:
+            return "--"
+        lo, hi = min(v), max(v)
+        spec = spec or ".2f"
+        return format(lo, spec) if lo == hi else f"{lo:{spec}}-{hi:{spec}}"
+
+
+def _tv(rws, t):
+    """A threshold as one value per row, whatever form it came in."""
+    if isinstance(t, Cut):
+        return t.vec(rws)
+    if np.ndim(t) == 0:
+        return np.full(len(rws), float(t))
+    return np.asarray(t, dtype=float)
+
+
+def _tfinite(t):
+    return bool(t.finite()) if isinstance(t, Cut) else bool(np.isfinite(t))
+
+
+def _tmin(t):
+    if isinstance(t, Cut):
+        v = t.finite()
+        return min(v) if v else float("inf")
+    return t
+
+
+def prepfold_nulls(recs):
+    """prepfold's null statistics from the injection-free realisations' folds."""
+    nulls, nreal = defaultdict(list), 0
+    for r in recs:
+        pn = r["results"].get("prepfold_null")
+        if not r.get("empty") or not pn:
+            continue
+        nreal += 1
+        for d in pn:
+            for k, col in (("chi2_sigma", "prepfold_chi2"), ("snr1", "prepfold_snr1")):
+                v = (d or {}).get(k)
+                if v is not None and np.isfinite(v):
+                    nulls[col].append(v)
+    return nulls, nreal
+
+
+def prepfold_pooled_thresholds(recs, fap):
+    """prepfold's matched cut over every fold period at once -- right on white noise.
+
+    `fap` is per REALISATION, and each null realisation contributed
+    `len(v)/nreal` folds, so the per-FOLD tail probability that gives that rate
+    is fap divided by the folds per realisation.  Using the plain `1 - fap`
+    quantile instead would quote a threshold several times too low and hand
+    prepfold a free advantage in the one table where it is the ceiling everyone
+    else is measured against.
+    """
+    nulls, nreal = prepfold_nulls(recs)
+    out = {}
+    for col, v in nulls.items():
+        if len(v) < 200:
+            continue
+        per = fap / max(1.0, len(v) / max(nreal, 1))
+        if per < 1.0:
+            out[col] = float(np.quantile(v, 1.0 - per))
+    return out
+
+
+class CutBook:
+    """Every method's matched cut at ANY false-alarm rate, under one `--match`.
+
+    Built once and asked for as many rates as the report wants (the ROC asks for
+    seven), so the per-group rate curves and per-band tails are scanned once.
+    """
+
+    def __init__(self, recs, match="knee", knee_by="knee", default=6.0):
+        if match not in MATCH:
+            raise SystemExit(f"--match {match}: choose from {MATCH}")
+        self.recs, self.knee_by, self.default = recs, knee_by, default
+        red = any(r.get("rednoise") for r in recs)
+        self.match = match if red else "pooled"
+        self.labs = fa_band_labels(recs)
+        if self.match == "knee,band" and not self.labs:
+            raise SystemExit("--match knee,band needs per-band false-alarm tails, "
+                             "which these records do not carry")
+        self.groups = (knee_bins(recs, knee_by) if self.match != "pooled"
+                       else [(None, recs)])
+        self._curves, self._tails = {}, {}
+        # prepfold cells whose null sample cannot resolve the requested rate:
+        # their cut is the lowest rate the sample CAN resolve, so the detection
+        # fraction beside it is a lower bound.  Counted, and reported by `main`.
+        self.censored = set()
+
+    def _group_curves(self, glab, sub):
+        if glab not in self._curves:
+            self._curves[glab] = fa_curves(sub, present_recs(sub, SEARCHES))
+        return self._curves[glab]
+
+    def _band_cut(self, glab, sub, m, lab, fap):
+        """`sec_band`'s cut: the band's order statistic, floored at the code's own
+        reporting floor inside the band (below it the curve is flat by
+        construction).  `nan` where the method stored no per-band tail."""
+        key = (glab, m, lab)
+        if key not in self._tails:
+            vals, n = [], 0
+            for r in sub:
+                res = r["results"]
+                d = res.get(m) or (_merge_union(res, m) if m in UNION else None)
+                if not d or not d.get("ok", True):
+                    continue
+                bands = d["false"].get("bands")
+                if bands is None:
+                    continue
+                n += 1
+                vals.append(np.asarray((bands.get(lab) or {}).get("top", []), dtype=float))
+            v = _desc(np.concatenate(vals)) if vals else np.zeros(0)
+            self._tails[key] = (v, n, band_floor(sub, m, lab))
+        v, n, fl = self._tails[key]
+        if not n:
+            return float("nan")
+        k = max(1, int(round(fap * n)))
+        t = float(v[k - 1]) if len(v) >= k else float("-inf")
+        return fl if t <= fl else t
+
+    def at(self, fap):
+        if self.match == "pooled":
+            out = pick_thresholds(self._group_curves(None, self.recs), fap)
+            out.update(prepfold_pooled_thresholds(self.recs, fap))
+            return out
+        cuts = defaultdict(dict)
+        for glab, sub in self.groups:
+            if self.match == "knee":
+                for m, t in pick_thresholds(self._group_curves(glab, sub), fap).items():
+                    cuts[m][glab] = t
+            else:
+                for m in present_recs(sub, SEARCHES):
+                    for lab in self.labs:
+                        cuts[m][(glab, lab)] = self._band_cut(glab, sub, m, lab, fap)
+            # prepfold's null is a function of the fold PERIOD under red noise
+            # (null snr1 median 2.8 below 5 ms, 44.9 above 2 s at knee 8-50 Hz),
+            # so a red bin is always matched per band; white is pooled, as in run 2.
+            if glab == "white":
+                for col, t in prepfold_pooled_thresholds(sub, fap).items():
+                    for lab in (self.labs or [None]):
+                        cuts[col][(glab, lab)] = t
+            else:
+                for (col, lab), (t, cens, _) in prepfold_null_thresholds(
+                        sub, self.labs, fap).items():
+                    cuts[col][(glab, lab)] = t
+                    if cens:
+                        self.censored.add((col, glab, lab))
+        out = {}
+        for m, c in cuts.items():
+            pf = m in PF_COLS
+            out[m] = Cut("knee,band" if (pf or self.match == "knee,band") else "knee",
+                         c, self.knee_by, self.labs,
+                         missing=(self.default if pf else np.inf))
+        return out
+
+
 def sec_band(recs, args, rng):
     """Matched threshold and detection fraction per FREQUENCY band.
 
@@ -1172,8 +1512,8 @@ def sec_band(recs, args, rng):
           f"{args.fap:g} false alarms/realisation ---")
     pf_cols = ("prepfold_chi2", "prepfold_snr1")
     for glab, sub in groups:
-        pfthr = prepfold_null_thresholds(sub, labs, args)
-        rws_all = rows(sub)
+        pfthr = prepfold_null_thresholds(sub, labs, args.fap)
+        rws_all = rows(sub, hit_tol=args.hit_tol)
         apply_weights(rws_all, args.weight)
         ms = present_recs(sub, SEARCHES)
         ms = [m for m in ms if any(m in r for r in rws_all)]
@@ -1235,6 +1575,223 @@ def sec_band(recs, args, rng):
               "   '-' = the run stored no per-band tail for this method)")
 
 
+def sec_paired(rws, thr, args, rng):
+    """Run 3 against run 2: the SAME injection, in the SAME white noise, red added.
+
+    THE POINT OF THE SECTION.  Red noise draws off its own RNG stream, so at a
+    given index the population draws, the injected S/N, the phases and the white
+    noise are bit-for-bit run 2's.  The two runs are therefore a PAIRED sample,
+    and the degradation can be taken injection by injection, with the population
+    scatter cancelling instead of being averaged over.  Give the command both run
+    directories.
+
+    Threshold-free where it can be -- the median paired statistic needs no cut at
+    all -- and matched per cell where a detection has to be counted: a white row
+    against the white cut, a red row against its own knee bin's.
+
+    The last block is what Lazarus et al. (2015) can be compared against: their
+    factor 1.1-2 in Smin at P = 0.1-2 s (f0 0.5-10 Hz) and DM > 150.  Quote their
+    HIGH-DM figure -- their DM dependence is RFI confusability, and this study
+    models red noise only.
+    """
+    white = {(r["index"], r["inj"]): r for r in rws if r.get("fknee") is None}
+    red = [r for r in rws if r.get("fknee") is not None]
+    if not white or not red:
+        print("\n--- paired white/red: needs BOTH runs on the command line, e.g.\n"
+              "    mc_analyze.py /data/mc/run2 /data/mc/run3 ---")
+        return
+    pairs = [(white[k], r) for r in red
+             for k in ((r["index"], r["inj"]),) if k in white]
+    if not pairs:
+        print("\n--- paired white/red: the two runs share no realisation index ---")
+        return
+    bad = sum(1 for w, r in pairs
+              if abs(w["f0"] - r["f0"]) > 1e-12 or abs(w["snr"] - r["snr"]) > 1e-12)
+    ms = [m for m in present(rws, SNR1_LIKE) if m != "prepfold_snr1"]
+    print(f"\n--- paired white/red: {len(pairs)} injections present in both runs "
+          f"({len(red)} red rows, {len(white)} white) ---")
+    if bad:
+        print(f"  *** {bad} pairs disagree about the injection itself -- the runs are "
+              "NOT paired.\n  *** Red noise must draw off `rng_for_rednoise`; check "
+              "the driver before reading on.")
+    else:
+        print("  (every pair carries the identical injection, so the pairing holds)")
+
+    klabs = _row_knee_labels([r for _, r in pairs], args.knee_by)
+    fedges = BINS["f0"]
+    fcols = list(zip(fedges[:-1], fedges[1:]))
+
+    def cell(sel, m):
+        v = [r[m] - w[m] for w, r in sel
+             if np.isfinite(w.get(m, np.nan)) and np.isfinite(r.get(m, np.nan))]
+        return (float(np.median(v)), len(v)) if len(v) >= 20 else (float("nan"), len(v))
+
+    print(f"\n  median paired (red - white) statistic for {args.ref}, "
+          "both runs recovering it")
+    print(f'{"knee":>10} ' + " ".join(f"{f'{lo:g}-{hi:g}':>14}" for lo, hi in fcols))
+    for kl in klabs:
+        cells = []
+        for lo, hi in fcols:
+            d, n = cell([(w, r) for w, r in pairs
+                         if knee_label(r, args.knee_by) == kl and lo <= r["f0"] < hi],
+                        args.ref)
+            cells.append(f"{'.':>14}" if not np.isfinite(d) else f"{d:+8.2f} ({n:>4d})")
+        print(f"{kl:>10} " + " ".join(cells))
+
+    print("\n  median paired (red - white) statistic per method, over all f0")
+    print(f'{"method":>17} ' + " ".join(f"{l:>14}" for l in klabs))
+    for m in ms:
+        cells = []
+        for kl in klabs:
+            d, n = cell([(w, r) for w, r in pairs
+                         if knee_label(r, args.knee_by) == kl], m)
+            cells.append(f"{'.':>14}" if not np.isfinite(d) else f"{d:+6.2f}({n:>6d})")
+        print(f"{m:>17} " + " ".join(cells))
+    print("  (both-recovered only, so it is a shift in the statistic, not a "
+          "detection fraction;\n   a pair the red run lost entirely cannot appear "
+          "here -- that is the next block)")
+
+    print("\n  paired detection: white-only (LOST to red) / red-only (gained), "
+          "each at its own cell's cut")
+    print(f'{"method":>17} ' + " ".join(f"{l:>14}" for l in klabs))
+    for m in ms:
+        cells = []
+        for kl in klabs:
+            sel = [(w, r) for w, r in pairs if knee_label(r, args.knee_by) == kl
+                   and m in w and m in r]
+            if len(sel) < 20:
+                cells.append(f"{'.':>14}")
+                continue
+            tw = _tv([w for w, _ in sel], thr.get(m, thr["_default"]))
+            tr = _tv([r for _, r in sel], thr.get(m, thr["_default"]))
+            a = np.array([np.isfinite(w.get(m, np.nan)) and w[m] >= u
+                          for (w, _), u in zip(sel, tw)])
+            b = np.array([np.isfinite(r.get(m, np.nan)) and r[m] >= u
+                          for (_, r), u in zip(sel, tr)])
+            cells.append(f"{int((a & ~b).sum()):>6d} /{int((~a & b).sum()):>6d}")
+        print(f"{m:>17} " + " ".join(cells))
+
+    print(f"\n  injected S/N at 50% detection, and red/white ratio -- {args.ref}")
+    print(f'{"knee":>10} {"S/N(50%)":>10} {"vs white":>9}   per f0 band, ratio to white:')
+    wl = [w for w, _ in pairs]
+    s50_w, _ = _logistic_s50(wl, args.ref, thr.get(args.ref, thr["_default"]))
+    for kl in klabs:
+        sel = [(w, r) for w, r in pairs if knee_label(r, args.knee_by) == kl]
+        s50, _ = _logistic_s50([r for _, r in sel], args.ref,
+                               thr.get(args.ref, thr["_default"]))
+        cells = []
+        for lo, hi in fcols[:5]:
+            sb = [(w, r) for w, r in sel if lo <= r["f0"] < hi]
+            a, _ = _logistic_s50([r for _, r in sb], args.ref,
+                                 thr.get(args.ref, thr["_default"]))
+            b, _ = _logistic_s50([w for w, _ in sb], args.ref,
+                                 thr.get(args.ref, thr["_default"]))
+            cells.append(f"{lo:g}-{hi:g}: " +
+                         ("--" if not (np.isfinite(a) and np.isfinite(b) and b)
+                          else f"{a / b:.2f}"))
+        print(f"{kl:>10} {_fmt(s50, 2):>10} "
+              f"{(f'{s50 / s50_w:.2f}x' if np.isfinite(s50) and np.isfinite(s50_w) and s50_w else '--'):>9}"
+              f"   " + "  ".join(cells))
+    print(f"  (white S/N(50%) = {_fmt(s50_w, 2)}.  A ratio is a degradation FACTOR in "
+          "sensitivity, which is\n   what Lazarus et al. (2015) quote as 1.1-2 at "
+          "P = 0.1-2 s for PALFA at DM > 150.\n   `--` where the fit did not reach 50% "
+          "inside the injected 5.5-11.5 band.)")
+
+
+def sec_hits(rws, thr, args):
+    """Chance coincidences: recorded hits too far from their target to be the signal.
+
+    THE POINT OF THE SECTION.  The driver's `score()` claims a candidate for an
+    injection if it lies within `tol_bins` (3.0) of ANY ratio n/m <= 8 of f0, and
+    a claimed candidate is removed from the false-alarm list -- so where a code
+    emits a flood of candidates, coincidences enter as DETECTIONS and no matched
+    threshold can see them.  Run 3's `rseek` does this at slow periods: at knee
+    > 15 Hz, f0 5-20 Hz, its detection fraction ROSE with knee (80.5% against
+    65.7% at knee < 0.5) while the median hit offset was 8 bins and the median
+    hit statistic 25, at labels 1/8, 1/7 and 1/6.
+
+    `--hit-tol` (default 0.5 bins) rejects those; this is what it cost and what
+    it left behind.  A coincidence is uniform across the tolerance window, so the
+    rejected hits ABOVE the cut in the sideband measure the density, and
+    `hit_tol / (tol_bins - hit_tol)` of that is what remains inside the accepted
+    window.  Real hits are nothing like uniform: on run 2's white noise, above
+    each code's matched cut, the 99th-percentile offset is 0.15-0.23 bins.
+
+    The one thing neither the cut nor this estimate can undo: the driver stores
+    only the BEST hit per injection (fundamental first, then strongest), so a
+    junk candidate at the fundamental ratio can have displaced a real one, and
+    rejecting it scores a miss the code may not have made.  `displaced` counts
+    the rejections that were above the cut -- an upper bound on that loss, and
+    the same number as the coincidences the cut removed from the detections.
+    """
+    ms = [m for m in present(rws, SEARCHES) if any(r.get(m + "_off") is not None
+                                                   for r in rws)]
+    if not ms:
+        print("\n--- chance coincidences: no hit frequencies recorded ---")
+        return
+    tol = np.median([r["tol_bins"] for r in rws if r.get("tol_bins")]) \
+        if any(r.get("tol_bins") for r in rws) else 3.0
+    if not np.isfinite(args.hit_tol) or args.hit_tol >= tol:
+        print(f"\n--- chance coincidences: --hit-tol {args.hit_tol:g} does not cut "
+              f"inside the driver's {tol:g}-bin tolerance, so every recorded hit "
+              "stands ---")
+        return
+    groups = [(lab, [r for r in rws if knee_label(r, args.knee_by) == lab])
+              for lab in _row_knee_labels(rws, args.knee_by)]
+    frac = args.hit_tol / (tol - args.hit_tol)
+    print(f"\n--- chance coincidences: hits more than {args.hit_tol:g} of the "
+          f"driver's {tol:g} tolerance bins from their target ---")
+    labs = [lab for lab, _ in groups]
+    head = f'{"method":>17} ' + " ".join(f"{l:>14}" for l in labs)
+    for what in ("rejected % of recorded hits",
+                 "displaced: rejections above the cut, % of detections",
+                 "estimated coincidences REMAINING, % of detections"):
+        print(f"\n  {what}")
+        print(head)
+        for m in ms:
+            cells = []
+            for lab, g in groups:
+                t = _tv(g, thr.get(m, thr["_default"]))
+                nhit = sum(1 for r in g if r.get(m + "_off") is not None)
+                rej = [r[m + "_junk"] for r in g if r.get(m + "_junk") is not None]
+                above = sum(1 for r, u in zip(g, t)
+                            if np.isfinite(r.get(m, np.nan)) and r[m] >= u)
+                disp = sum(1 for r, u in zip(g, t)
+                           if r.get(m + "_junk") is not None and r[m + "_junk"] >= u)
+                if not nhit:
+                    cells.append(f"{'.':>14}")
+                elif what.startswith("rejected"):
+                    cells.append(f"{100 * len(rej) / nhit:11.1f}   ")
+                elif above < _HITS_MIN_DET:
+                    # A ratio to a handful of detections is not a measurement.
+                    # `rseek`'s cut in these cells is 170-315, so it detects
+                    # almost nothing and the percentage read 900% once; the two
+                    # counts say the same thing without pretending to precision.
+                    cells.append(f"{f'{disp} of {above}':>14}")
+                elif what.startswith("displaced"):
+                    cells.append(f"{100 * disp / above:11.1f}   ")
+                else:
+                    cells.append(f"{100 * disp * frac / above:11.2f}   ")
+            print(f"{m:>17} " + " ".join(cells))
+    print("  (a coincidence is uniform in offset, so the sideband above the cut "
+          f"measures its density\n   and {frac:.2f}x of it remains inside the "
+          "accepted window -- that last row is what the\n   detection fractions "
+          "still carry.  `displaced` is the upper bound on real hits the cut\n"
+          "   threw away, because only the best hit per injection was stored.\n"
+          f"   `d of n` = fewer than {_HITS_MIN_DET} detections in the cell, so "
+          "the counts are quoted instead\n   of a ratio to them; '.' = the method "
+          "recorded no hit there.)")
+
+
+def _row_knee_labels(rws, by):
+    """The knee labels present among rows, white first, then in bin order."""
+    seen = {knee_label(r, by) for r in rws}
+    edges = KNEE_EDGES if by == "knee" else SIGMA_EDGES
+    order = ["white"] + [f"{lo:g}-" + ("inf" if hi >= 1e8 else f"{hi:g}")
+                         for lo, hi in zip(edges[:-1], edges[1:])]
+    return [l for l in order if l in seen]
+
+
 def sec_knee(recs, args, rng):
     """Matched threshold and detection fraction per red-noise bin.
 
@@ -1259,26 +1816,41 @@ def sec_knee(recs, args, rng):
     print(f"\n--- per red-noise bin ({unit}), every threshold matched INSIDE its bin "
           f"at {args.fap:g} false alarms/realisation ---")
 
-    ms, det, thr, warn = [], {}, {}, {}
+    ms, det, thr, warn, band_det = [], {}, {}, defaultdict(dict), {}
     for lab, sub in groups:
         curves = fa_curves(sub, present_recs(sub, SEARCHES))
         t = pick_thresholds(curves, args.fap)
-        rws = rows(sub)
+        rws = rows(sub, hit_tol=args.hit_tol)
         apply_weights(rws, args.weight)
+        # The same bin, matched per (knee x f0 band) instead: `rseek` emits one
+        # candidate list over its whole range and its noise is not stationary
+        # across it, so the two matchings answer different questions and the
+        # report gives both.  See `sec_band` for the cells themselves.
+        tb = {}
+        if fa_band_labels(sub):
+            tb = CutBook(sub, "knee,band", args.knee_by, args.threshold).at(args.fap)
         for m in present(rws, SEARCHES):
             if m not in ms:
                 ms.append(m)
             p, se, _ = boot_det(rws, m, t.get(m, float("inf")), args.boot, rng)
             det[(m, lab)] = (p, se)
             thr[(m, lab)] = t.get(m, float("inf"))
-        n = sum(1 for r in sub for v in r.get("results", {}).values()
-                if isinstance(v, dict) and v.get("sigma_warn"))
-        warn[lab] = n
+            if m in tb:
+                band_det[(m, lab)] = boot_det(rws, m, tb[m], args.boot, rng)[:2]
+        for v in (r.get("results", {}) for r in sub):
+            for arm, d in v.items():
+                if isinstance(d, dict) and d.get("sigma_warn"):
+                    warn.setdefault(arm, {})
+                    warn[arm][lab] = warn[arm].get(lab, 0) + 1
 
     labs = [l for l, _ in groups]
     head = f'{"method":>17} ' + " ".join(f"{l:>14}" for l in labs)
-    for title, tab, fmt in (("detection % (bootstrap se over realisations)", det, "det"),
-                            ("matched threshold", thr, "thr")):
+    tabs = [("detection % (bootstrap se over realisations)", det, "det"),
+            ("matched threshold", thr, "thr")]
+    if band_det:
+        tabs.insert(1, ("detection % with every cut matched per (this bin x f0 band) "
+                        "instead", band_det, "det"))
+    for title, tab, fmt in tabs:
         print(f"\n  {title}")
         print(head)
         for m in ms:
@@ -1294,12 +1866,22 @@ def sec_knee(recs, args, rng):
                                  else f"{v:14.2f}")
             print(f"{m:>17} " + " ".join(cells))
     print(f'\n{"realisations":>17} ' + " ".join(f"{len(s):>14d}" for _, s in groups))
-    if any(warn.values()):
-        print(f'{"sigma_warn fired":>17} ' + " ".join(f"{warn[l]:>14d}" for l in labs))
-        print("  (the search's own guard: analytic sigma disagreeing with the measured"
-              " one by >10%.\n   On a whitened file it should be silent -- where it is"
-              " not, `rednoise` left a residual\n   and the analytic default is"
-              " reporting inflated S/N.)")
+    if warn:
+        print("\n  the search's own sigma guard (analytic disagreeing with measured "
+              "by >10%), per arm")
+        print(head)
+        for arm in sorted(warn):
+            print(f"{arm:>17} " +
+                  " ".join(f"{warn[arm].get(l, 0):>14d}" for l in labs))
+        print("  (NOT a red-noise diagnostic, and it was read as one once.  On run 3 it "
+              "fires only on\n   `coherent_tier`, at a rate FLAT in knee, and it fires "
+              "the same way on pure white noise:\n   the guard's third sample point is "
+              "the LAST chunk, a stub in a narrow band (57 trials\n   spanning 0.24 "
+              "Fourier bins), so its measured sigma scatters +-7% against a 10%\n"
+              "   tolerance over 12 rungs.  In the full chunks the analytic sigma is "
+              "right to 0.3-1%, so\n   no result here is biased.  A guard firing on an "
+              "arm that searches the WHOLE band, or a\n   rate that climbs with knee, "
+              "would be the real thing.)")
 
 
 def sec_duty(rws, args):
@@ -1377,6 +1959,8 @@ def _logistic_s50(rws, m, t, iters=25):
     v = np.array([r[m] for r in rws if m in r], dtype=float)
     if len(x) < 50:
         return float("nan"), float("nan")
+    if isinstance(t, Cut):
+        t = t.vec([r for r in rws if m in r])
     y = (np.nan_to_num(v, nan=-1e9) >= t).astype(float)
     if y.sum() < 10 or y.sum() > len(y) - 10:
         return float("nan"), float("nan")
@@ -1455,7 +2039,7 @@ def add_model(rws, nharms, maxdecim, quiet=False):
 # ---------------------------------------------------------------------------
 SECTIONS = ("header", "cost", "falarm", "roc", "table", "pairs", "decompose",
             "scatter", "recovery", "model", "prepfold", "drizzle", "duty", "2d",
-            "s50", "harm", "knee", "band")
+            "s50", "harm", "hits", "knee", "band", "paired")
 
 
 def main(argv=None):
@@ -1473,6 +2057,14 @@ def main(argv=None):
                          "covariate -- at fixed knee the realised level spans "
                          "0.55-1.50x, because the red variance is dominated by a "
                          "few low-frequency bins")
+    ap.add_argument("--match", default="knee", choices=MATCH,
+                    help="where every threshold is matched: over the pooled run, "
+                         "per red-noise bin (default), or per red-noise bin x f0 "
+                         "band.  Identical on records without red noise")
+    ap.add_argument("--hit-tol", type=float, default=HIT_TOL,
+                    help="a hit further than this many Fourier bins from its "
+                         "target is a chance coincidence, scored as a miss "
+                         "(default %(default)s; `inf` scores as recorded)")
     ap.add_argument("--by", default="snr,ducy,f0",
                     help="comma-separated binning axes for the detection tables")
     ap.add_argument("--ref", default="coherent",
@@ -1505,47 +2097,37 @@ def main(argv=None):
     recs = load(args.paths, with_profiles=("drizzle" in want))
     if not recs:
         raise SystemExit("no realisations found")
-    rws = rows(recs)
+    rws = rows(recs, hit_tol=args.hit_tol)
     apply_weights(rws, args.weight)
     if args.model:
         add_model(rws, args.nharms, args.maxdecim)
     rng = np.random.default_rng(args.seed)
 
-    curves = fa_curves(recs, present_recs(recs, SEARCHES))
-    thr = pick_thresholds(curves, args.fap)
+    # Every threshold in the report comes from here.  prepfold folds at the KNOWN
+    # period, so it has no false-alarm column unless the run folded the
+    # injection-free realisations at random periods too (runs 2 and 3 do); where
+    # it did, prepfold joins the matched table as a proper ceiling.
+    book = CutBook(recs, args.match, args.knee_by, args.threshold)
+    thr = book.at(args.fap)
     thr["_default"] = args.threshold
-    # prepfold folds at the KNOWN period, so it has no false-alarm column unless
-    # the run folded the injection-free realisations at random periods too (run 2
-    # does).  Where it did, prepfold joins the matched table as a proper ceiling.
-    nulls = defaultdict(list)
-    nreal_null = 0
-    for r in recs:
-        pn = r["results"].get("prepfold_null")
-        if not r.get("empty") or not pn:
-            continue
-        nreal_null += 1
-        for d in pn:
-            for k, col in (("chi2_sigma", "prepfold_chi2"), ("snr1", "prepfold_snr1")):
-                v = (d or {}).get(k)
-                if v is not None and np.isfinite(v):
-                    nulls[col].append(v)
-    for col, v in nulls.items():
-        if len(v) < 200:
-            continue
-        # `fap` is per REALISATION, and each null realisation contributed
-        # `len(v)/nreal_null` folds, so the per-FOLD tail probability that gives
-        # that rate is fap divided by the folds per realisation.  Using the plain
-        # `1 - fap` quantile instead would quote a threshold several times too low
-        # and hand prepfold a free advantage in the one table where it is the
-        # ceiling everyone else is measured against.
-        per = args.fap / max(1.0, len(v) / max(nreal_null, 1))
-        if per < 1.0:
-            thr[col] = float(np.quantile(v, 1.0 - per))
+    nulls, _ = prepfold_nulls(recs)
 
     if "header" in want:
-        sec_header(recs, rws, args)
+        sec_header(recs, rws, args, book)
     print(f"\nthresholds at {args.fap:g} false alarms per realisation: " +
           ", ".join(f"{k} {v:.2f}" for k, v in sorted(thr.items()) if k != "_default"))
+    if book.match != "pooled":
+        print(f"  (matched per {'red-noise bin' if book.match == 'knee' else 'red-noise bin x f0 band'}"
+              f" -- each is the range over cells; the `knee` and `band` sections list them."
+              f"\n   prepfold is matched per (red-noise bin, f0 band) either way: its null"
+              f" depends on the fold period.)")
+        if book.censored:
+            ncell = sum(len(v.cuts) for k, v in thr.items()
+                        if k in PF_COLS and isinstance(v, Cut))
+            print(f"  ({len(book.censored)} of {ncell} prepfold cells cannot resolve "
+                  f"{args.fap:g}/realisation from their null folds: the cut shown is the "
+                  f"lowest\n   rate that sample CAN resolve, so prepfold reads as a LOWER "
+                  "bound there.  `--fap 0.1` needs ~10x less data.)")
     if any(k.startswith("prepfold") for k in nulls):
         print(f"  (prepfold_* are matched too, from {sum(len(v) for v in nulls.values())} "
               f"folds of the injection-free realisations at random periods.  Its "
@@ -1562,7 +2144,7 @@ def main(argv=None):
     if "falarm" in want:
         sec_falarm(recs, args, thr)
     if "roc" in want:
-        sec_roc(recs, rws, curves, args, rng)
+        sec_roc(recs, rws, book, args, rng)
     if "table" in want:
         for key in [k.strip() for k in args.by.split(",") if k.strip()]:
             if key not in BINS:
@@ -1591,10 +2173,14 @@ def main(argv=None):
         sec_s50(rws, thr, args)
     if "harm" in want:
         sec_harm(rws)
+    if "hits" in want:
+        sec_hits(rws, thr, args)
     if "knee" in want:
         sec_knee(recs, args, rng)
     if "band" in want:
         sec_band(recs, args, rng)
+    if "paired" in want:
+        sec_paired(rws, thr, args, rng)
     return 0
 
 

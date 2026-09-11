@@ -33,11 +33,37 @@ Panels, and what each is for:
 given.  Without it every code is cut at the same nominal value, which is NOT a
 fair comparison -- ours and rseek's statistics are single-trial, accelsearch's
 sigma is trials-corrected and prepfold's is a chi-squared.
+
+**A SECOND page is written whenever the records carry red noise**
+(`<out>_red.png`), because every panel on it is cut inside a red-noise bin and
+putting that on the same axes as a pooled cut would be two different cuts on one
+plot.  Its panels:
+
+  1  detection vs knee, matched per knee bin  -- the degradation, at the cut a
+                                                 pipeline tuned to one
+                                                 observation would apply
+  2  the same, matched per (knee x f0 band)   -- what a code whose noise is not
+                                                 stationary across its own
+                                                 output (rseek) can recover
+  3  paired (red - white) statistic vs f0     -- run 3 against run 2 on the SAME
+                                                 injection; needs both run
+                                                 directories on the command line
+  4  S/N at 50% detection vs knee             -- one number per code per bin
+  5  false-alarm tail per knee bin            -- ours is flat in knee, rseek's is
+                                                 not, and that is the whole story
+                                                 of why its cut moves
+  6  detection vs f0 per knee bin             -- red noise eats the slow end
+                                                 first
+  7  hit offset distributions                 -- real hits are tight, chance
+                                                 coincidences are flat across
+                                                 the tolerance window
+  8  the drawn (knee, sigma_red, alpha)       -- a sampler check
 """
 
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 
@@ -55,21 +81,34 @@ COLOURS = {"prepfold_chi2": "#8c8c8c", "prepfold_snr1": "#3b7dd8",
            "accelsearch": "#d9822b", "accelsearch_red": "#b06010",
            "rseek_A": "#c1272d", "rseek_B": "#7b3fa0",
            "coherent": "#1a9850", "coherent_tier": "#0d6e33",
-           "coherent_deep": "#66bd63", "coh+tier": "#054d21"}
+           "coherent_deep": "#66bd63", "coh+tier": "#054d21",
+           "coherent_meas": "#2b8cbe", "coherent_rawmeas": "#7fcdbb"}
 SNR1_LIKE = ("prepfold_snr1", "rseek_A", "coherent", "coh+tier")
+# One colour per red-noise bin, dark (quiet) to bright (worst).
+KNEE_COLOURS = ["#000000", "#2166ac", "#4393c3", "#f4a582", "#d6604d", "#b2182b"]
 
 
 def frac(rws, m, thr, key, edges):
     """Detection fraction of method `m` in bins of `key`, with the denominator
     counting only injections that method actually saw (rseek_B runs on a
-    subset)."""
+    subset).
+
+    `thr` may be one cut or a per-cell one (`mc_analyze.Cut`), which is what
+    makes these panels legible under red noise: a cut matched over a mixture of
+    noise levels belongs to none of them."""
     x, y, n = [], [], []
     for lo, hi in zip(edges[:-1], edges[1:]):
-        v = np.array([r[m] for r in rws if m in r and lo <= r[key] < hi], dtype=float)
-        if len(v) == 0:
+        sel = [r for r in rws if m in r and lo <= r[key] < hi]
+        if not sel:
             continue
+        v = np.array([r[m] for r in sel], dtype=float)
+        tv = MA._tv(sel, thr)
+        keep = ~np.isnan(tv)           # no cut in the cell: no measurement
+        if not keep.any():
+            continue
+        v, tv = v[keep], tv[keep]
         x.append(math_mid(lo, hi, key))
-        y.append(float(np.nansum(v >= thr)) / len(v))
+        y.append(float(np.nansum(v >= tv)) / len(v))
         n.append(len(v))
     return np.array(x), np.array(y), np.array(n)
 
@@ -100,6 +139,199 @@ def panel_frac(ax, rws, methods, thr, key, edges, xlabel, logx=False):
     ax.grid(alpha=0.25)
 
 
+def _mark_white(ax, x):
+    """Label the paired WHITE control, which has no knee to be plotted at.
+
+    It sits at the left edge as the zero point of every knee axis; without this
+    it reads as a measurement at 0.05 Hz, which it is not.
+    """
+    ax.axvline(x, color="#888888", lw=0.8, ls=":")
+    ax.annotate("white\n(run 2)", (x, 0.02), xycoords=("data", "axes fraction"),
+                fontsize=6, color="#555555", ha="center", va="bottom")
+
+
+def red_page(recs, rws, thr, book, args, methods):
+    """The red-noise page: everything that has the knee as an axis.
+
+    Separate from the white page on purpose -- every panel here needs a
+    threshold matched INSIDE a red-noise bin, and overlaying that on the
+    pooled-cut panels would put two different cuts on one axis.
+    """
+    klabs = MA._row_knee_labels(rws, args.knee_by)
+    red_labs = [l for l in klabs if l != "white"]
+    kx = {l: (0.05 if l == "white" else math_gmean(*MA.band_range(l)))
+          for l in klabs}
+    fig, axes = plt.subplots(2, 4, figsize=(22, 10))
+    unit = "red-noise knee (Hz)" if args.knee_by == "knee" else "realised sigma_red/sigma_w"
+
+    # 1, 2 -- detection vs knee, matched per knee and then per (knee x band).
+    for ax, mode, ttl in ((axes[0, 0], "knee", "matched per knee bin"),
+                          (axes[0, 1], "knee,band", "matched per (knee x f0 band)")):
+        try:
+            t = MA.CutBook(recs, mode, args.knee_by, args.threshold).at(args.fap)
+        except SystemExit:
+            ax.set_axis_off()
+            continue
+        for m in methods:
+            if m not in t:
+                continue
+            xs, ys, es = [], [], []
+            for l in klabs:
+                g = [r for r in rws if MA.knee_label(r, args.knee_by) == l and m in r]
+                if len(g) < 30:
+                    continue
+                p, _ = MA._det(g, m, t[m])
+                xs.append(kx[l])
+                ys.append(100 * p)
+                es.append(100 * math.sqrt(max(p * (1 - p), 1e-6) / len(g)))
+            if xs:
+                ax.errorbar(xs, ys, yerr=es, marker="o", ms=3, lw=1.4, capsize=2,
+                            color=COLOURS.get(m), label=m)
+        ax.set_xscale("log")
+        ax.set_xlabel(unit)
+        ax.set_ylabel("detected (%)")
+        ax.set_ylim(-3, 103)
+        ax.set_title(f"detection vs knee, {ttl}")
+        ax.grid(alpha=0.25)
+        if "white" in klabs:
+            _mark_white(ax, kx["white"])
+    axes[0, 0].legend(fontsize=7, loc="lower left")
+
+    # 3 -- the paired degradation: run 3 against run 2, same injection.
+    ax = axes[0, 2]
+    white = {(r["index"], r["inj"]): r for r in rws if r.get("fknee") is None}
+    pairs = [(white[k], r) for r in rws if r.get("fknee") is not None
+             for k in ((r["index"], r["inj"]),) if k in white]
+    m = args.ref
+    if pairs:
+        edges = [0.1, 1.0, 5.0, 20.0, 100.0, 1000.0]
+        for l, c in zip(red_labs, KNEE_COLOURS[1:]):
+            xs, ys = [], []
+            for lo, hi in zip(edges[:-1], edges[1:]):
+                d = [r[m] - w[m] for w, r in pairs
+                     if MA.knee_label(r, args.knee_by) == l and lo <= r["f0"] < hi
+                     and np.isfinite(w.get(m, np.nan)) and np.isfinite(r.get(m, np.nan))]
+                if len(d) >= 20:
+                    xs.append(math_gmean(lo, hi))
+                    ys.append(float(np.median(d)))
+            if xs:
+                ax.plot(xs, ys, "o-", ms=4, lw=1.4, color=c, label=f"knee {l}")
+        ax.axhline(0.0, color="k", lw=1, ls=":")
+        ax.set_xscale("log")
+        ax.legend(fontsize=7)
+    else:
+        ax.text(0.5, 0.5, "give BOTH run directories\nfor the paired comparison",
+                ha="center", va="center", transform=ax.transAxes, fontsize=9)
+    ax.set_xlabel("spin frequency (Hz)")
+    ax.set_ylabel(f"median paired (red - white) {m}")
+    ax.set_title("paired degradation (both runs recovering)")
+    ax.grid(alpha=0.25)
+
+    # 4 -- S/N at 50% detection against knee.
+    ax = axes[0, 3]
+    for m in methods:
+        xs, ys = [], []
+        for l in klabs:
+            g = [r for r in rws if MA.knee_label(r, args.knee_by) == l and m in r]
+            if len(g) < 200:
+                continue
+            s50, _ = MA._logistic_s50(g, m, thr.get(m, thr["_default"]))
+            if np.isfinite(s50):
+                xs.append(kx[l])
+                ys.append(s50)
+        if xs:
+            ax.plot(xs, ys, "o-", ms=4, lw=1.4, color=COLOURS.get(m), label=m)
+    ax.set_xscale("log")
+    ax.set_xlabel(unit)
+    ax.set_ylabel("injected S/N at 50% detection")
+    ax.set_title("sensitivity vs knee (lower is better)")
+    ax.legend(fontsize=7)
+    ax.grid(alpha=0.25)
+
+    # 5 -- the false-alarm tail per knee bin: ours flat, rseek's not.
+    ax = axes[1, 0]
+    grid = np.arange(5.0, 40.01, 0.25)
+    groups = dict(MA.knee_bins(recs, args.knee_by))
+    for m, ls in ((args.ref, "-"), ("rseek_A", "--")):
+        for l, c in zip(klabs, KNEE_COLOURS):
+            sub = groups.get(l)
+            if not sub:
+                continue
+            rate, n = MA.fa_rates(sub, m, grid)
+            if n:
+                ax.semilogy(grid, np.clip(rate, 1e-4, None), ls, lw=1.2, color=c,
+                            label=f"{m} {l}")
+    ax.axhline(args.fap, color="k", ls=":", lw=1)
+    ax.set_xlabel("statistic cut")
+    ax.set_ylabel("false alarms / realisation")
+    ax.set_title(f"false-alarm tail per knee bin ({args.ref} solid, rseek_A dashed)")
+    ax.legend(fontsize=5, ncol=2)
+    ax.grid(alpha=0.25)
+
+    # 6 -- where in frequency the loss happens, per knee bin.
+    ax = axes[1, 1]
+    for l, c in zip(klabs, KNEE_COLOURS):
+        g = [r for r in rws if MA.knee_label(r, args.knee_by) == l]
+        if len(g) < 200:
+            continue
+        x, y, n = frac(g, args.ref, thr.get(args.ref, thr["_default"]), "f0",
+                       [0.1, 0.5, 2.0, 8.0, 30.0, 120.0, 400.0, 1000.0])
+        if len(x):
+            ax.plot(x, 100 * y, "o-", ms=3, lw=1.4, color=c, label=f"knee {l}")
+    ax.set_xscale("log")
+    ax.set_xlabel("spin frequency (Hz)")
+    ax.set_ylabel("detected (%)")
+    ax.set_ylim(-3, 103)
+    ax.set_title(f"{args.ref}: detection vs f0, per knee bin")
+    ax.legend(fontsize=7)
+    ax.grid(alpha=0.25)
+
+    # 7 -- hit offsets: how the chance coincidences were found.
+    ax = axes[1, 2]
+    tol = np.median([r["tol_bins"] for r in rws if r.get("tol_bins")]) \
+        if any(r.get("tol_bins") for r in rws) else 3.0
+    bins = np.linspace(0, tol, 40)
+    for m, ls in ((args.ref, "-"), ("rseek_A", "--")):
+        for l, c in ((red_labs[0], "#2166ac"), (red_labs[-1], "#b2182b")) if red_labs else ():
+            v = np.array([r[m + "_off"] for r in rws
+                          if r.get(m + "_off") is not None
+                          and MA.knee_label(r, args.knee_by) == l], dtype=float)
+            if len(v) > 50:
+                ax.hist(np.clip(v, 0, tol), bins=bins, histtype="step", ls=ls,
+                        color=c, lw=1.3, density=True, label=f"{m} knee {l}")
+    ax.axvline(args.hit_tol, color="k", lw=1.2, ls=":")
+    ax.set_yscale("log")
+    ax.set_xlabel("hit offset from target (Fourier bins)")
+    ax.set_ylabel("density")
+    ax.set_title("real hits are tight; coincidences are flat")
+    ax.legend(fontsize=6)
+    ax.grid(alpha=0.25)
+
+    # 8 -- the drawn population, as a sampler check.
+    ax = axes[1, 3]
+    red = [r["rednoise"] for r in recs if r.get("rednoise")]
+    if red:
+        k = np.array([x["fknee"] for x in red])
+        s = np.array([x.get("sigma_got") or np.nan for x in red])
+        al = np.array([x["alpha"] for x in red])
+        sc = ax.scatter(k, s, c=al, s=4, alpha=0.5, cmap="viridis")
+        fig.colorbar(sc, ax=ax, label="spectral index alpha")
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+    ax.set_xlabel("drawn knee (Hz)")
+    ax.set_ylabel("realised sigma_red / sigma_white")
+    ax.set_title("the red-noise population that was drawn")
+    ax.grid(alpha=0.25)
+
+    nred = sum(1 for r in recs if r.get("rednoise"))
+    fig.suptitle(f"MC red-noise page — {nred} red realisations of {len(recs)}, "
+                 f"thresholds matched per {book.match.replace(',', ' x ')} at "
+                 f"{args.fap:g} false alarms/realisation, hit tolerance "
+                 f"{args.hit_tol:g} bins", fontsize=13)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    return fig
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -111,21 +343,36 @@ def main(argv=None):
     ap.add_argument("--methods", default=None,
                     help="comma-separated subset to plot (run 2 has ten, which is "
                          "too many curves for one panel to be read)")
+    ap.add_argument("--match", default="knee", choices=MA.MATCH,
+                    help="where thresholds are matched; identical on records "
+                         "without red noise")
+    ap.add_argument("--knee-by", default="knee", choices=("knee", "sigma"))
+    ap.add_argument("--hit-tol", type=float, default=MA.HIT_TOL,
+                    help="a hit further than this many Fourier bins from its "
+                         "target is a chance coincidence, scored as a miss")
+    ap.add_argument("--ref", default="coherent",
+                    help="the method the red-noise page follows in detail")
+    ap.add_argument("--out-red", default=None,
+                    help="the red-noise page (default: <out> with _red before the "
+                         "suffix).  Written whenever the records carry red noise")
     args = ap.parse_args(argv)
 
     recs = MA.load(args.paths)
     if not recs:
         raise SystemExit("no realisations found")
-    rws = MA.rows(recs)
+    rws = MA.rows(recs, hit_tol=args.hit_tol)
     methods = [m for m in MA.METHODS if any(m in r for r in rws)]
     if args.methods:
         methods = [m for m in methods if m in args.methods.split(",")]
 
+    book = None
     if args.fap is not None:
-        thr = MA.pick_thresholds(MA.fa_curves(recs, MA.present_recs(recs, MA.SEARCHES)),
-                                 args.fap)
+        book = MA.CutBook(recs, args.match, args.knee_by, args.threshold)
+        thr = book.at(args.fap)
         thr["_default"] = args.threshold
-        cut = f"matched at {args.fap:g} false alarms/realisation"
+        cut = (f"matched at {args.fap:g} false alarms/realisation"
+               + (f", per {book.match.replace(',', ' x ')} cell"
+                  if book.match != "pooled" else ""))
     else:
         thr = {"_default": args.threshold}
         cut = f"nominal {args.threshold:g} for every code (NOT the same statistic)"
@@ -198,7 +445,9 @@ def main(argv=None):
     if args.fap is not None:
         ax.axhline(args.fap, color="k", ls=":", lw=1)
         for m in MA.SEARCHES:
-            if m in thr and np.isfinite(thr[m]):
+            # A per-cell cut is a set of numbers, not a line on a pooled axis:
+            # the red page plots those against the knee instead.
+            if m in thr and not isinstance(thr[m], MA.Cut) and np.isfinite(thr[m]):
                 ax.axvline(thr[m], color=COLOURS.get(m), ls="--", lw=0.8)
     ax.set_xlabel("statistic cut"); ax.set_ylabel("false alarms / realisation")
     ax.set_title("false-alarm rate (what makes codes comparable)")
@@ -238,6 +487,17 @@ def main(argv=None):
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     fig.savefig(args.out, dpi=110)
     print(f"wrote {args.out}  ({len(recs)} realisations, {len(rws)} injections)")
+
+    # The red-noise page, whenever there is red noise to plot.  Its own file
+    # because every panel on it is cut INSIDE a red-noise bin, and putting that
+    # on the same axes as a pooled cut would be two cuts on one plot.
+    if any(r.get("rednoise") for r in recs):
+        out_red = args.out_red or (os.path.splitext(args.out)[0] + "_red"
+                                   + (os.path.splitext(args.out)[1] or ".png"))
+        rfig = red_page(recs, rws, thr, book, args, methods)
+        rfig.savefig(out_red, dpi=110)
+        print(f"wrote {out_red}  (red-noise page)")
+
     if args.fap is None:
         print("NOTE: every code cut at the same nominal value, which is not a fair "
               "comparison.  Re-run with --fap 1e-2.")
