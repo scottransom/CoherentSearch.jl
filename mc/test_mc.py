@@ -20,6 +20,7 @@ SILENTLY and in a plausible-looking direction:
 
 from __future__ import annotations
 
+import glob
 import math
 import os
 import subprocess
@@ -361,6 +362,27 @@ def test_silent_failures():
               and got[0]["results"]["coherent"]["ncand"] == 12
               and got[0]["timing"]["accelsearch"] == 1.9,
               str(got[0]["results"]) if got else "no record")
+
+    # Run 2 and run 3 share indices ON PURPOSE (run 2 is run 3's paired white
+    # control).  Keyed on index alone, the loader kept whichever run sorted first
+    # and `--sections knee` over both printed a white row and no red bins.
+    with tempfile.TemporaryDirectory() as d:
+        for run, red in (("run2", None), ("run3", {"fknee": 5.0, "sigma_got": 1.0})):
+            os.makedirs(os.path.join(d, run))
+            for w in (0, 1):
+                with open(os.path.join(d, run, f"mc_x_{w:03d}.jsonl"), "w") as fh:
+                    # worker 1 repeats index 2: a restart re-partitioning the
+                    # index space, which must still collapse INSIDE a run
+                    for i in ((0, 1, 2) if w == 0 else (2, 3)):
+                        fh.write(json.dumps(dict(index=i, rednoise=red, results={},
+                                                 injections=[])) + "\n")
+        got = MA.load([os.path.join(d, "run2"), os.path.join(d, "run3")])
+        check("paired runs sharing indices both load, duplicates inside a run collapse",
+              len(got) == 8 and sum(1 for r in got if r["rednoise"]) == 4,
+              f"{len(got)} records, {sum(1 for r in got if r['rednoise'])} red")
+        got = MA.load(glob.glob(os.path.join(d, "run*", "*.jsonl")))
+        check("a shell-expanded file list is still one run per directory",
+              len(got) == 8, f"{len(got)} records")
 
 
 

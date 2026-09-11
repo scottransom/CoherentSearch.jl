@@ -85,7 +85,24 @@ BINS = {
 # Loading
 # ---------------------------------------------------------------------------
 def load(paths, with_profiles=False):
-    """Every realisation, de-duplicated by index.
+    """Every realisation, de-duplicated by index WITHIN each run.
+
+    **A run is a directory**, and the de-duplication key is `(directory, index)`.
+    Run 2 and run 3 share their indices on purpose -- same injections in the same
+    white noise, red added -- so a key of `index` alone kept whichever run sorted
+    first and silently dropped the other: `mc_analyze run2 run3 --sections knee`,
+    the command the README gives for the paired white row, returned all of run 2
+    as `white` and NO red bins at all.  Each record carries its run as `run`.
+    The key is the directory rather than the path argument because duplicates
+    also occur INSIDE a run -- run 3 was restarted from 24 workers to 15, which
+    re-partitioned the index space across worker files -- and a shell-expanded
+    file list must still collapse those.
+
+    The false-alarm tails are held as numpy arrays.  They are ~1500 floats per
+    record (pooled plus per-band) and as Python floats they were most of the
+    memory: ~5 GB for 44k run-3 realisations, which would not scale to the
+    full run, let alone to run 2 and run 3 together.  float64, so every value is
+    exactly the parsed one and a report is unchanged to the byte.
 
     `with_profiles` keeps prepfold's stored profiles.  It is OFF by default and
     that is not an oversight: a stored profile is 128 floats, so at one realisation
@@ -98,6 +115,7 @@ def load(paths, with_profiles=False):
     for p in paths:
         files += glob.glob(os.path.join(p, "*.jsonl")) if os.path.isdir(p) else glob.glob(p)
     for f in sorted(files):
+        run = os.path.dirname(os.path.abspath(f))
         with open(f) as fh:
             for line in fh:
                 try:
@@ -106,6 +124,11 @@ def load(paths, with_profiles=False):
                     continue
                 if "error" in r:
                     continue
+                r["run"] = run
+                # Per record, as it is parsed: converting after the whole run is
+                # read leaves every Python list alive at once, which is the peak.
+                for d in (r.get("results") or {}).values():
+                    _tails_to_arrays(d)
                 # A PATCH row carries one arm re-run on the same realisation --
                 # `mc_simulate --arms accel` regenerates the noise from the index
                 # and re-scores only accelsearch.  Hold them and merge after, so
@@ -113,9 +136,9 @@ def load(paths, with_profiles=False):
                 if r.get("patch"):
                     patches.append(r)
                     continue
-                if r.get("index") in seen:
+                if (run, r.get("index")) in seen:
                     continue
-                seen[r["index"]] = r
+                seen[(run, r["index"])] = r
                 if not with_profiles:
                     for k in ("prepfold", "prepfold_null"):
                         for d in (r.get("results", {}).get(k) or []):
@@ -123,13 +146,23 @@ def load(paths, with_profiles=False):
                                 d.pop("prof", None)
                 recs.append(r)
     for pr in patches:
-        base = seen.get(pr["index"])
+        base = seen.get((pr["run"], pr["index"]))
         if base is None:                       # patched a realisation we do not have
             continue
         base.setdefault("results", {}).update(pr.get("results", {}))
         base.setdefault("timing", {}).update(pr.get("timing", {}))
     recs.sort(key=lambda r: r["index"])
     return recs
+
+
+def _tails_to_arrays(d):
+    """Replace one arm's stored false-alarm tails (pooled and per band) with arrays."""
+    f = d.get("false") if isinstance(d, dict) else None
+    if not isinstance(f, dict):
+        return
+    f["top"] = np.asarray(f.get("top") or [], dtype=float)
+    for b in (f.get("bands") or {}).values():
+        b["top"] = np.asarray(b.get("top") or [], dtype=float)
 
 
 def _merge_union(res, name):
@@ -153,7 +186,8 @@ def _merge_union(res, name):
             if h and (best is None or h["stat"] > best["stat"]):
                 best = h
         hits.append(best)
-    top = sorted((v for p in parts for v in p["false"]["top"]), reverse=True)[:1600]
+    top = _desc(np.concatenate([np.asarray(p["false"]["top"], dtype=float)
+                                for p in parts]))[:1600]
     floors = [p["false"]["floor"] for p in parts if p["false"].get("floor") is not None]
     false = dict(n=sum(p["false"]["n"] for p in parts), top=top,
                  truncated=any(p["false"].get("truncated") for p in parts),
@@ -164,13 +198,17 @@ def _merge_union(res, name):
             sub = [p["false"]["bands"][lab] for p in parts if lab in p["false"]["bands"]]
             fl = [b["floor"] for b in sub if b.get("floor") is not None]
             bands[lab] = dict(n=sum(b["n"] for b in sub),
-                              top=sorted((v for b in sub for v in b["top"]),
-                                         reverse=True)[:1600],
+                              top=_desc(np.concatenate(
+                                  [np.asarray(b["top"], dtype=float) for b in sub]))[:1600],
                               truncated=any(b.get("truncated") for b in sub),
                               floor=(min(fl) if fl else None))
         false["bands"] = bands
     return dict(hits=hits, ncand=sum(p["ncand"] for p in parts),
                 ok=all(p.get("ok", True) for p in parts), false=false)
+
+
+def _desc(a):
+    return np.sort(a)[::-1]
 
 
 def rows(recs, dt=None):
@@ -328,7 +366,7 @@ def fa_rates(recs, method, thresholds, empty_only=False, band=None):
                 continue                        # pre-run-3 record: no band split
             tail = (bands.get(band) or {}).get("top", [])
         n += 1
-        if not tail:
+        if not len(tail):
             continue
         top = np.asarray(tail, dtype=float)
         counts += (top[:, None] >= np.asarray(thresholds)[None, :]).sum(axis=0)
@@ -357,7 +395,7 @@ def saturation(recs, method):
     for r in recs:
         res = r["results"]
         d = res.get(method) or (_merge_union(res, method) if method in UNION else None)
-        if not d or not d["false"]["top"]:
+        if not d or not len(d["false"]["top"]):
             continue
         n += 1
         if d["false"].get("truncated"):
@@ -1066,13 +1104,14 @@ def matched_threshold(recs, method, fap, band=None):
                 continue
             tail = (bands.get(band) or {}).get("top", [])
         n += 1
-        vals.extend(tail)
+        vals.append(np.asarray(tail, dtype=float))
     if not n:
         return float("nan"), 0, 0
+    vals = np.concatenate(vals)
     k = max(1, int(round(fap * n)))
     if len(vals) < k:
         return float("-inf"), n, len(vals)
-    v = np.partition(np.asarray(vals, dtype=float), -k)[-k:]
+    v = np.partition(vals, -k)[-k:]
     return float(v.min()), n, len(vals)
 
 
