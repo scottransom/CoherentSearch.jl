@@ -193,6 +193,17 @@ the 2x2 is paid for out of the questions run 2 closed.
   paired degradation against f0, S/N(50%) vs knee, the false-alarm tail per
   knee bin (ours flat, rseek's not), detection vs f0 per knee bin, the hit
   offset distributions that expose the coincidences, and the drawn population.
+* **prepfold's matched cut is drizzle-corrected, like its statistic.** Its
+  threshold comes from the null folds and was read off **raw** `snr1` while
+  every value compared against it is corrected in `rows()` — so prepfold was
+  held to a cut up to ~12% too high wherever the correction bites (the MSP
+  band, where it is 0.83–0.89 and where prepfold is the *ceiling* column
+  everything else is measured against). That biased prepfold's own column low,
+  which is the direction that flatters us, and it was in run 2's numbers too.
+  Fixed 2026-09-11: `_null_snr1` corrects each null fold by its own
+  `(nbins, dt_per_bin, w)`, memoised on exact arguments so the cut and the
+  statistic are corrected identically. **prepfold columns move up slightly
+  against anything quoted before that date.**
 * **The `sigma_warn` row is NOT a red-noise diagnostic** — it was read as one
   once. It fires only on `coherent_tier`, at a rate flat in knee, and fires the
   same way on pure white noise: the guard's third sample point is the last

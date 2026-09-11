@@ -55,6 +55,7 @@ WHAT THIS DOES NOT DO IMPLICITLY, and why (each of these was a wrong answer once
 from __future__ import annotations
 
 import argparse
+import functools
 import glob
 import json
 import math
@@ -274,7 +275,7 @@ def rows(recs, dt=None, hit_tol=None):
                 s1 = pf.get("snr1")
                 row["prepfold_snr1_raw"] = s1
                 row["prepfold_snr1"] = (
-                    s1 * MM.drizzle_boxcar_corr(nb, dpb, w)
+                    s1 * _drizzle_corr(nb, dpb, w)
                     if (s1 is not None and nb and dpb and w) else s1)
                 row["prepfold_ducy"] = pf.get("ducy")
             valid = {}
@@ -1172,7 +1173,10 @@ def prepfold_null_thresholds(recs, labs, fap):
                 if lo <= f0 < hi:
                     for key, col in (("chi2_sigma", "prepfold_chi2"),
                                      ("snr1", "prepfold_snr1")):
-                        v = d.get(key)
+                        # `snr1` drizzle-corrected per fold, exactly as the
+                        # injected folds are: the cut and the statistic it is
+                        # compared against must be the same quantity.
+                        v = _null_snr1(d) if key == "snr1" else d.get(key)
                         if v is not None and np.isfinite(v):
                             per_band[lab].append((col, v))
                     break
@@ -1351,8 +1355,44 @@ def _tmin(t):
     return t
 
 
+@functools.lru_cache(maxsize=1 << 20)
+def _drizzle_corr(nbins, dt_per_bin, w):
+    """`MM.drizzle_boxcar_corr`, memoised on its EXACT arguments.
+
+    Exact, not quantised: the same correction has to be applied to prepfold's
+    null folds (which set its threshold) and to its injected folds (the
+    statistic compared against that threshold), and rounding the two differently
+    would put the mismatch straight back.  The cache matters because the report
+    asks for eight false-alarm rates and re-corrects the same null folds for
+    each.
+    """
+    return MM.drizzle_boxcar_corr(nbins, dt_per_bin, w)
+
+
+def _null_snr1(d):
+    """A null fold's `snr1`, drizzle-corrected the way `rows()` corrects the
+    injected folds.
+
+    Without this the cut was read off RAW `snr1` and applied to corrected
+    values, so prepfold was held to a threshold up to ~12% too high wherever the
+    correction bites -- the MSP band, where the correction is 0.83-0.89 and where
+    prepfold is the ceiling column everything else is measured against.  It
+    biased prepfold's own column low, which is the flattering direction for us,
+    and it was in run 2's numbers too.
+    """
+    v = (d or {}).get("snr1")
+    nb, dpb, w = d.get("nbins"), d.get("dt_per_bin"), d.get("w")
+    if v is None or not (nb and dpb and w):
+        return v
+    return v * _drizzle_corr(nb, dpb, w)
+
+
 def prepfold_nulls(recs):
-    """prepfold's null statistics from the injection-free realisations' folds."""
+    """prepfold's null statistics from the injection-free realisations' folds.
+
+    `snr1` is drizzle-corrected per fold (see `_null_snr1`); `chi2_sigma` is
+    prepfold's own chi-squared and takes no such correction.
+    """
     nulls, nreal = defaultdict(list), 0
     for r in recs:
         pn = r["results"].get("prepfold_null")
@@ -1361,7 +1401,7 @@ def prepfold_nulls(recs):
         nreal += 1
         for d in pn:
             for k, col in (("chi2_sigma", "prepfold_chi2"), ("snr1", "prepfold_snr1")):
-                v = (d or {}).get(k)
+                v = _null_snr1(d) if k == "snr1" else (d or {}).get(k)
                 if v is not None and np.isfinite(v):
                     nulls[col].append(v)
     return nulls, nreal
