@@ -1647,7 +1647,12 @@ def sec_paired(rws, thr, args, rng):
         return
     bad = sum(1 for w, r in pairs
               if abs(w["f0"] - r["f0"]) > 1e-12 or abs(w["snr"] - r["snr"]) > 1e-12)
-    ms = [m for m in present(rws, SNR1_LIKE) if m != "prepfold_snr1"]
+    # EVERY method, not just the snr1-comparable ones: a paired difference
+    # compares a code to ITSELF across the two runs, so the cross-code
+    # comparability that `SNR1_LIKE` exists for is beside the point here.
+    # Restricting it dropped both accelsearch arms, which are the field's
+    # standard and the reason the comparison is interesting at all.
+    ms = present(rws, METHODS)
     print(f"\n--- paired white/red: {len(pairs)} injections present in both runs "
           f"({len(red)} red rows, {len(white)} white) ---")
     if bad:

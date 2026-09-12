@@ -252,7 +252,7 @@ def red_page(recs, rws, thr, book, args, methods):
     ax = axes[1, 0]
     grid = np.arange(5.0, 40.01, 0.25)
     groups = dict(MA.knee_bins(recs, args.knee_by))
-    for m, ls in ((args.ref, "-"), ("rseek_A", "--")):
+    for m, ls in ((args.ref, "-"), ("rseek_A", "--"), ("accelsearch", ":")):
         for l, c in zip(klabs, KNEE_COLOURS):
             sub = groups.get(l)
             if not sub:
@@ -264,7 +264,8 @@ def red_page(recs, rws, thr, book, args, methods):
     ax.axhline(args.fap, color="k", ls=":", lw=1)
     ax.set_xlabel("statistic cut")
     ax.set_ylabel("false alarms / realisation")
-    ax.set_title(f"false-alarm tail per knee bin ({args.ref} solid, rseek_A dashed)")
+    ax.set_title(f"false-alarm tail per knee bin ({args.ref} solid, rseek_A dashed,\n"
+                 "accelsearch dotted)")
     ax.legend(fontsize=5, ncol=2)
     ax.grid(alpha=0.25)
 
@@ -291,14 +292,21 @@ def red_page(recs, rws, thr, book, args, methods):
     tol = np.median([r["tol_bins"] for r in rws if r.get("tol_bins")]) \
         if any(r.get("tol_bins") for r in rws) else 3.0
     bins = np.linspace(0, tol, 40)
-    for m, ls in ((args.ref, "-"), ("rseek_A", "--")):
-        for l, c in ((red_labs[0], "#2166ac"), (red_labs[-1], "#b2182b")) if red_labs else ():
-            v = np.array([r[m + "_off"] for r in rws
-                          if r.get(m + "_off") is not None
-                          and MA.knee_label(r, args.knee_by) == l], dtype=float)
-            if len(v) > 50:
-                ax.hist(np.clip(v, 0, tol), bins=bins, histtype="step", ls=ls,
-                        color=c, lw=1.3, density=True, label=f"{m} knee {l}")
+    # The worst knee bin for each code that floods, plus the reference code at the
+    # quietest bin to show what a clean offset distribution looks like.
+    series = []
+    if red_labs:
+        hi, lo = red_labs[-1], red_labs[0]
+        series = [(args.ref, hi, "-", 1.0), ("rseek_A", hi, "--", 1.0),
+                  ("accelsearch", hi, ":", 1.0), (args.ref, lo, "-", 0.4)]
+    for m, l, ls, al in series:
+        v = np.array([r[m + "_off"] for r in rws
+                      if r.get(m + "_off") is not None
+                      and MA.knee_label(r, args.knee_by) == l], dtype=float)
+        if len(v) > 50:
+            ax.hist(np.clip(v, 0, tol), bins=bins, histtype="step", ls=ls,
+                    color=COLOURS.get(m), lw=1.3, alpha=al, density=True,
+                    label=f"{m} knee {l}")
     ax.axvline(args.hit_tol, color="k", lw=1.2, ls=":")
     ax.set_yscale("log")
     ax.set_xlabel("hit offset from target (Fourier bins)")
