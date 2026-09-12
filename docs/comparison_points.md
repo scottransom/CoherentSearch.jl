@@ -162,9 +162,20 @@ beside its 41.6% vs our 76.3%.
   Read `knee`, `band` and `paired`.
 * **`coherent_tier` is scored outside its own band** in the pooled and S50
   panels — it searches below 5 Hz only, so at high knee it is charged for
-  injections it never covered (its S/N(50%) curve rises to ~10 then falls,
-  which is that artifact, not sensitivity). Restrict it to its band for any
-  figure.
+  injections it never covered. Restrict it to its band for any figure.
+* **S/N(50%) is only reported where the data bracket 50%.** A logistic fit to a
+  code whose detection never reaches half across the injected 5.5–11.5 band is
+  unconstrained and will still return a number inside that range: accelsearch
+  read 10.0 at knee 6–15 and then **7.57** at 15–50, i.e. sensitivity improving
+  as the noise worsened, and `coherent_tier` did the same outside its band.
+  `_logistic_s50` now requires a measured S/N bin below 50% and one at or above
+  it, and blanks the cell otherwise. **A blank there means "this code does not
+  reach 50% detection in this cell", which is itself the result** — not missing
+  data. With the guard, accelsearch's per-knee S/N(50%) is monotone as it must
+  be — **9.12 / 9.23 / 9.49 / 9.94 / 10.54** over knee 0.1–0.5 … 15–50 (9.49 on
+  white), at 41% falling to 27% detection — and the cells that blank are
+  `accelsearch_red` and `coherent_tier` at knee 15–50 (24% and 22% detection)
+  and `rseek_A` everywhere above 0.5 Hz (0%).
 * **`prepfold_chi2` has a cut of 0.00 in at least one cell.** `chi2_sigma`
   floors at zero on noise folds, so there every candidate clears the cut and
   the column is degenerate. `prepfold_snr1` is the comparable column.

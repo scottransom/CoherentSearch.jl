@@ -2009,6 +2009,20 @@ def _logistic_s50(rws, m, t, iters=25):
     y = (np.nan_to_num(v, nan=-1e9) >= t).astype(float)
     if y.sum() < 10 or y.sum() > len(y) - 10:
         return float("nan"), float("nan")
+    # The fit must be CONSTRAINED ON BOTH SIDES of 50% by measured points.  With
+    # detection stuck below half across the whole injected band the logistic is
+    # free to put its midpoint anywhere, and it did: accelsearch read S/N(50%)
+    # 10.0 at knee 6-15 and then 7.57 at 15-50 -- sensitivity IMPROVING as the
+    # noise got worse.  The range check below is not enough, because such a
+    # midpoint can still land inside 5.5-11.5.  `coherent_tier` did the same
+    # where it is scored outside its own 5 Hz band.
+    seen = []
+    for a, b in zip(BINS["snr"][:-1], BINS["snr"][1:]):
+        sel = (x >= a) & (x < b)
+        if sel.sum() >= 20:
+            seen.append(float(np.average(y[sel], weights=w[sel])))
+    if not seen or min(seen) >= 0.5 or max(seen) < 0.5:
+        return float("nan"), float("nan")
     X = np.column_stack([np.ones_like(x), x])
     beta = np.array([-8.0, 1.0])
     for _ in range(iters):
