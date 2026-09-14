@@ -365,11 +365,12 @@ All three had the same shape: a number that looked measured and was not.
    runners-up and the analysis takes the best candidate that is close enough;
    and **`rseek_W`**, riptide on a PRESTO-whitened time series with its own
    running median switched off, which turns §11's n = 1 check into a measurement.
-   `--arms rseek,rseekw,coherent` costs ~80 s a realisation on eiger against
-   ~146 for the full set (measured: `rseek_A` 39.5 s + `rseek_W` 40.3 +
-   `coherent` 27.2 + `coherent_tier` 7.6 + ~8 shared on fitzroy, which runs these
-   arms 1.5–1.7x slower), so 15 workers give **~16k realisations a day** —
-   ~96k injections, enough for ±0.5% per band cell. See `mc/README.md`.
+   Measured on eiger at 15 workers: **92.1 s a realisation** for
+   `rseek,rseekw,coherent`, and ~107 s with `accel` and `rseek_B` added so that
+   every cell of the band-matched white row is filled — **~12,100 a day, so ~24k
+   realisations (~145k injections) over two days.** Load costs 1.70x against the
+   54.3 s solo figure, and it is contention rather than throttling: the clock
+   *rises* 1572 → 1975 MHz under load. See `mc/README.md`.
 5. **Restrict `coherent_tier`'s curves to its own band in every figure.**
 6. **Decide the headline red-noise figure**: per knee, per band, or both panels
    side by side.

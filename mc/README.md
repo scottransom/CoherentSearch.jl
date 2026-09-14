@@ -17,16 +17,28 @@ $PIXI/python mc/mc_simulate.py --outdir mcout --nreal 100000 --workers 48 \
     --presto-bin $PIXI --rseek $PIXI/rseek --tpa /path/to/table_1.csv
 
 # run 4 (the white top-up): run 2's indices, only the arms that need re-running.
-# MEASURED on fitzroy: rseek_A 39.5 s + rseek_W 40.3 + coherent 27.2 +
-# coherent_tier 7.6 + ~8 shared = ~123 s, so ~80 s on eiger (which is 1.5-1.7x
-# faster per arm) against ~146 for `all`.  15 workers => ~16k realisations a day.
-# Add `accel` to the arm set (+~2 s) if the band-matched white row should have an
-# accelsearch cell too; it overwrites run 2's accelsearch column with an
-# equivalent re-run, so it is left out by default.
+# MEASURED ON EIGER 2026-09-14, 15 workers, steady state (first-per-worker
+# excluded): 92.1 s a realisation for `rseek,rseekw,coherent` => 0.163/s =>
+# 14,100 a day.  Solo it is 54.3 s, so load costs 1.70x -- and that is CONTENTION,
+# not throttling: the clock RISES 1572 -> 1975 MHz under load, because idle cores
+# sit in low-power states.  Same signature as the 24-vs-15 worker result.
+# `accel` adds ~3 s and rseek_B via --deep-every 10 adds ~12 s, for ~107 s and
+# ~12,100 a day: that is the set that fills EVERY cell of the band-matched white
+# row, and over two days it is ~24k realisations (~145k injections).
+# Two things this needs on the machine it runs on, both of which bite silently:
+#   * run 2's .jsonl files, or --indices-from finds no indices and every worker
+#     exits with "0 realisations" (they are not on eiger by default -- rsync them);
+#   * LD_LIBRARY_PATH, because `accel` imports presto.sifting, which needs
+#     libpresto.so out of the env's lib64/.  Unactivated it is on no loader path
+#     and mc_simulate refuses to start -- see launch_eiger.sh, and run 2's 1.5 days.
+export LD_LIBRARY_PATH="$PIXI/../lib64:/usr/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 $PIXI/python mc/mc_simulate.py --outdir /data1/mc/run4 --workers 15 \
-    --arms rseek,rseekw,coherent --indices-from /data1/mc/run2 \
-    --deep-every 0 --sigma-every 0 --fa-top 4000 --ncands 4000 \
+    --arms accel,rseek,rseekw,coherent --indices-from /data1/mc/run2 \
+    --deep-every 10 --sigma-every 0 --fa-top 4000 --ncands 4000 \
     --presto-bin $PIXI --rseek $PIXI/rseek --tpa /data1/mc/table_1.csv
+# --indices-from takes ALL of run 2's 76,105 indices and ignores --nreal, so the
+# job does not "finish": stop it when the time is up.  Each worker walks its own
+# stride in sorted order, so a partial run is an unbiased subset of run 2.
 
 # the whole report (combining runs is `cat`; this globs *.jsonl)
 $PIXI/python mc/mc_analyze.py mcout/

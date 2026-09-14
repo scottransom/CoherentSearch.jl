@@ -165,11 +165,12 @@ SALT_PROFILES = 3      # --keep-profiles, stored prepfold profiles
 
 # Which searches a pass runs.  `--arms` takes a comma-separated set of these, so
 # a top-up run costs only the arms it needs: run 4 is `rseek,rseekw,coherent`
-# over run 2's white indices, ~80 s a realisation on eiger against ~146 for
-# `all` (measured: rseek_A 39.5 s + rseek_W 40.3 + coherent 27.2 +
-# coherent_tier 7.6 + ~8 shared on fitzroy, which runs these arms 1.5-1.7x
-# slower).  Pass --sigma-every 0 with it: the measured-sigma arms add another
-# ~54 s where they fire, and they are a run-3 question, not a white one.
+# over run 2's white indices.  MEASURED on eiger at 15 workers, steady state:
+# 92.1 s a realisation for `rseek,rseekw,coherent` (54.3 s solo -- load costs
+# 1.70x, and it is contention, not clock: the frequency RISES 1572 -> 1975 MHz
+# under load), against ~146 for `all`.  Pass --sigma-every 0 with it: the
+# measured-sigma arms add ~54 s where they fire and are a run-3 question, not a
+# white one.
 # `all` is every group and is the default, so an ordinary run is unchanged.
 ARM_GROUPS = ("prepfold", "accel", "rseek", "rseekw", "coherent")
 
@@ -1274,7 +1275,7 @@ def main(argv=None):
                          "names: `--arms accel` is the accelsearch repair pass "
                          "(~12 s a realisation against ~146) and "
                          "`--arms rseek,rseekw,coherent` is run 4's white top-up "
-                         "(~80 s on eiger).  The noise is regenerated from the realisation "
+                         "(92 s a realisation on eiger at 15 workers).  The noise is regenerated from the realisation "
                          "index and --master-seed, so it is bit-for-bit the "
                          "original run's -- and --indices-from checks that")
     ap.add_argument("--hits-per-inj", type=int, default=8,
