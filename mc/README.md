@@ -31,11 +31,21 @@ $PIXI/python mc/mc_simulate.py --outdir mcout --nreal 100000 --workers 48 \
 #   * LD_LIBRARY_PATH, because `accel` imports presto.sifting, which needs
 #     libpresto.so out of the env's lib64/.  Unactivated it is on no loader path
 #     and mc_simulate refuses to start -- see launch_eiger.sh, and run 2's 1.5 days.
+#   * and a PATCH MUST BE WRITTEN INTO THE DIRECTORY IT PATCHES.  `load()` keys
+#     records by (directory, index), so a patch sitting in its own directory finds
+#     no parent and is dropped without a word -- `--outdir /data1/mc/run4` would
+#     throw the entire run away at analysis time.  That is why
+#     repair_accel_fitzroy.sh gives the same path to --outdir and --indices-from,
+#     and why run 2 already holds mcpatch_accel_*.jsonl beside its own records.
 export LD_LIBRARY_PATH="$PIXI/../lib64:/usr/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-$PIXI/python mc/mc_simulate.py --outdir /data1/mc/run4 --workers 15 \
+$PIXI/python mc/mc_simulate.py --outdir /data1/mc/run2 --workers 15 \
     --arms accel,rseek,rseekw,coherent --indices-from /data1/mc/run2 \
     --deep-every 10 --sigma-every 0 --fa-top 4000 --ncands 4000 \
     --presto-bin $PIXI --rseek $PIXI/rseek --tpa /data1/mc/table_1.csv
+
+# Analysing on another host afterwards: copy back ONLY the new patch files, into
+# that host's run 2 directory -- same reason as above.
+rsync eiger:'/data1/mc/run2/mcpatch_accel+coherent+rseek+rseekw_*' /data1/mc/run2/
 # --indices-from takes ALL of run 2's 76,105 indices and ignores --nreal, so the
 # job does not "finish": stop it when the time is up.  Each worker walks its own
 # stride in sorted order, so a partial run is an unbiased subset of run 2.
