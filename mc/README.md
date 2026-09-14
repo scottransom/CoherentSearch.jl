@@ -16,6 +16,18 @@ mc/launch_fitzroy.sh /data1/mc/run2
 $PIXI/python mc/mc_simulate.py --outdir mcout --nreal 100000 --workers 48 \
     --presto-bin $PIXI --rseek $PIXI/rseek --tpa /path/to/table_1.csv
 
+# run 4 (the white top-up): run 2's indices, only the arms that need re-running.
+# MEASURED on fitzroy: rseek_A 39.5 s + rseek_W 40.3 + coherent 27.2 +
+# coherent_tier 7.6 + ~8 shared = ~123 s, so ~80 s on eiger (which is 1.5-1.7x
+# faster per arm) against ~146 for `all`.  15 workers => ~16k realisations a day.
+# Add `accel` to the arm set (+~2 s) if the band-matched white row should have an
+# accelsearch cell too; it overwrites run 2's accelsearch column with an
+# equivalent re-run, so it is left out by default.
+$PIXI/python mc/mc_simulate.py --outdir /data1/mc/run4 --workers 15 \
+    --arms rseek,rseekw,coherent --indices-from /data1/mc/run2 \
+    --deep-every 0 --sigma-every 0 --fa-top 4000 --ncands 4000 \
+    --presto-bin $PIXI --rseek $PIXI/rseek --tpa /data1/mc/table_1.csv
+
 # the whole report (combining runs is `cat`; this globs *.jsonl)
 $PIXI/python mc/mc_analyze.py mcout/
 $PIXI/python mc/mc_analyze.py mcout/ --sections roc,pairs,decompose --fap 1e-3
@@ -31,6 +43,49 @@ cut is not a comparison: ours and rseek's statistics are single-trial,
 accelsearch's sigma is already trials-corrected and prepfold's is a chi-squared,
 and run 1 measured the four sitting at 8.10 / 7.95 / 8.05 / **7.05** for the same
 rate. `mc_quicklook.py` still takes `--fap` explicitly and warns without it.
+
+## Run 4: the white top-up, and what it closes
+
+Three gaps in run 2 + run 3 that no re-analysis can close, all fixed by re-running
+a subset rather than the study:
+
+1. **Run 2 stored no per-band false-alarm tails** (the driver gained them part
+   way through run 3), so the per-(knee × band) matching — the fair one for a
+   code whose noise is not stationary across its own candidate list — has **no
+   white zero point**. Re-running run 2's indices records them.
+2. **Only the best hit per injection was stored**, so a junk candidate at the
+   fundamental ratio displaced the real one and `--hit-tol` could reject it but
+   never put the detection back. `--hits-per-inj` (default 8) records the
+   runners-up, and `mc_analyze` then takes the best candidate that is actually
+   close enough. On run 3 that bound reached **80% of `rseek_A`'s detections**
+   at the worst knee.
+3. **No whitened-riptide arm.** `rseek_W` searches a time series we whitened in
+   the Fourier domain (`realfft` → `rednoise` → `realfft -inv`), which separates
+   riptide's *preprocessing* from its *FFA* with an `n` behind it instead of the
+   one-off check in `docs/comparison_points.md` §11.
+
+**`--arms` takes a comma-separated set** (`all`, `prepfold`, `accel`, `rseek`,
+`rseekw`, `coherent`). Anything but `all` writes PATCH records that
+`mc_analyze.load` merges into the full ones by index — and a patch **overwrites**
+the arm it re-ran, which is the point: it is how run 2's white records acquire
+their missing band tails. Only the arms' own timings are copied, never the shared
+`generate`/`realfft`/`rednoise` ones, so a top-up on a different machine cannot
+rewrite the original run's cost column.
+
+**The population arguments must match the run being patched** — `--indices-from`
+regenerates each realisation and aborts if the injected frequencies differ, which
+is the guard that makes a top-up safe rather than merely convenient.
+
+**`rseek_W` needs riptide's own dereddening OFF**, or it high-passes the data a
+second time and the arm measures two cleanings instead of one. `rseek`'s CLI does
+not expose `ffa_search(deredden=False)`, so `rseek_nodered.py` rebinds it and
+calls riptide's own `run_program`; the peak finding, clustering and printed table
+are riptide's code untouched. It deliberately does **not** patch the installed
+riptide, which is a site-packages copy rather than an editable install of
+`../riptide`: editing that checkout would either do nothing or, once reinstalled,
+change the binary `rseek_A` and `rseek_B` are being measured with, mid-study.
+Normalisation is kept — only the running median is skipped. Verified on a 3σ
+8-second wander: stock `rseek` reports S/N 301, the shim 608.
 
 ## The pieces
 

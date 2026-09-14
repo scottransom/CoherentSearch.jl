@@ -358,18 +358,18 @@ All three had the same shape: a number that looked measured and was not.
 1. **Re-run the analysis on the completed run 3** (`go3.sh` → `report_v4_*`).
    Signs and orderings will not move; precision and the per-(knee × band)
    `prepfold` cells will.
-2. **White realisations with per-band tails.** The only gap the analysis cannot
-   close on existing data: without them the band-matched comparison has no white
-   zero point (§4). Re-running run 2's indices with `--indices-from`, rseek and
-   coherent only, is ~37 s per realisation — about 14 h for 20k on eiger. Needs
-   a small `--arms` addition to the driver.
-3. **Store every hit per injection, not just the best.** This is what bounds
-   §5's `displaced` row, which reaches 80% of `rseek_A`'s detections at the
-   worst knee. Until then, riptide's band-matched numbers carry an uncertainty
-   that no re-analysis can remove.
-4. **An rseek arm on PRESTO-whitened input.** The clean separation of
-   "preprocessing" from "algorithm", currently resting on the n = 1 check above.
-   Worth it if a referee is likely to ask whether the FFA itself is the problem.
+2–4. **Run 4 — implemented 2026-09-14, waiting to be launched.** One pass over
+   run 2's white indices closes all three of the gaps that no re-analysis can:
+   the missing **per-band tails** on the white side (§4's absent zero point); the
+   **displaced-hit** bound of §5, now that `--hits-per-inj` records the
+   runners-up and the analysis takes the best candidate that is close enough;
+   and **`rseek_W`**, riptide on a PRESTO-whitened time series with its own
+   running median switched off, which turns §11's n = 1 check into a measurement.
+   `--arms rseek,rseekw,coherent` costs ~80 s a realisation on eiger against
+   ~146 for the full set (measured: `rseek_A` 39.5 s + `rseek_W` 40.3 +
+   `coherent` 27.2 + `coherent_tier` 7.6 + ~8 shared on fitzroy, which runs these
+   arms 1.5–1.7x slower), so 15 workers give **~16k realisations a day** —
+   ~96k injections, enough for ±0.5% per band cell. See `mc/README.md`.
 5. **Restrict `coherent_tier`'s curves to its own band in every figure.**
 6. **Decide the headline red-noise figure**: per knee, per band, or both panels
    side by side.

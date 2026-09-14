@@ -163,6 +163,41 @@ SALT_DEEP = 1          # --deep-every, the rseek deep tiling
 SALT_COH = 2           # --sigma-every / --deep-coh-every, the coherent subsets
 SALT_PROFILES = 3      # --keep-profiles, stored prepfold profiles
 
+# Which searches a pass runs.  `--arms` takes a comma-separated set of these, so
+# a top-up run costs only the arms it needs: run 4 is `rseek,rseekw,coherent`
+# over run 2's white indices, ~80 s a realisation on eiger against ~146 for
+# `all` (measured: rseek_A 39.5 s + rseek_W 40.3 + coherent 27.2 +
+# coherent_tier 7.6 + ~8 shared on fitzroy, which runs these arms 1.5-1.7x
+# slower).  Pass --sigma-every 0 with it: the measured-sigma arms add another
+# ~54 s where they fire, and they are a run-3 question, not a white one.
+# `all` is every group and is the default, so an ordinary run is unchanged.
+ARM_GROUPS = ("prepfold", "accel", "rseek", "rseekw", "coherent")
+
+
+def parse_arms(spec):
+    """`--arms` -> the set of groups to run.  `all` means every group."""
+    if spec == "all":
+        return set(ARM_GROUPS)
+    out = set()
+    for tok in spec.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if tok == "all":
+            out |= set(ARM_GROUPS)
+        elif tok in ARM_GROUPS:
+            out.add(tok)
+        else:
+            raise SystemExit(f"--arms: unknown group {tok!r}; "
+                             f"choose from {('all',) + ARM_GROUPS}")
+    if not out:
+        raise SystemExit("--arms: no groups selected")
+    return out
+
+
+def _want(args, group):
+    return group in (getattr(args, "armset", None) or set(ARM_GROUPS))
+
 RSEEK_A = dict(Pmin=1.0 / (COH_HIFREQ * COH_MAXDECIM), Pmax=10.0, bmin=20, bmax=120)
 # riptide-at-its-best: narrow bins ranges where periods are long, but a WIDE one
 # at the short end -- a literal pipeline-style tiling there pins b near 22 and is
@@ -443,30 +478,51 @@ def harmonic_label(fc, f0, T, tol_bins, nmax=8):
     return None
 
 
-def score(cands, injections, T, tol_bins):
+def score(cands, injections, T, tol_bins, keep=0):
     """Best match per injection, plus the false-alarm count.
 
     A candidate is a false alarm only if it matches NO injection at any simple
     harmonic ratio -- otherwise every real detection's own 2f and f/2 entries
     (which rseek and accelsearch do not collapse and we do) would be counted as
     false positives, which would be nonsense.
+
+    **`keep` is what closes run 3's one irreducible caveat.**  Storing only the
+    BEST match per injection means a junk candidate sitting at the fundamental
+    ratio -- red noise at a slow period, inside the 3-bin tolerance of a
+    SUBHARMONIC -- displaces the real hit, and the analysis then has no way to
+    tell "this code missed it" from "this code found it and we recorded the
+    junk".  `mc_analyze`'s `--hit-tol` rejects the junk but cannot put the real
+    hit back, so the `displaced` row could only ever BOUND the damage: on run 3
+    it reached 80% of `rseek_A`'s detections at the worst knee.  With `keep > 0`
+    the next `keep` matches are recorded beside the best one as `others`, and
+    the analysis can pick the best candidate that is actually close enough.
+
+    They go INSIDE the hit dict rather than in a parallel list, so every existing
+    reader of `hits` keeps working unchanged.
     """
     hits = []
     claimed = set()
     for inj in injections:
-        best, best_lab = None, None
+        matched = []
         for i, c in enumerate(cands):
             lab = harmonic_label(c.freq, inj["f0"], T, tol_bins)
             if lab is None:
                 continue
             claimed.add(i)
             # Prefer the fundamental over a harmonic, then the strongest.
-            key = (lab != "1", -c.stat)
-            if best is None or key < (best_lab != "1", -best.stat):
-                best, best_lab = c, lab
-        hits.append(None if best is None else
-                    dict(stat=best.stat, freq=best.freq, ducy=best.ducy,
-                         harmonic=best_lab, **best.extra))
+            matched.append(((lab != "1", -c.stat), c, lab))
+        if not matched:
+            hits.append(None)
+            continue
+        matched.sort(key=lambda m: m[0])
+        _, best, best_lab = matched[0]
+        h = dict(stat=best.stat, freq=best.freq, ducy=best.ducy,
+                 harmonic=best_lab, **best.extra)
+        if keep and len(matched) > 1:
+            h["others"] = [dict(stat=c.stat, freq=c.freq, ducy=c.ducy,
+                                harmonic=lab, **c.extra)
+                           for _, c, lab in matched[1:keep + 1]]
+        hits.append(h)
     fa = [c for i, c in enumerate(cands) if i not in claimed]
     return hits, fa
 
@@ -759,6 +815,8 @@ def realisation(idx, args, pop, tools, seedseq):
                            threshold=args.threshold, trials=tools.get("trials"),
                            strat=args.strat, fa_bands=list(FA_BAND_EDGES),
                            fa_top=args.fa_top, ncands=args.ncands,
+                           arms=sorted(getattr(args, "armset", ARM_GROUPS)),
+                           hits_per_inj=args.hits_per_inj,
                            reporting_floor=args.threshold,
                            rednoise=(list(args.rednoise_knee) if args.rednoise_knee
                                      else args.rednoise),
@@ -870,7 +928,8 @@ def _search_all(rec, draws, null_draws, stem, args, tools, T, keep_prof=False):
     # MEASURED null, so prepfold can join the FAP-matched table as a proper
     # ceiling instead of sitting beside it at a nominal cut that means nothing.
     pf, t_pf = [], 0.0
-    for i, d in enumerate(() if args.arms != "all" else (draws if draws else null_draws)):
+    for i, d in enumerate((draws if draws else null_draws)
+                          if _want(args, "prepfold") else ()):
         o = f"{stem}_pf{i}"
         cmd = [tools["prepfold"], "-f", repr(d["f0"]), "-nosearch", "-fine",
                "-noxwin", "-nopdsearch", "-o", os.path.basename(o)]
@@ -887,7 +946,7 @@ def _search_all(rec, draws, null_draws, stem, args, tools, T, keep_prof=False):
             continue
         sig, prof = read_bestprof(best[0])
         pf.append(score_bestprof(sig, prof, d["f0"], args, keep_profile=keep_prof))
-    if args.arms == "all":
+    if _want(args, "prepfold"):
         rec["timing"]["prepfold"] = t_pf
         # Targeted: no false-alarm column of its own, so the empty realisations'
         # folds are filed separately -- `mc_analyze` reads them as prepfold's null.
@@ -903,33 +962,53 @@ def _search_all(rec, draws, null_draws, stem, args, tools, T, keep_prof=False):
     # name.
     for name, src in (("accelsearch", base + ".fft"),
                       ("accelsearch_red", base + "_red.fft")):
+        if not _want(args, "accel"):
+            continue
         if name == "accelsearch_red" and not args.accel_red:
             continue
         t, _, _, rc = run([tools["accelsearch"], "-numharm", "16", "-zmax", "0",
                            "-sigma", str(args.accel_sigma), src], cwd=wd)
         rec["timing"][name] = t
         ac = parse_accel(os.path.join(wd, src[:-4] + "_ACCEL_0"))
-        hits, fa = score(ac, inj, T, tol)
+        hits, fa = score(ac, inj, T, tol, keep=args.hits_per_inj)
         rec["results"][name] = dict(hits=hits, false=fa_summary(fa, args.fa_top), ncand=len(ac),
                                     ok=(rc == 0))
 
-    if args.arms != "all":            # accelsearch-only repair pass; see --arms
-        return
-
     # --- rseek, config A ----------------------------------------------------
-    def rseek(cfg):
-        return run([tools["rseek"], "--Pmin", repr(cfg["Pmin"]), "--Pmax", repr(cfg["Pmax"]),
-                    "--bmin", str(cfg["bmin"]), "--bmax", str(cfg["bmax"]),
-                    "--smin", str(args.rseek_smin), "-f", "presto", base + ".inf"], cwd=wd)
-    t, out, _, rc = rseek(RSEEK_A)
-    rec["timing"]["rseek_A"] = t
-    rs = parse_rseek(out) if rc == 0 else []
-    hits, fa = score(rs, inj, T, tol)
-    rec["results"]["rseek_A"] = dict(hits=hits, false=fa_summary(fa, args.fa_top), ncand=len(rs),
-                                     ok=(rc == 0))
+    def rseek(cfg, inf=None, tool="rseek"):
+        cmd = ([tools[tool]] if tool == "rseek" else
+               [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                             "rseek_nodered.py")])
+        return run(cmd + ["--Pmin", repr(cfg["Pmin"]), "--Pmax", repr(cfg["Pmax"]),
+                          "--bmin", str(cfg["bmin"]), "--bmax", str(cfg["bmax"]),
+                          "--smin", str(args.rseek_smin), "-f", "presto",
+                          inf or (base + ".inf")], cwd=wd)
+    if _want(args, "rseek"):
+        t, out, _, rc = rseek(RSEEK_A)
+        rec["timing"]["rseek_A"] = t
+        rs = parse_rseek(out) if rc == 0 else []
+        hits, fa = score(rs, inj, T, tol, keep=args.hits_per_inj)
+        rec["results"]["rseek_A"] = dict(hits=hits, false=fa_summary(fa, args.fa_top),
+                                         ncand=len(rs), ok=(rc == 0))
+
+    # --- rseek on the PRESTO-WHITENED time series ---------------------------
+    # The arm that separates riptide's PREPROCESSING from its FFA.  `rednoise`
+    # has already whitened the spectrum, so `realfft -inv` gives back a time
+    # series with the same red noise removed the way WE remove it; riptide's own
+    # running median is then switched off (see `rseek_nodered.py`), because
+    # leaving it on would high-pass the data a second time and measure two
+    # cleanings rather than one.  Its own false-alarm tail, like every other arm.
+    if _want(args, "rseekw"):
+        t_inv, _, _, rc_inv = run([tools["realfft"], "-inv", base + "_red.fft"], cwd=wd)
+        t, out, _, rc = rseek(RSEEK_A, inf=base + "_red.inf", tool="nodered")
+        rec["timing"]["rseek_W"] = t + t_inv
+        rw = parse_rseek(out) if (rc == 0 and rc_inv == 0) else []
+        hits, fa = score(rw, inj, T, tol, keep=args.hits_per_inj)
+        rec["results"]["rseek_W"] = dict(hits=hits, false=fa_summary(fa, args.fa_top),
+                                         ncand=len(rw), ok=(rc == 0 and rc_inv == 0))
 
     # --- rseek, deep tiling, on a subset ------------------------------------
-    if one_in(rec["index"], args.deep_every, salt=SALT_DEEP):
+    if _want(args, "rseek") and one_in(rec["index"], args.deep_every, salt=SALT_DEEP):
         allc, tt, ok = [], 0.0, True
         for cfg in RSEEK_B:
             t, out, _, rc = rseek(cfg)
@@ -937,7 +1016,7 @@ def _search_all(rec, draws, null_draws, stem, args, tools, T, keep_prof=False):
             ok &= (rc == 0)
             allc += parse_rseek(out) if rc == 0 else []
         rec["timing"]["rseek_B"] = tt
-        hits, fa = score(allc, inj, T, tol)
+        hits, fa = score(allc, inj, T, tol, keep=args.hits_per_inj)
         rec["results"]["rseek_B"] = dict(hits=hits, false=fa_summary(fa, args.fa_top),
                                          ncand=len(allc), ok=ok)
         rec["config"]["rseek_B"] = RSEEK_B
@@ -948,7 +1027,7 @@ def _search_all(rec, draws, null_draws, stem, args, tools, T, keep_prof=False):
     # deeper configuration pays for its own trials instead of being handed the
     # default arm's threshold.  The ~2 s of Julia start-up per arm is ~4% of a
     # realisation and buys a threshold that is measured rather than assumed.
-    for name, cfg in COH_ARMS.items():
+    for name, cfg in (COH_ARMS.items() if _want(args, "coherent") else ()):
         if name == "coherent_deep":
             every = args.deep_coh_every
         elif name in SIGMA_ARMS:
@@ -968,7 +1047,7 @@ def _search_all(rec, draws, null_draws, stem, args, tools, T, keep_prof=False):
         t, _, err, rc = run(cmd)
         rec["timing"][name] = t
         ch = parse_cohout(out_f) if rc == 0 else []
-        hits, fa = score(ch, inj, T, tol)
+        hits, fa = score(ch, inj, T, tol, keep=args.hits_per_inj)
         rec["results"][name] = dict(hits=hits, false=fa_summary(fa, args.fa_top), ncand=len(ch),
                                     ok=(rc == 0))
         # `--sigma analytic` on an un-whitened file inflates every S/N, and the
@@ -1187,15 +1266,24 @@ def main(argv=None):
     ap.add_argument("--fa-top", type=int, default=800,
                     help="false-alarm statistics stored per code per realisation")
     ap.add_argument("--accel-sigma", type=float, default=1.0)
-    ap.add_argument("--arms", choices=("all", "accel"), default="all",
-                    help="which searches to run.  'accel' is the REPAIR pass: it "
-                         "regenerates the noise (which depends only on the "
-                         "realisation index and --master-seed, so it is bit-for-bit "
-                         "the original) and runs ONLY the two accelsearch arms, "
-                         "writing patch records that `mc_analyze` merges into the "
-                         "full ones by index.  ~12 s a realisation against ~137, "
-                         "which is what makes repairing a bad accelsearch column "
-                         "cheaper than re-running the study")
+    ap.add_argument("--arms", default="all",
+                    help="comma-separated set of search groups to run: all, "
+                         + ", ".join(ARM_GROUPS) + ".  A pass that is not `all` "
+                         "writes PATCH records that `mc_analyze` merges into the "
+                         "full ones by index, so a top-up costs only the arms it "
+                         "names: `--arms accel` is the accelsearch repair pass "
+                         "(~12 s a realisation against ~146) and "
+                         "`--arms rseek,rseekw,coherent` is run 4's white top-up "
+                         "(~80 s on eiger).  The noise is regenerated from the realisation "
+                         "index and --master-seed, so it is bit-for-bit the "
+                         "original run's -- and --indices-from checks that")
+    ap.add_argument("--hits-per-inj", type=int, default=8,
+                    help="record this many runner-up candidates per injection "
+                         "beside the best one.  A junk candidate at the "
+                         "fundamental ratio DISPLACES the real hit, and with only "
+                         "the best stored the analysis can bound that but never "
+                         "undo it (run 3: up to 80%% of rseek_A's detections at "
+                         "the worst knee).  0 reproduces run 3's storage")
     ap.add_argument("--indices-from", nargs="+", default=None, metavar="PATH",
                     help="take the realisation indices from these .jsonl files or "
                          "directories instead of from --start/--nreal, and CHECK "
@@ -1215,6 +1303,7 @@ def main(argv=None):
     ap.add_argument("--presto-bin", default=None, help="directory holding realfft/rednoise/prepfold/accelsearch")
     ap.add_argument("--rseek", default=None)
     args = ap.parse_args(argv)
+    args.armset = parse_arms(args.arms)
 
     os.makedirs(args.outdir, exist_ok=True)
     # Once, in the PARENT, before any worker starts: it is a property of the
@@ -1269,8 +1358,9 @@ def main(argv=None):
     # Before anything else: the accelsearch arms are scored through
     # `presto.sifting`, and an environment where it does not import produces a
     # perfect-looking run in which both of them detect nothing.  See
-    # `check_presto_python`.
-    check_presto_python()
+    # `check_presto_python`.  A pass that does not run them does not need it.
+    if _want(args, "accel"):
+        check_presto_python()
 
     extra = [args.presto_bin] if args.presto_bin else []
     tools = dict(julia=args.julia,
@@ -1308,7 +1398,8 @@ def main(argv=None):
     # main run may still be appending to those, and a patch is a different kind
     # of row.  `mc_analyze.load` merges them back by index.
     src = load_indices(args.indices_from) if args.indices_from else None
-    stem_out = "mc" if args.arms == "all" else f"mcpatch_{args.arms}"
+    stem_out = ("mc" if args.armset == set(ARM_GROUPS)
+                else "mcpatch_" + "+".join(sorted(args.armset)))
     outfile = os.path.join(args.outdir,
                            f"{stem_out}_{os.uname().nodename}_{args.worker:03d}.jsonl")
     done = set()
@@ -1356,13 +1447,19 @@ def main(argv=None):
                             "--injections, --noise-every, --snr-range, --strat and "
                             "--tpa to the original run.\n")
                         return 2
-                if args.arms != "all":
+                if args.armset != set(ARM_GROUPS):
+                    # Keep only what THIS pass measured.  `load()` lets a patch
+                    # overwrite, which is the point -- it is how run 4 gives run
+                    # 2's white records the per-band false-alarm tails they were
+                    # written without -- but the shared preprocessing timings
+                    # (generate / realfft / rednoise) are re-done here on a
+                    # different machine and would rewrite the original run's cost
+                    # column with this host's numbers.  Arms only.
                     rec = dict(index=idx, host=rec["host"], patch=True,
                                t_start=rec["t_start"], t_end=rec.get("t_end"),
-                               results={k: v for k, v in rec["results"].items()
-                                        if k.startswith("accelsearch")},
+                               results=rec["results"],
                                timing={k: v for k, v in rec["timing"].items()
-                                       if k.startswith("accelsearch")})
+                                       if k in rec["results"]})
                 fh.write(json.dumps(rec) + "\n")
                 print(f"[worker {args.worker}] {n + 1}/{len(idxs)} idx={idx} "
                       f"{time.perf_counter() - t0:.1f}s", flush=True)
@@ -1383,9 +1480,10 @@ def main(argv=None):
                 # empty list on realisation 0 is a broken parser, not a quiet
                 # sky, and is worth stopping for.
                 if n == 0:
-                    dead = [m for m in ("rseek_A", "rseek_B", "accelsearch",
-                                        "accelsearch_red", "coherent",
-                                        "coherent_tier", "coherent_deep")
+                    dead = [m for m in ("rseek_A", "rseek_B", "rseek_W",
+                                        "accelsearch", "accelsearch_red",
+                                        "coherent", "coherent_tier",
+                                        "coherent_deep")
                             if m in rec.get("results", {})
                             and (not rec["results"][m].get("ok", True)
                                  or rec["results"][m].get("ncand", 1) == 0)]

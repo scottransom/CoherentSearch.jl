@@ -75,12 +75,12 @@ import mc_model as MM
 # against the always-on `coherent` (analytic, _red.fft).  There is deliberately no
 # analytic-on-raw arm: that is a usage error, not a configuration.
 METHODS = ("prepfold_chi2", "prepfold_snr1", "accelsearch", "accelsearch_red",
-           "rseek_A", "rseek_B", "coherent", "coherent_tier", "coherent_deep",
-           "coherent_meas", "coherent_rawmeas", "coh+tier")
-SEARCHES = ("accelsearch", "accelsearch_red", "rseek_A", "rseek_B",
+           "rseek_A", "rseek_B", "rseek_W", "coherent", "coherent_tier",
+           "coherent_deep", "coherent_meas", "coherent_rawmeas", "coh+tier")
+SEARCHES = ("accelsearch", "accelsearch_red", "rseek_A", "rseek_B", "rseek_W",
             "coherent", "coherent_tier", "coherent_deep",
             "coherent_meas", "coherent_rawmeas", "coh+tier")
-RECORDED = ("accelsearch", "accelsearch_red", "rseek_A", "rseek_B",
+RECORDED = ("accelsearch", "accelsearch_red", "rseek_A", "rseek_B", "rseek_W",
             "coherent", "coherent_tier", "coherent_deep",
             "coherent_meas", "coherent_rawmeas")
 # The union arm: a candidate list is the two arms' lists concatenated, which is
@@ -88,9 +88,9 @@ RECORDED = ("accelsearch", "accelsearch_red", "rseek_A", "rseek_B",
 UNION = {"coh+tier": ("coherent", "coherent_tier")}
 # Statistics that are the same quantity (riptide's snr1), so their VALUES may be
 # compared and not only their detection fractions.
-SNR1_LIKE = ("prepfold_snr1", "rseek_A", "rseek_B", "coherent", "coherent_tier",
-             "coherent_deep", "coherent_meas", "coherent_rawmeas",
-             "coh+tier")
+SNR1_LIKE = ("prepfold_snr1", "rseek_A", "rseek_B", "rseek_W", "coherent",
+             "coherent_tier", "coherent_deep", "coherent_meas",
+             "coherent_rawmeas", "coh+tier")
 
 BINS = {
     "snr":  [5.5, 6.5, 7.5, 8.5, 9.5, 10.5, 11.5],
@@ -291,7 +291,21 @@ def rows(recs, dt=None, hit_tol=None):
                         # A coincidence, not a detection: kept for the diagnostics
                         # (`sec_hits`), scored as a miss everywhere else.
                         row[m + "_junk"] = h["stat"]
-                        h = None
+                        # ... UNLESS the driver kept the runners-up (`--hits-per-inj`,
+                        # run 4 on).  Then the junk displacing the real hit is
+                        # recoverable rather than merely boundable: take the best
+                        # candidate that IS close enough.  Without this the
+                        # `displaced` row can only say how much damage the cut may
+                        # have done -- 80% of rseek_A's detections at the worst knee.
+                        alt = None
+                        for o in (h.get("others") or []):
+                            oo = _hit_offset(o, inj["f0"], T)
+                            if oo is not None and oo <= hit_tol:
+                                if alt is None or o["stat"] > alt["stat"]:
+                                    alt, row[m + "_off"] = o, oo
+                        h = alt
+                        if alt is not None:
+                            row[m + "_rescued"] = True
                 valid[m] = h
                 row[m] = h["stat"] if h else float("nan")
                 row[m + "_harm"] = h["harmonic"] if h else None

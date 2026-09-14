@@ -533,6 +533,64 @@ def test_missing_cut():
           str(MA.disjoint_pairs(a + b, ["x", "y"])))
 
 
+def test_run4_arms_and_hits():
+    """Run 4's driver changes: arm selection, and keeping the runners-up.
+
+    The second one is what closes run 3's irreducible caveat.  `score()` stored
+    only the BEST match per injection, so a junk candidate sitting at the
+    fundamental ratio -- red noise at a slow period, inside the 3-bin tolerance
+    of a subharmonic -- displaced the real hit, and `--hit-tol` could then only
+    reject the junk, never put the real detection back.  On run 3 that bound
+    reached 80% of `rseek_A`'s detections at the worst knee.
+    """
+    import mc_simulate as MS
+    import mc_analyze as MA
+
+    check("--arms all is every group", MS.parse_arms("all") == set(MS.ARM_GROUPS))
+    check("--arms takes a comma-separated set",
+          MS.parse_arms("rseek,rseekw,coherent") == {"rseek", "rseekw", "coherent"},
+          str(MS.parse_arms("rseek,rseekw,coherent")))
+    check("--arms accel is still the repair pass", MS.parse_arms("accel") == {"accel"})
+    try:
+        MS.parse_arms("rseekW")
+        bad = False
+    except SystemExit:
+        bad = True
+    check("--arms rejects an unknown group instead of running nothing", bad)
+
+    # The real hit is exact and weak; the junk is 2 bins off and strong.  Both
+    # carry the fundamental label, so `score` ranks the junk first -- which is
+    # precisely the run-3 failure.
+    cands = [MS.Cand(10.002, 25.0, 0.10), MS.Cand(10.0, 8.0, 0.05)]
+    inj = [dict(f0=10.0)]
+    hits, _ = MS.score(cands, inj, 1000.0, 3.0, keep=8)
+    h = hits[0]
+    check("score still reports the strongest match as the hit", h["stat"] == 25.0)
+    check("and now records the runner-up in `others`",
+          [o["stat"] for o in h.get("others", [])] == [8.0], str(h.get("others")))
+    check("keep=0 reproduces run 3's storage exactly",
+          "others" not in MS.score(cands, inj, 1000.0, 3.0, keep=0)[0][0])
+
+    rec = _rec(0, hits={"coherent": h})
+    tight = MA.rows([rec], hit_tol=0.5)[0]
+    loose = MA.rows([rec], hit_tol=float("inf"))[0]
+    check("a displaced real hit is RECOVERED, not scored as a miss",
+          tight["coherent"] == 8.0 and tight.get("coherent_rescued") is True,
+          f'stat={tight["coherent"]} off={tight.get("coherent_off")}')
+    check("--hit-tol inf still scores exactly as recorded", loose["coherent"] == 25.0)
+
+    # A hit with no rescuable runner-up must still be a miss.
+    only_junk = dict(h)
+    only_junk["others"] = [dict(stat=6.0, freq=10.004, ducy=0.1, harmonic="1")]
+    r = MA.rows([_rec(1, hits={"coherent": only_junk})], hit_tol=0.5)[0]
+    check("and a runner-up that is ALSO too far away stays a miss",
+          not np.isfinite(r["coherent"]), str(r["coherent"]))
+
+    check("rseek_W is registered everywhere the analysis looks",
+          all("rseek_W" in t for t in (MA.METHODS, MA.SEARCHES, MA.RECORDED,
+                                       MA.SNR1_LIKE)))
+
+
 def test_rednoise():
     """The red-noise generator: the spectrum it claims, and the pairing it promises."""
     import mc_simulate as MS
@@ -637,6 +695,7 @@ if __name__ == "__main__":
     test_hit_scoring()
     test_match_modes()
     test_missing_cut()
+    test_run4_arms_and_hits()
     test_silent_failures()
     test_rednoise()
     print()
