@@ -6,19 +6,26 @@ Section 1 is meant to be readable by someone who has never run a pulsar search;
 everything after it is for us.
 
 **Provenance.** `mc_analyze.py /data1/mc/run2 /data1/mc/run3 --fap 0.1` on
-fitzroy, 2026-09-14, against the eiger run-3 snapshot taken that morning.
-**158,475 realisations / 856,164 injections**: run 2 (white noise, 76,105 —
-complete) plus run 3 (red noise, 82,370), with **411,078 paired injections**.
-Band-matched numbers are the same data with `--match knee,band`. Analysis code
-`87ddc50`; the three defects fixed on 2026-09-14 are listed in §9 and do not
-change any number quoted here.
+fitzroy, 2026-09-14, against the **completed** run 3 (`report_v4_fap0.1.txt`).
+**160,976 realisations / 869,574 injections**: run 2 (white noise, 76,105) plus
+run 3 (red noise, 84,871), with **411,078 paired injections**. Band-matched
+numbers are the same data with `--match knee,band`
+(`report_v4_band_fap0.1.txt`). Analysis code `e0be51d`, i.e. with the three
+defects of §9 fixed.
 
-**Eiger was stopped on 2026-09-14 at 82,370 red realisations of a planned
+**Eiger was stopped on 2026-09-14 at 84,871 red realisations of a planned
 396,000, deliberately.** Going from 43,901 to 82,370 red realisations — a
 factor 1.88 — moved every headline cell by **≤ 0.6 points** and reversed no
-ordering, while finishing the run would have taken ~21 more days. The final
-numbers come from re-running `go3.sh` (`report_v4_*`) on the completed files;
-expect them to move by less than half a point.
+ordering, while finishing the run would have taken ~21 more days. The numbers
+below are the final ones.
+
+**One cell to understand before reading the tables.** `coherent` at knee 15–50
+reads 47.9 here against 48.7 in the snapshot, and that is not sampling: its
+matched cut stepped 6.70 → 6.75, one grid step. Detection is steep in threshold
+at high knee, where the recovered-S/N distribution is compressed against the cut.
+**Per-cell matched cuts quantise these fractions at the 0.05 grid, so ±0.5-point
+jitter between runs is expected in those cells and is not a change in the
+science.**
 
 ---
 
@@ -30,7 +37,7 @@ riptide's fast-folding search recovers 50% and PRESTO's `accelsearch` 42%.
 
 **2. The advantage is biggest for narrow pulses.** Pulsars whose pulse covers
 less than 1% of a rotation are the hardest case, and there the other two codes
-almost vanish: we find 57% of them, riptide 5%, `accelsearch` 2%. For fat pulses
+almost vanish: we find 56% of them, riptide 5%, `accelsearch` 2%. For fat pulses
 (a sixth of a rotation or more) the gap narrows but does not close.
 
 **3. Most of our margin comes from a better-behaved noise tail, not from a
@@ -53,7 +60,7 @@ way its authors intend, and the paper must say so.**
 
 **5. Red noise costs us little, and only at low frequencies.** The pulsar
 brightness we need for a 50% detection rises by a factor of 1.00, 1.00, 1.05,
-1.12, 1.26 as the noise gets worse. Above 100 Hz the loss is exactly zero at
+1.12, 1.27 as the noise gets worse. Above 100 Hz the loss is exactly zero at
 every noise level. Published measurements of the same effect for a real survey
 quote a factor of 1.1–2, so we sit at or below the bottom of that range — as we
 should, because they include radio interference and we model only red noise.
@@ -78,7 +85,7 @@ report is close to the real one, where riptide's is up to ten times too wide for
 the narrowest pulses.
 
 **10. There is still headroom.** `prepfold`, which is *told* the right period
-and so is a ceiling rather than a competitor, reaches 92% where we reach 72% on
+and so is a ceiling rather than a competitor, reaches 93% where we reach 72% on
 the same injections. About two thirds of that gap is the price of not knowing
 the period in advance — the threshold a blind search has to set.
 
@@ -131,10 +138,10 @@ Matched cut at 0.1 false alarms per realisation, per knee bin (Hz):
 
 | | white | 0.1–0.5 | 0.5–2 | 2–6 | 6–15 | 15–50 |
 |---|---|---|---|---|---|---|
-| `coherent` | 6.75 | 6.75 | 6.70 | 6.70 | 6.70 | 6.70 |
+| `coherent` | 6.75 | 6.75 | 6.70 | 6.70 | 6.70 | 6.75 |
 | `accelsearch` | 7.20 | 7.20 | 7.20 | 7.20 | 7.20 | 7.20 |
 | `rseek_A` | 7.55 | 7.55 | 18.85 | 59.50 | 140.00 | **250.00** |
-| `rseek_B` | 7.65 | 7.75 | 14.55 | 35.50 | 92.50 | **205.00** |
+| `rseek_B` | 7.65 | 7.75 | 14.55 | 35.50 | 91.50 | **200.00** |
 
 Ours is flat because we search a PRESTO-whitened FFT; `accelsearch`'s is flat
 because of its own local power normalisation. riptide's climbs by a factor of 33
@@ -147,13 +154,13 @@ Detection fraction, per knee / per (knee × f0 band):
 
 | | white | 0.1–0.5 | 0.5–2 | 2–6 | 6–15 | 15–50 |
 |---|---|---|---|---|---|---|
-| `coherent` | 76.3 | 76.2 / 84.1 | 75.2 / 82.7 | 69.7 / 77.5 | 61.4 / 68.8 | 48.7 / 54.4 |
-| `coh+tier` | 77.6 | 77.5 / 83.9 | 75.7 / 82.4 | 70.4 / 77.4 | 61.9 / 68.8 | 48.9 / 54.4 |
-| `rseek_A` | 50.2 | 50.2 / 71.5 | **0.0** / 65.5 | 0.0 / 54.5 | 0.0 / 50.9 | 0.0 / 36.9 |
-| `rseek_B` | 71.3 | 69.2 / 79.5 | **0.1** / 71.1 | 0.0 / 61.2 | 0.0 / 45.8 | 0.0 / 30.9 |
-| `accelsearch` | 41.6 | 41.3 / 57.7 | 39.6 / 55.2 | 36.3 / 50.8 | 31.9 / 44.6 | 26.3 / 35.2 |
-| `accelsearch_red` | 38.5 | 38.3 / 56.4 | 36.2 / 54.2 | 33.8 / 49.4 | 29.5 / 43.2 | 24.3 / 34.0 |
-| `coherent_tier` | 51.6 | 52.0 / 55.6 | 49.8 / 54.1 | 44.7 / 49.1 | 36.7 / 40.6 | 22.4 / 26.5 |
+| `coherent` | 76.3 | 76.2 / 84.2 | 75.2 / 82.7 | 69.8 / 77.6 | 61.3 / 68.7 | 47.9 / 54.5 |
+| `coh+tier` | 77.6 | 77.5 / 83.9 | 75.7 / 82.4 | 70.5 / 77.4 | 61.9 / 68.7 | 48.9 / 54.4 |
+| `rseek_A` | 50.2 | 50.2 / 71.5 | **0.0** / 65.6 | 0.0 / 55.0 | 0.0 / 50.8 | 0.0 / 36.8 |
+| `rseek_B` | 71.3 | 69.2 / 79.6 | **0.1** / 71.1 | 0.0 / 61.6 | 0.1 / 45.6 | 0.0 / 30.9 |
+| `accelsearch` | 41.6 | 41.3 / 57.7 | 39.6 / 55.2 | 36.4 / 50.9 | 31.9 / 44.6 | 26.3 / 35.3 |
+| `accelsearch_red` | 38.5 | 38.3 / 56.4 | 36.2 / 54.2 | 33.9 / 49.5 | 29.5 / 43.1 | 24.4 / 34.0 |
+| `coherent_tier` | 51.6 | 52.0 / 55.6 | 49.8 / 54.1 | 44.6 / 49.1 | 36.7 / 40.6 | 22.5 / 26.5 |
 
 **Both columns belong in the paper.** Per knee is what a pipeline tuned to one
 observation applies, and it is where riptide goes to zero. Per (knee × band)
@@ -176,10 +183,10 @@ above both under either matching.
 ### Where our margin comes from
 
 The report's counterfactual splits it: scored at *riptide's* threshold we would
-detect 38.3% against its 31.3%, so of the 40.9-point gap, **33.9 points are the
+detect 38.0% against its 31.0%, so of the 41.1-point gap, **34.1 points are the
 threshold** and 7 are the filter. Against `prepfold` the same calculation runs
-the other way: at `prepfold`'s threshold we reach 85.1% against its 91.7%, so
-**12.9 of the 19.5-point gap is the threshold** a blind search must pay.
+the other way: at `prepfold`'s threshold we reach 86.2% against its 92.9%, so
+**14.1 of the 20.8-point gap is the threshold** a blind search must pay.
 
 ---
 
@@ -198,14 +205,20 @@ detects**:
 
 | | white | 0.1–0.5 | 0.5–2 | 2–6 | 6–15 | 15–50 |
 |---|---|---|---|---|---|---|
-| `coherent` | 0.00 | 0.03 | 0.04 | 0.08 | 0.16 | 0.27 |
-| `accelsearch` | 0.01 | 0.29 | 0.35 | 0.40 | 0.50 | 0.66 |
-| `accelsearch_red` | 0.01 | 0.05 | 0.07 | 0.05 | 0.07 | 0.09 |
-| `rseek_A` | 0.03 | 0.31 | 2.45 | 4.38 | 7.21 | **16.00** |
-| `rseek_B` | 0.02 | 0.07 | 0.11 | 0.32 | 0.70 | 1.27 |
+| `coherent` | — | 0.03 | 0.04 | 0.08 | 0.16 | 0.27 |
+| `accelsearch` | — | 0.29 | 0.35 | 0.40 | 0.50 | 0.66 |
+| `accelsearch_red` | — | 0.05 | 0.07 | 0.05 | 0.07 | 0.09 |
+| `rseek_A` | — | 0.31 | 2.44 | 4.34 | 7.22 | **16.01** |
+| `rseek_B` | — | 0.07 | 0.10 | 0.32 | 0.72 | 1.30 |
+
+(White is blank because this matching has no white cut at all — run 2 stored no
+per-band tails, so no detections are scored there. The white result is the
+closing paragraph of this section instead: above every code's matched cut the
+99th-percentile hit offset is 0.15–0.23 bins and the residual is 0.00% for every
+coherent arm.)
 
 **This is the one number that qualifies finding 4's rehabilitation of riptide.**
-Its band-matched 36.9% at the worst knee still carries ~16% chance coincidences;
+Its band-matched 36.8% at the worst knee still carries ~16% chance coincidences;
 ours carries 0.27%. Note also `accelsearch_red` — the de-reddened input — is the
 cleanest arm in the study, the same mechanism as its flat threshold.
 
@@ -232,7 +245,7 @@ and the residual is 0.00% for every coherent arm.
 | 0.5–2 | 6.87 | 1.00x | 1.12 | 1.01 | 0.99 | 0.99 |
 | 2–6 | 7.15 | 1.05x | **1.37** | 1.11 | 1.01 | 0.99 |
 | 6–15 | 7.63 | 1.12x | — | 1.32 | 1.08 | 1.01 |
-| 15–50 | 8.62 | **1.26x** | — | — | 1.33 | 1.10 |
+| 15–50 | 8.68 | **1.27x** | — | — | 1.34 | 1.12 |
 
 Lazarus et al. (2015) measure **1.1–2 at P = 0.1–2 s for PALFA at DM > 150**.
 Quote their high-DM figure: their DM dependence is RFI confusability and we
@@ -249,14 +262,14 @@ else.
 ## 7. The two sigma questions, answered
 
 **`coherent_rawmeas` — can I skip `rednoise`?** No. Measured sigma on the raw
-`.fft`, per knee: **77.3 → 32.4 → 8.5 → 3.0 → 1.1%**, against `coherent`'s
-76.2 → 48.7. Its matched cut inflates 6.80 → 11.80 just to hold the false-alarm
+`.fft`, per knee: **77.3 → 32.4 → 8.5 → 3.0 → 1.0%**, against `coherent`'s
+76.2 → 47.9. Its matched cut inflates 6.80 → 11.80 just to hold the false-alarm
 rate. A negative result about our own default path, worth stating plainly.
 
 **`coherent_meas` — should I measure sigma or compute it?** It makes no
 difference: measured sigma on the whitened file tracks the analytic default to
-within ~1% at every knee (76.5 / 74.4 / 69.2 / 60.8 / 47.6 against
-76.2 / 75.2 / 69.7 / 61.4 / 48.7). The analytic one is free, so use it.
+within ~1% at every knee (76.5 / 74.4 / 69.2 / 60.9 / 47.7 against
+76.2 / 75.2 / 69.8 / 61.3 / 47.9). The analytic one is free, so use it.
 
 ---
 
@@ -268,7 +281,7 @@ median mixes two machines and a ratio taken from it would be part hardware:
 | median s per realisation | `rseek_B` | `coherent_deep` | `rseek_A` | `coherent` | `prepfold` | `coherent_tier` | `accelsearch` |
 |---|---|---|---|---|---|---|---|
 | eiger (run 3) | 121.3 | — | 27.5 | **16.9** | 5.5 | 5.0 | 1.5 |
-| fitzroy (run 2) | 179.8 | 75.3 | 42.2 | **29.4** | 8.8 | 8.0 | 2.3 |
+| fitzroy (run 2) | 179.8 | 75.3 | 42.3 | **29.4** | 8.8 | 8.0 | 2.3 |
 
 Both hosts agree on the ratios that matter: we are **1.4–1.6x cheaper than
 `rseek_A`** and **11–13x more expensive than `accelsearch`**. That last number
@@ -281,11 +294,14 @@ belongs next to `accelsearch`'s 41.6% against our 76.3%.
 All three had the same shape: a number that looked measured and was not.
 
 * **`prepfold` read 0.0% at 100–200 Hz in every cell.** That band is the gap
-  between the two injected populations, so its null folds land there at **0.083
+  between the two injected populations, so its null folds land there at **0.089
   per realisation** — under the 0.1 the rate asks for — and the cut came back
   `inf`, which the detection counter scored as "every row a miss". It now
   returns `nan` and the cell prints blank with the fold rate quoted. It biased
-  the ceiling column low, i.e. in the direction that flattered us.
+  the ceiling column low, i.e. in the direction that flattered us — and not only
+  in the band table: the pooled `by f0` row for 100–200 Hz read **45.3 / 47.7%**
+  before the fix and reads **94.5 / 99.6%** after, a ~50-point correction to the
+  reference column in that band.
 * **Four "the subset every arm ran" tables printed rows of `nan`, and the whole
   cost table silently vanished.** `coherent_deep` ran only in run 2 and
   `coherent_meas`/`rawmeas` only in run 3, so no injection was seen by every
@@ -303,7 +319,7 @@ All three had the same shape: a number that looked measured and was not.
 ## 10. Traps — read before quoting any of this
 
 * **Do not quote the pooled tables from a combined run2+run3 load.** They
-  average a 76k-white plus 82k-red mixture whose composition is just how far
+  average a 76k-white plus 85k-red mixture whose composition is just how far
   run 3 got. Thresholds are right per cell; the marginal is meaningless. Read
   `knee`, `band` and `paired`. (The by-duty and by-f0 tables are pooled this
   way: read their *shape*, not their level.)
@@ -355,9 +371,8 @@ All three had the same shape: a number that looked measured and was not.
 
 ## 12. Still open, in value order
 
-1. **Re-run the analysis on the completed run 3** (`go3.sh` → `report_v4_*`).
-   Signs and orderings will not move; precision and the per-(knee × band)
-   `prepfold` cells will.
+1. ~~Re-run the analysis on the completed run 3~~ — **done 2026-09-14**; every
+   number above comes from `report_v4_*`. Signs and orderings did not move.
 2–4. **Run 4 — implemented 2026-09-14, waiting to be launched.** One pass over
    run 2's white indices closes all three of the gaps that no re-analysis can:
    the missing **per-band tails** on the white side (§4's absent zero point); the
