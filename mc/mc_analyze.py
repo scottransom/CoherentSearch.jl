@@ -389,6 +389,33 @@ def common(rws, methods):
     return [r for r in rws if all(m in r for m in ms)]
 
 
+def disjoint_pairs(rws, ms):
+    """Pairs of methods that never ran on the same injection.
+
+    `common()` over every arm can come back EMPTY, and a table built on it then
+    prints a row of `nan` that looks like a measurement.  run 2 + run 3 does
+    exactly this: `coherent_deep` ran only in run 2 and `coherent_meas` /
+    `coherent_rawmeas` only in run 3, so no injection was seen by all of them.
+    Naming the pair is the difference between "this comparison is impossible" and
+    "something is broken".
+    """
+    ms = [m for m in ms if m not in ("prepfold_chi2", "prepfold_snr1")]
+    cov = {m: np.array([m in r for r in rws], dtype=bool) for m in ms}
+    return [(a, b) for i, a in enumerate(ms) for b in ms[i + 1:]
+            if not np.any(cov[a] & cov[b])]
+
+
+def _no_common(rws, ms):
+    """Say why a block is empty instead of printing a table of `nan`."""
+    print("  no injection was run by every arm in this block, so there is no "
+          "common subset to compare on.")
+    for a, b in disjoint_pairs(rws, ms)[:6]:
+        print(f"    {a} and {b} never ran on the same injection")
+    print("  (a MISSING comparison, not a null result: two arms cannot overlap when\n"
+          "   they belong to different runs.  Read each arm against the always-run\n"
+          "   block above, or pass --no-common.)")
+
+
 def split_coverage(rws, ms, frac=0.95):
     """Split methods into those that ran on (nearly) everything and those that
     ran on a subset.
@@ -547,12 +574,18 @@ def _det(rws, m, t):
     v, w, ok, _ = _cols(rws, m)
     if not ok.any():
         return float("nan"), 0.0
-    # A cell with NO cut (nan -- e.g. a run that stored no per-band tails) is a
-    # missing measurement, not a miss.  Counting those rows in the denominator
-    # read as a detection fraction of zero, which is the artifact this whole
-    # per-cell machinery exists to remove.
+    # A cell with NO cut is a missing measurement, not a miss.  Counting those
+    # rows in the denominator read as a detection fraction of zero, which is the
+    # artifact this whole per-cell machinery exists to remove.  BOTH non-finite
+    # forms mean the same thing and both must be excluded: `nan` (a run that
+    # stored no per-band tails) and `inf` (a band whose null sample is too small
+    # to set any cut at this rate, and a row whose cell the CutBook never
+    # filled).  Excluding only `nan` is what made prepfold read 0.0% at
+    # 100-200 Hz in every knee bin -- its null folds land there at 0.083 per
+    # realisation, below the 0.1 the rate asks for, so the cut came back `inf`
+    # and every row was scored a miss against it.
     tv = _tv(rws, t)
-    ok = ok & ~np.isnan(tv)
+    ok = ok & np.isfinite(tv)
     d = np.where(np.isnan(v), False, v >= tv) & ok
     den = float(np.sum(w * ok))
     return (float(np.sum(w * d)) / den if den else float("nan")), den
@@ -571,7 +604,7 @@ def boot_det(rws, m, t, nboot, rng):
         return p, float("nan"), wsum
     v, w, ok, idx = _cols(rws, m)
     tv = _tv(rws, t)
-    ok = ok & ~np.isnan(tv)            # no cut in this cell: no measurement
+    ok = ok & np.isfinite(tv)          # no cut in this cell: no measurement
     d = (np.where(np.isnan(v), False, v >= tv) & ok).astype(float)
     uniq, inv = np.unique(idx, return_inverse=True)
     num = np.bincount(inv, weights=w * d, minlength=len(uniq))
@@ -660,16 +693,48 @@ def sec_cost(recs, rws, thr, args):
     print("median wall per realisation (s):  " +
           "  ".join(f"{k} {np.median(v):.1f}" for k, v in
                     sorted(tk.items(), key=lambda kv: -np.median(kv[1]))))
+    # Run 2 ran on fitzroy and run 3 on eiger, so the pooled median above is a
+    # median over two MACHINES and its composition is just how far each run got.
+    # Any ratio quoted from it would be part hardware.
+    hosts = sorted({r.get("host") for r in recs if r.get("host")})
+    if len(hosts) > 1:
+        print(f"  the run spans {', '.join(hosts)}, so that line mixes machines -- "
+              "per host:")
+        for h in hosts:
+            th = defaultdict(list)
+            nh = 0
+            for r in recs:
+                if r.get("host") != h:
+                    continue
+                nh += 1
+                for k, v in r.get("timing", {}).items():
+                    th[k].append(v)
+            if th:
+                print(f"    {h} ({nh} realisations):  " +
+                      "  ".join(f"{k} {np.median(v):.1f}" for k, v in
+                                sorted(th.items(), key=lambda kv: -np.median(kv[1]))))
+        print("    (a speed ratio has to come from ONE host; these columns are not "
+              "comparable across hosts)")
     tr = {}
     for r in recs:
         for k, v in (r.get("config", {}).get("trials") or {}).items():
             tr.setdefault(k, v)
-    sub = common(rws, present(rws, SEARCHES)) if args.common else rws
-    if not sub:
+    # A subset arm is scored on ITS OWN subset intersected with the always-run
+    # set, never on the intersection of EVERY arm: `coherent_deep` (run 2 only)
+    # and `coherent_meas` (run 3 only) share no injection, so that intersection is
+    # empty and this whole table used to disappear without a word.
+    full, part = split_coverage(rws, present(rws, SEARCHES))
+    base = common(rws, full) if args.common else rws
+    if not base:
+        print("  (no injection was run by every always-run arm: no cost table)")
         return
     print(f"\n{'method':>15} {'det%':>7} {'s/real':>8} {'det/CPU-s':>10} "
           f"{'trials':>12} {'det% per 1e6 trials':>20}")
-    for m in present(sub, SEARCHES):
+    for m in full + part:
+        sub = (base if m in full else
+               (common(rws, full + [m]) if args.common else rws))
+        if not sub:
+            continue
         t = thr.get(m, thr["_default"])
         p, _ = _det(sub, m, t)
         # A union arm costs both its parts; a subset method costs what it costs
@@ -682,7 +747,11 @@ def sec_cost(recs, rws, thr, args):
               f"{(f'{n:,}' if n else '--'):>12} "
               f"{(100 * p / (n / 1e6) if n else float('nan')):20.3f}")
     print("  (det/CPU-s is detection fraction per second of that method's own wall clock;\n"
-          "   a code that is 6x slower must be 6x better to be on the same line)")
+          "   a code that is 6x slower must be 6x better to be on the same line.\n"
+          "   An arm that ran on a subset is scored on that subset intersected with the\n"
+          "   always-run arms, so its det% is measured where it actually ran.\n"
+          "   s/real here is the median over ALL hosts: where the run spans more than\n"
+          "   one machine, take any speed RATIO from the per-host lines above instead.)")
 
 
 def sec_falarm(recs, args, thr=None):
@@ -739,16 +808,20 @@ def sec_roc(recs, rws, book, args, rng):
         sub = common(rws, ms) if args.common else rws
         print(f"\n--- ROC: detection fraction vs false alarms/realisation "
               f"({len(sub)} injections{', the subset every arm ran' if len(ms) > len(full) else ''}) ---")
+        if not sub:
+            _no_common(rws, ms)
+            continue
         print(f"{'FAP':>8} " + " ".join(f"{m:>16}" for m in ms))
         for f in faps:
             t = book.at(f)
             cells = []
             for m in ms:
-                p, _ = _det(sub, m, t.get(m, np.inf))
+                p, _ = _det(sub, m, t.get(m, np.nan))
                 tt = t.get(m, float("nan"))
                 at = (f"@{tt:4.2f}" if not isinstance(tt, Cut)
                       else ("@knee" if tt.kind == "knee" else "@k,band"))
-                cells.append(f"{100 * p:10.1f}% {at}")
+                cells.append("               ." if not np.isfinite(p)
+                             else f"{100 * p:10.1f}% {at}")
             print(f"{f:>8g} " + " ".join(f"{c:>16}" for c in cells))
 
 
@@ -761,6 +834,9 @@ def sec_table(rws, thr, args, rng, key=None):
         deep = len(ms) > len(full)
         print(f"\n--- {ttl} ({len(sub)} injections"
               f"{', the subset every arm ran' if deep else ''}) ---")
+        if not sub:
+            _no_common(rws, ms)
+            continue
         print(f"{'':>14} " + " ".join(f"{m:>16}" for m in ms) + f"   {'N':>7}")
         groups = [("all", sub)] if not key else [
             (f"{lo:g}-{hi:g}", [r for r in sub if lo <= r[key] < hi])
@@ -1192,7 +1268,13 @@ def prepfold_null_thresholds(recs, labs, fap):
             k = int(round(per * len(v)))
             censored = k < _NULL_MIN_ABOVE
             k = max(k, _NULL_MIN_ABOVE)
-            out[(col, lab)] = (float(v[k - 1]) if len(v) >= k else float("inf"),
+            # Too few null folds in this band to set ANY cut at this rate: `nan`,
+            # a missing measurement.  It was `inf`, which `_det` scored as "every
+            # row a miss" and printed as a hard 0.0% -- and the band it happens in
+            # is 100-200 Hz, the gap between the two injected populations, where
+            # the null lands 0.083 folds per realisation against a 0.1 rate.  A
+            # 0.0% there is not prepfold failing; it is us failing to cut it.
+            out[(col, lab)] = (float(v[k - 1]) if len(v) >= k else float("nan"),
                                censored, len(v))
     return out
 
@@ -1307,11 +1389,18 @@ class Cut:
 
     `kind` says what a cell is: `knee` (the realisation's red-noise bin) or
     `knee,band` (that, and the injection's f0 band).  A row in a cell with no cut
-    gets `missing` -- `inf` for a search, i.e. no threshold there means no
-    detection, and the nominal cut for prepfold, as in the pooled report.
+    gets `missing` -- `nan` for a search, i.e. NO MEASUREMENT, and the nominal
+    cut for prepfold, as in the pooled report.
+
+    `missing` used to be `inf` for a search, on the reading that "no threshold
+    means no detection".  That is wrong whenever the cell is uncuttable rather
+    than quiet, and under `--match knee,band` it silently zeroed run 2: white
+    records carry no per-band tails, so every white row fell in an empty cell and
+    scored 0% in every table.  A cell we cannot cut is a hole in the measurement
+    and has to print as one.
     """
 
-    def __init__(self, kind, cuts, knee_by, labs, missing=np.inf):
+    def __init__(self, kind, cuts, knee_by, labs, missing=np.nan):
         self.kind, self.cuts, self.knee_by, self.labs = kind, cuts, knee_by, labs
         self.missing = missing
 
@@ -1516,7 +1605,7 @@ class CutBook:
             pf = m in PF_COLS
             out[m] = Cut("knee,band" if (pf or self.match == "knee,band") else "knee",
                          c, self.knee_by, self.labs,
-                         missing=(self.default if pf else np.inf))
+                         missing=(self.default if pf else np.nan))
         return out
 
 
@@ -1550,6 +1639,11 @@ def sec_band(recs, args, rng):
         else [("all", recs)]
     print(f"\n--- per FREQUENCY band, every threshold matched INSIDE the band at "
           f"{args.fap:g} false alarms/realisation ---")
+    print(f"  (the rate is {args.fap:g} false alarms per realisation IN EACH BAND, so "
+          f"over\n   {len(labs)} bands the pooled rate is up to {len(labs) * args.fap:g}.  "
+          "These numbers answer 'at equal\n   false-alarm rate HERE, who detects more "
+          "HERE?' and are NOT comparable with the\n   per-knee table, which cuts once "
+          "for the whole candidate list.)")
     pf_cols = ("prepfold_chi2", "prepfold_snr1")
     for glab, sub in groups:
         pfthr = prepfold_null_thresholds(sub, labs, args.fap)
@@ -1558,15 +1652,18 @@ def sec_band(recs, args, rng):
         ms = present_recs(sub, SEARCHES)
         ms = [m for m in ms if any(m in r for r in rws_all)]
         ms += [c for c in pf_cols if any(c in r for r in rws_all)]
-        det, thr, note, nrow = {}, {}, {}, {}
+        det, thr, note, nrow, pfgap = {}, {}, {}, {}, []
+        npf = sum(1 for r in sub if r.get("empty"))
         for lab in labs:
             lo, hi = band_range(lab)
             rws = [r for r in rws_all if lo <= r["f0"] < hi]
             nrow[lab] = len(rws)
             for m in ms:
                 if m in pf_cols:
-                    t, censored, nnull = pfthr.get((m, lab), (float("inf"), True, 0))
+                    t, censored, nnull = pfthr.get((m, lab), (float("nan"), False, 0))
                     note[(m, lab)] = "c" if censored else ""
+                    if not np.isfinite(t):
+                        pfgap.append((m, lab, nnull))
                 else:
                     t, n, _ = matched_threshold(sub, m, args.fap, band=lab)
                     fl = band_floor(sub, m, lab)
@@ -1612,7 +1709,26 @@ def sec_band(recs, args, rng):
               "   so the cut shown is the lowest rate it CAN resolve and the detection\n"
               "   fraction beside it is therefore a lower bound -- `--fap 0.1` resolves\n"
               "   these on a night's data, where 1e-2 needs roughly ten times more;\n"
+              "   '.' = no cut exists in that cell, so nothing is measured there;\n"
               "   '-' = the run stored no per-band tail for this method)")
+        if not any(np.isfinite(thr[(m, lab)])
+                   for m in ms if m not in pf_cols for lab in labs):
+            print("  NO SEARCH CAN BE CUT IN THIS GROUP: these records carry no per-band\n"
+                  "   false-alarm tails.  Run 2 stored none -- the driver gained them part\n"
+                  "   way through run 3 -- so this matching HAS NO WHITE ZERO POINT, and a\n"
+                  "   band-matched red number must not be read against the per-knee white\n"
+                  "   column.  Re-running some white realisations with the current driver is\n"
+                  "   what would fill this row.")
+        if pfgap:
+            bands = dict((lab, n) for _, lab, n in pfgap)
+            print("  prepfold has NO cut in " +
+                  ", ".join(f"{lab} ({n} null folds = {n / max(npf, 1):.3f} per "
+                            f"realisation, under the {args.fap:g} the rate asks for)"
+                            for lab, n in bands.items()) +
+                  "\n   -- BLANK because it is unmeasured, not because prepfold missed.  "
+                  "That band is\n   the gap between the two injected populations, so the "
+                  "null folds are thin there;\n   more injection-free realisations, or a "
+                  "larger --fap, is what fills it.")
 
 
 def sec_paired(rws, thr, args, rng):
@@ -1910,6 +2026,12 @@ def sec_knee(recs, args, rng):
                     cells.append("             ." if v is None or not np.isfinite(v)
                                  else f"{v:14.2f}")
             print(f"{m:>17} " + " ".join(cells))
+    if band_det:
+        print("\n  (the band-matched row cuts at --fap IN EACH f0 band, so it allows up to\n"
+              "   nbands x --fap over the whole candidate list.  It is the fairer statement\n"
+              "   about a code whose noise is not stationary across its own output, and it\n"
+              "   is NOT comparable with the per-knee row above.  `white` is blank in it\n"
+              "   because run 2 stored no per-band tails.)")
     print(f'\n{"realisations":>17} ' + " ".join(f"{len(s):>14d}" for _, s in groups))
     if warn:
         print("\n  the search's own sigma guard (analytic disagreeing with measured "

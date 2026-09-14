@@ -469,6 +469,70 @@ def test_match_modes():
           and MA.knee_label(dict(fknee=30.0)) == "15-50")
 
 
+def test_missing_cut():
+    """A cell that cannot be CUT is not a cell with no detections.
+
+    Run 3's report said prepfold detected 0.0% at 100-200 Hz in every knee bin.
+    That band is the gap between the two injected populations, so its null folds
+    land there at 0.083 per realisation -- under the 0.1 false alarms per
+    realisation the rate asks for -- and `prepfold_null_thresholds` returned
+    `inf`, which `_det` scored as "every row a miss".  A blank is the truth; a
+    hard 0.0% is a lie about the one column that is the study's ceiling.
+
+    The same hole zeroed run 2 under `--match knee,band`: white records carry no
+    per-band tails, so every white row fell in an empty cell and `Cut.missing`
+    handed it `inf`.
+    """
+    import mc_analyze as MA
+
+    rws = [dict(index=i, inj=0, weight=1.0, f0=10.0, snr=9.0, ducy=0.05,
+                coherent=8.0) for i in range(10)]
+    p, _ = MA._det(rws, "coherent", 6.0)
+    check("a finite cut still scores detections", p == 1.0, f"p={p}")
+    for bad, what in ((float("inf"), "inf"), (float("nan"), "nan")):
+        p, den = MA._det(rws, "coherent", bad)
+        check(f"a cut of {what} is a MISSING measurement, not a miss",
+              (not np.isfinite(p)) and den == 0.0, f"p={p} den={den}")
+
+    cut = MA.Cut("knee", {"white": 6.0}, "knee", [])
+    check("a Cut leaves an unfilled cell missing, not infinite",
+          np.isnan(cut.vec([dict(fknee=30.0)])[0])
+          and cut.vec([dict(fknee=None)])[0] == 6.0,
+          str(cut.vec([dict(fknee=30.0), dict(fknee=None)])))
+
+    # 20 injection-free realisations.  Band 5-20 Hz gets two null folds each;
+    # 100-200 Hz gets ONE in the whole set, i.e. 0.05 per realisation, under the
+    # 0.1 the rate asks for -- exactly run 3's shape.
+    def fold(f0, snr1, nb=64, dt=6e-5):
+        return dict(nbins=nb, dt_per_bin=1.0 / (f0 * nb * dt), w=1,
+                    snr1=snr1, chi2_sigma=snr1)
+
+    nulls = []
+    for i in range(20):
+        folds = [fold(10.0, 3.0 + 0.1 * i), fold(10.0, 3.5)]
+        if i == 0:
+            folds.append(fold(150.0, 9.9))
+        nulls.append(dict(index=i, empty=True, dt=6e-5,
+                          results=dict(prepfold_null=folds),
+                          config=dict(fa_bands=[0.0, 1.0, 5.0, 20.0, 100.0,
+                                                200.0, 400.0, float("inf")])))
+    out = MA.prepfold_null_thresholds(nulls, MA.fa_band_labels(nulls), 0.1)
+    t_thin, _, n_thin = out[("prepfold_snr1", "100-200")]
+    check("a band too thin to set any cut returns nan, not inf",
+          np.isnan(t_thin), f"cut={t_thin} from {n_thin} null folds")
+    t_ok, _, n_ok = out[("prepfold_snr1", "5-20")]
+    check("a band with enough null folds still sets one",
+          np.isfinite(t_ok), f"cut={t_ok} from {n_ok} null folds")
+
+    # And the empty common subset is NAMED rather than printed as a row of nan.
+    a = [dict(index=i, inj=0, weight=1.0, x=1.0) for i in range(5)]
+    b = [dict(index=5 + i, inj=0, weight=1.0, y=1.0) for i in range(5)]
+    check("arms that never overlap are named, not intersected to nothing",
+          MA.disjoint_pairs(a + b, ["x", "y"]) == [("x", "y")]
+          and MA.disjoint_pairs(a + b, ["x"]) == [],
+          str(MA.disjoint_pairs(a + b, ["x", "y"])))
+
+
 def test_rednoise():
     """The red-noise generator: the spectrum it claims, and the pairing it promises."""
     import mc_simulate as MS
@@ -572,6 +636,7 @@ if __name__ == "__main__":
     test_fa_bands()
     test_hit_scoring()
     test_match_modes()
+    test_missing_cut()
     test_silent_failures()
     test_rednoise()
     print()
