@@ -79,11 +79,14 @@ import mc_profiles as MP
 # One colour per method, used everywhere so the panels can be read together.
 COLOURS = {"prepfold_chi2": "#8c8c8c", "prepfold_snr1": "#3b7dd8",
            "accelsearch": "#d9822b", "accelsearch_red": "#b06010",
-           "rseek_A": "#c1272d", "rseek_B": "#7b3fa0",
+           "rseek_A": "#c1272d", "rseek_B": "#7b3fa0", "rseek_W": "#e8734a",
            "coherent": "#1a9850", "coherent_tier": "#0d6e33",
            "coherent_deep": "#66bd63", "coh+tier": "#054d21",
            "coherent_meas": "#2b8cbe", "coherent_rawmeas": "#7fcdbb"}
-SNR1_LIKE = ("prepfold_snr1", "rseek_A", "coherent", "coh+tier")
+# `rseek_W` is riptide on a PRESTO-whitened series, so its statistic is the same
+# snr1 as `rseek_A`'s and the two belong on the same axes: that pair IS the
+# preprocessing-vs-FFA comparison run 4 exists to make.
+SNR1_LIKE = ("prepfold_snr1", "rseek_A", "rseek_W", "coherent", "coh+tier")
 # One colour per red-noise bin, dark (quiet) to bright (worst).
 KNEE_COLOURS = ["#000000", "#2166ac", "#4393c3", "#f4a582", "#d6604d", "#b2182b"]
 
