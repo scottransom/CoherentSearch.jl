@@ -1,55 +1,204 @@
 # CoherentSearch.jl
 
-A pure-Julia pulsar search using fast complex **Fourier interpolation** and
-**coherent harmonic summing** of PRESTO-style FFT files. A port of the Python
-[`coherent_search`](../coherent_search) package, restructured for
-multi-threaded performance.
+A pure-Julia pulsar search that uses the **phase** of every harmonic, not just
+its power. Working from a PRESTO-style `.fft` file, it reconstructs the pulse
+profile at each trial spin frequency — Fourier-interpolating the complex
+amplitudes of up to 60 harmonics of that frequency and inverse-transforming them
+— and matched-filters each profile against a bank of boxcars. Keeping the
+harmonic phases is what separates this from the incoherent harmonic sum most
+FFT-based searches use: the profile comes back with its *shape* intact, so the
+search can tell a pulsar-like pulse from an arbitrary pile of harmonic power.
 
-The goal is a fast, parallel, well-tested search code. Correctness is anchored
-by cross-validating every numerical result against the original Python
-implementation used as an independent oracle.
+What comes out is close to what a fast folding algorithm (FFA) computes, but it
+is reached through one long FFT rather than through repeated partial sums. That
+difference is the point. The work factors into dense, regular, independent
+kernels — interpolate, transform, filter — which vectorise, thread, and port to
+a GPU cleanly, none of which the FFA's recursion does easily.
+
+In short:
+
+- **More sensitive.** In an injection Monte Carlo over ~120,000 noise
+  realisations, with every code's threshold matched to the same measured
+  false-alarm rate, we detect **76%** of white-noise injections. riptide's
+  `rseek` detects 71% in its deepest configuration (which costs ~6x our
+  runtime) and 50% in the configuration matched to our frequency coverage;
+  PRESTO's `accelsearch` detects 42%. See `docs/comparison_points.md`, and read
+  its caveats before quoting any of this.
+- **A calculable false-alarm rate.** The input FFT is normalised, so the noise
+  in every reconstructed profile is known in closed form rather than estimated,
+  and the boxcar template is normalised so that each (phase, width) trial is
+  `N(0,1)`. One `--threshold` therefore means one false-alarm rate at every fold
+  depth and across the whole band — which is what makes it safe to lower it.
+- **Resilient to red noise.** Searching a whitened FFT keeps the matched
+  threshold flat — 6.75 on white noise, 6.70–6.75 out to a 50 Hz red-noise knee.
+  riptide detrends in the time domain instead, and over the same range its
+  matched threshold climbs from 7.6 to 250.
+- **Fast.** Single-threaded it is **1.5–2.1x** `rseek` over matched frequency
+  coverage. It scales ~9x across 20 cores, and the whole search runs on a GPU:
+  an A100 is ~9.6x a 20-core Xeon, an RTX A4000 ~3.5x.
+- **Pinned, not eyeballed.** Every numerical result is cross-validated against
+  the original Python [`coherent_search`](../coherent_search) package used as an
+  independent oracle (~1e-16 relative), the optimised search is pinned against
+  an unoptimised reference path inside this repo, and a change that should not
+  move results is checked by `diff` on the candidate file.
+
+`bin/toy_coherent_search.jl` is the same algorithm with **every optimisation
+removed** — brute-force per-point interpolation, one inverse FFT per fold, the
+boxcar filter straight from its definition, plain nested loops. It is a complete,
+working search, roughly 150–250x slower than the production code, and it exists
+to be *read*: it is what the paper's pseudo-code figure describes, line for line.
+Start there if you want to understand the algorithm. See
+[The toy search](#the-toy-search).
 
 ## References
 
 - Fourier interpolation: Eqn. 30 of Ransom, Eikenberry & Middleditch (2002),
   <https://arxiv.org/pdf/astro-ph/0204349>
+- The boxcar matched filter: Morello et al. (2020), MNRAS 497, 4654, §5.4
 - PRESTO: <https://github.com/scottransom/presto>
+- riptide (the FFA we benchmark against):
+  <https://github.com/v-morello/riptide>
 
 ## Layout
 
 ```
 src/
   CoherentSearch.jl   module + public API
-  fourierinterp.jl    interpolation kernels (the indexing-critical code)
+  fourierinterp.jl    reference interpolation kernels (indexing-critical code)
+  directinterp.jl     the production interpolator: tabulated Eqn.-30 weights
   fileio.jl           PRESTO .fft / .inf readers (mmap)
   search.jl           chunk-parallel coherent harmonic-summing search
   candidate.jl        per-candidate high-accuracy profile reconstruction
+  backend.jl          CPU/GPU backend dispatch (backendtypes.jl, wisdom.jl)
   cli.jl              ArgParse command-line driver (`CoherentSearch.main`)
+ext/
+  CoherentSearchCUDAExt.jl  the GPU search (a weak dependency on CUDA.jl)
 bin/
   coherent_search.jl  command-line entry point (a shim onto src/cli.jl)
   toy_coherent_search.jl  the same search with every optimisation removed
+  parallel_search.py  fill a machine: partition a file list over cores or GPUs
   plotting.jl         CairoMakie candidate-profile plotting (loaded on demand)
   plot_candidates.jl  standalone: re-plot profiles from a saved candidate file
   sift_candidates.py  cross-observation candidate sifter (.cohout / .txt)
 test/                 unit tests (golden values, analytic signals, indexing)
 crossval/             Python-as-oracle accuracy + speed cross-validation
+compare/              head-to-head benchmark against riptide's rseek
+mc/                   the injection Monte Carlo: sensitivity vs. the other codes
+bench/                microbenchmarks and phase timings (its own environment)
+docs/                 design notes, the GPU log, and the measurement record
 sysimage/             optional PackageCompiler sysimage for production runs
 ```
 
 ## Design notes
 
+The code is built around four goals, roughly in this order: **sensitivity**, a
+**calculable false-alarm rate**, **resilience to red noise**, and **speed**.
+Nearly every non-obvious choice below follows from one of them.
+
+### Sensitivity
+
+- **Coherent harmonic summing.** Harmonic amplitudes are summed as complex
+  numbers, not as powers, so the inverse transform of the stack is the actual
+  pulse profile. Discarding the phases — what an incoherent sum does — throws
+  away the pulse shape and with it the ability to reject a detection that is
+  not pulsar-like.
+- **Exact Fourier interpolation.** A pulsar almost never sits on an integer
+  Fourier bin, and a harmonic's phase rotates a full turn between bins. The
+  Eqn.-30 kernel is evaluated *exactly* at each trial frequency rather than
+  interpolated from a precomputed fine grid, which costs nothing (the weights
+  tabulate) and is worth ~1e-10 accuracy against the fine grid's ~1e-2.
+- **`--nharms 60`, i.e. 120 profile bins.** Enough to resolve duty cycles below
+  1%, which is where the narrowest real pulsars live.
+- **A harmonic-summing ladder, not one fold depth.** Taking every `k`-th
+  interpolated amplitude folds the same data at `k` times the trial frequency
+  into `2·nharms/k` bins, for the price of one short inverse FFT. That covers
+  fast pulsars for nearly free — and the rungs below `hifreq` overlap on
+  purpose. They look redundant and are not: a wide pulse is better detected in a
+  shallow fold, and restricting each `k` to a disjoint band models out ~8% of
+  recovered S/N. Do not "optimise" the overlap away.
+- **A boxcar bank set by each profile's own length**, geometrically spaced out
+  to 30% duty cycle, so every fold depth is filtered to the same duty cycles.
+
+### A calculable false-alarm rate
+
+- **A normalised template.** Each boxcar is made zero-mean and unit-L2 before
+  correlating, so every (phase, width) trial is `N(0,1)` under white noise and
+  the distribution of the peak is analytic. This is numerically identical to
+  riptide's `snr1`, so the two codes report the same quantity.
+- **Held-at-zero DC.** The zero-frequency bin is forced to zero, so every
+  profile's mean is *exactly* zero. There is no mean to estimate, which removes
+  a term from the statistic's variance.
+- **An analytic noise scale.** For a normalised input FFT the per-bin noise of
+  the reconstructed profile follows from the FFT normalisation alone —
+  `σ = sqrt(2·nlow + 0.5·nnyq)/nbins` — so it is computed, not measured. That is
+  both faster and *more* accurate than the subsampled robust estimator it
+  replaced (3.0% spread against 5.4%), and it removes a ~1% per-chunk noise term
+  that used to land directly on every reported S/N.
+- **Renormalised for a band-limited fold.** Profile bins from an inverse FFT of
+  a truncated harmonic stack are correlated, so the textbook `snr1`
+  normalisation is wrong for them. Dividing by the exact variance of the boxcar
+  sum fixes two biases: a `sqrt(nbins/2H)` inflation past the Nyquist knee (on
+  pure noise the peak ran 9.09 at 500 Hz against 5.32 at 20 Hz; now 5.01 and
+  5.28) and a ~3.4% offset *between* ladder rungs that made shallow folds win
+  spuriously.
+- Together these are why the threshold can sit near 6.7 and stay there.
+
+### Resilience to red noise
+
+- **Whiten first.** The input is a PRESTO `rednoise`-flattened `.fft`, which
+  makes the unit-variance assumption above true rather than hopeful. Codes that
+  detrend in the time domain instead cannot whiten above `1/rmed_width`, and
+  their false-alarm rate then depends on the red-noise knee — which is the
+  single largest effect in the Monte Carlo.
+- **An escape hatch, and a guard.** `--sigma measured` estimates the noise from
+  the data instead, which is the right answer when the noise level varies with
+  frequency (residual red noise, an RFI comb, a `rednoise` pass that did not
+  take). And because the analytic assumption fails *silently* and in the
+  dangerous direction — a normalisation error inflates every S/N — the search
+  scores a few chunks both ways and warns when they disagree by more than 10%.
+- Skipping the de-reddening step is not an option, and we measured that on our
+  own default path: detection falls 76% → 1% across the knee range.
+
+### Speed
+
+- **Regular kernels, then vectorise along the long axis.** The interpolator
+  vectorises across *trials* (a group of consecutive trials becomes a
+  matrix-vector product against one contiguous slice of Fourier bins — no
+  gather, no horizontal reduce), and the boxcar scan vectorises across
+  *profiles*, 128 at a time, since the phase axis is only 20–120 long. Both
+  choices are worth 1.5–4x on their phase.
+- **Chunk-parallel, whole chunks per thread.** Trials are grouped into chunks of
+  2048 and handed to tasks round-robin, each with a private workspace. That is
+  what lets a harmonic's Fourier-bin window be loaded once per chunk and read
+  back from L1 by every trial in it. ~9x on 20 cores.
+- **A GPU extension.** The whole search runs on a CUDA card
+  (`ext/CoherentSearchCUDAExt.jl`); CUDA is a weak dependency, so a CPU-only
+  user downloads nothing. Six cards have been measured, 6 to 108 SMs, all
+  reporting byte-identical candidates.
+- **Start-up is a real cost and is treated as one.** Julia's JIT once dominated
+  short runs (15.6 s wall for 1.4 s of searching). A precompile workload plus
+  keeping the CLI inside the package cut that to 2.4 s, and one invocation
+  searches many `.fft` files while sharing plans and workspaces, so the marginal
+  cost of an extra file is ~1 s.
+- **Measured, not guessed.** Permanent in-situ phase timers, a `bench/`
+  environment, and a long record of projections that turned out wrong live in
+  `docs/Summary_and_Future_Work.md` and `docs/gpu_design.md`. Microbenchmarks
+  have inverted in situ often enough here that the phase timers are the primary
+  instrument.
+
+### Implementation notes
+
 - **Indexing.** Python is 0-based with half-open slices; Julia is 1-based with
   inclusive ranges. The translation is isolated and documented in
   `fourierinterp.jl` (see `nearby_fourier_bin_range`), and pinned by tests and
   the cross-validation to machine precision.
-- **Parallelism.** The stateful, forward-walking `FourierInterpolator` of the
-  Python version is replaced by **independent frequency blocks**
-  (`block_metrics` / `search_block`). Each block owns its buffers and shares no
-  mutable state, so the search scales across cores via `Threads.@threads` and
-  extends naturally to `Distributed` for cluster-scale runs.
 - **FFT conventions.** `irfft` of the stacked harmonic amplitudes matches
   numpy's `np.fft.irfft` (both ignore the imaginary parts of the DC/Nyquist
   bins); this is verified directly in the tests.
+- **Two paths that must agree.** A deliberately unoptimised *reference* path
+  (`block_metrics` / `reference_profiles`) is pinned to the Python oracle at
+  ~1e-16, and the whole optimised machinery is pinned to that reference at
+  8.4e-16. Every optimisation has to keep both green.
 
 ## Installation and first use
 
@@ -760,7 +909,9 @@ unit-L2*, and scored
 max_{w,phase} (S_w − δ·S_tot) / (σ̂ · sqrt(w·(1−δ))),      δ = w / nbins
 ```
 
-with one robust per-bin `σ̂` per block. Because the widths are fixed a priori,
+with the per-bin noise scale `σ̂` computed analytically by default (see
+[The noise scale](#the-noise-scale-analytic-by-default)). Because the widths
+are fixed a priori,
 every (phase, width) trial is `N(0,1)` under noise, so the pure-noise
 distribution is analytic and — unlike the older on-pulse sums — flat across
 harmonic decimations: one `--threshold` means one false-alarm rate at every `k`.
