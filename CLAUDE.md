@@ -318,8 +318,12 @@ optimisation below (1.84x vs 1.26x on the same code and the same data).
   `snr_metrics` still computes plain `snr1` by default (the oracle pin holds at
   1.393e-16); `nfilled` selects the production form, which `block_metrics`
   passes. **The `--gpu` kernels take the same per-width table from the host and
-  were changed with it, but that path is UNTESTED on a device — verify
-  byte-identical candidates on a GPU host before trusting it.** Full account in
+  were changed with it, and that path is VERIFIED on two cards**: the GTX 1080
+  on fitzroy (2026-08-28, `17031a8`) and the A100 on OzSTAR's `gina4`
+  (2026-09-15) — `test_gpu.jl` 300/300 on both, and CPU vs `--gpu` candidates
+  byte-identical in bands past each file's Nyquist knee. Still check each new
+  card (`bench/paper_gpu_run.sh` does), and note that `Pkg.test()` never runs
+  `test_gpu.jl` — `test/Project.toml` has no CUDA. Full account in
   `docs/Summary_and_Future_Work.md` §3.6.
 - **Our S/N IS riptide's S/N as of 2026-08-24 — same statistic, not merely
   comparable.** `_boxcar_scan`, the Python oracle's `snr_metric` and riptide's
