@@ -21,10 +21,10 @@
 #      test/Project.toml has no CUDA, so test_gpu.jl skips itself.
 #   2. *** The CPU-vs-GPU candidate diff. ***  The one step that is not about
 #      speed.  The boxcar renormalisation of 2026-08-28 (commit 1b8fed9) changed
-#      the per-width table the GPU kernels take from the host, and NO COMMIT HAS
-#      TOUCHED ext/ SINCE -- so that path has never run on a device.  If either
-#      diff is non-empty, every GPU number and every GPU candidate below is
-#      suspect and nothing else in this file should be used.  Read it first.
+#      the per-width table the GPU kernels take from the host.  It was verified
+#      on the GTX 1080 that day (17031a8) and on the A100 on 2026-09-15, but
+#      every new card gets its own check: if either diff is non-empty, nothing
+#      else in this file should be used for that card.  Read it first.
 #      Two bands, because they test different things: a low one where every
 #      harmonic is below Nyquist, and a high one chosen from THIS file's length
 #      so that the top harmonics run past it -- the `nfilled` path, which is the
