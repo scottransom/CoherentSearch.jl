@@ -32,7 +32,7 @@
 #    because one had a faster CPU, so the breakdown below reports device-only
 #    shares alongside the raw ones.  Classify a card on the device column.
 
-using CoherentSearch, CUDA, Printf
+using CoherentSearch, CUDA, Printf, Logging
 const CS = CoherentSearch
 
 args = copy(ARGS)
@@ -108,7 +108,10 @@ const _SCHEDULED = any(haskey(ENV, k) for k in
 # on it there is a false alarm, and a false alarm teaches you to ignore the real
 # one.  What other jobs still share is memory bandwidth and last-level cache, so
 # say that instead of claiming the numbers are worthless.
-if !isnan(_LOADAVG) && _LOADAVG > 0.5 * Sys.CPU_THREADS && _SCHEDULED
+# A batch job holding EVERY core is not isolated from the load: on gina4 the
+# allocation was all 64 cores at load 38, and this branch wrongly said so.
+if !isnan(_LOADAVG) && _LOADAVG > 0.5 * Sys.CPU_THREADS && _SCHEDULED &&
+   _NCPU_ALLOWED < Sys.CPU_THREADS
     @info "Busy node, but this looks like a batch allocation: the load average " *
           "covers the whole machine, and your cores are cpuset-isolated from it. " *
           "Device phases are unaffected; `scan` may still be slowed by shared " *
@@ -127,6 +130,9 @@ end
 @printf("search : %.4f-%.4f Hz  nharms=%d maxdecim=%d  ->  %d trial fundamentals\n",
         lo, hi, params.nharms, maximum(params.decimations), total)
 println("="^78)
+# Every search logs its candidate collapsing at @info.  Forty-odd searches of
+# that buried the sweep table (~300 lines on gina4); warnings still print.
+Logging.global_logger(Logging.ConsoleLogger(stderr, Logging.Warn))
 
 B = CS.require_gpu()
 go(bk, bs) = search(ft, params; lofreq = lo, hifreq = hi, blocksize = bs,

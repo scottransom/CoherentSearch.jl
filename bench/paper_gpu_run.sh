@@ -65,7 +65,10 @@ echo "############################## 0. provenance #############################
 date -u +'utc      : %Y-%m-%dT%H:%M:%SZ'
 echo    "host     : $(hostname -f)"
 echo    "uptime   :$(uptime)"
-echo    "cpu      : $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')  ($(nproc) threads)"
+echo    "cpu      : $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')"
+# `nproc` honours OMP_NUM_THREADS, which batch systems often set to 1 -- on
+# gina4 it printed "1" for a 64-core allocation.  Unset it to see the cpuset.
+echo    "cores    : node $(nproc --all), allocated $(env -u OMP_NUM_THREADS -u OMP_THREAD_LIMIT nproc), OMP_NUM_THREADS=${OMP_NUM_THREADS:-unset}"
 echo    "repo     : $REPO"
 echo    "git      : $(git rev-parse --short HEAD)  $(git log -1 --format=%s)"
 echo    "dirty    : $(git status --porcelain | wc -l) modified path(s)"
@@ -84,7 +87,6 @@ $JL -e 'using Pkg; Pkg.test("CoherentSearch")' > "${OUT%.txt}_tests.log" 2>&1
 grep -n -A6 -E 'Test Failed at|Error During Test at|Got exception outside of a @test' \
     "${OUT%.txt}_tests.log" | head -120
 grep -E -A30 '^Test Summary:' "${OUT%.txt}_tests.log" | grep -vE '^\s*$' | head -40
-tail -3 "${OUT%.txt}_tests.log"
 echo "  (full log: ${OUT%.txt}_tests.log)"
 echo
 echo "  -- test_gpu.jl in the CUDA project (Pkg.test cannot run it):"
@@ -119,8 +121,8 @@ run_pair() {   # $1=label $2=lofreq $3=hifreq
   else
     echo "     RESULT: *** FILES DIFFER *** -- first 30 lines of diff:"
     diff "$TMP/$1.cpu.txt" "$TMP/$1.gpu.txt" | head -30
-    echo "     (S/N differing in the last digit is the known ~2e-7 FP32 tolerance;"
-    echo "      a changed frequency, nharm, or candidate COUNT is a real disagreement.)"
+    echo "     (A last-digit change in the PERIOD column is one ulp of 1/f and is harmless."
+    echo "      A changed S/N beyond ~2e-7, frequency, nharm, or candidate COUNT is real.)"
   fi
 }
 run_pair below_nyquist 0.1 5.0
