@@ -16,7 +16,9 @@
 #
 #   0. Provenance.  Host, git revision, Julia, driver, card, load average.  A
 #      timing without these has bitten this project repeatedly.
-#   1. The test suite, including test_gpu.jl, which only runs when CUDA loads.
+#   1. The test suite, then test_gpu.jl on its own in the CUDA project.  An
+#      ordinary Pkg.test() NEVER runs the GPU tests, even on a GPU host:
+#      test/Project.toml has no CUDA, so test_gpu.jl skips itself.
 #   2. *** The CPU-vs-GPU candidate diff. ***  The one step that is not about
 #      speed.  The boxcar renormalisation of 2026-08-28 (commit 1b8fed9) changed
 #      the per-width table the GPU kernels take from the host, and NO COMMIT HAS
@@ -75,11 +77,19 @@ nvidia-smi --query-gpu=name,driver_version,memory.total,compute_cap --format=csv
 
 echo
 echo "############################## 1. test suite ##############################"
-# The box-drawing lines are per-test @info/@warn chatter (the sigma guard fires
-# on the deliberately un-normalised fixtures); dropping them keeps the pass/fail
-# summary inside the tail.  Failures are not box-drawn and survive the filter.
-$JL -e 'using Pkg; Pkg.test("CoherentSearch")' 2>&1 |
-    grep -vE '^[|\xe2\x94\x82\xe2\x94\x94\xe2\x94\x8c]|worst at k=|^# [0-9]+ candidates' | tail -30
+# Keep the whole log, then print what matters: every failure/error header with
+# a few lines of context (tail alone showed only Pkg's stack trace on gina4),
+# and the summary table.
+$JL -e 'using Pkg; Pkg.test("CoherentSearch")' > "${OUT%.txt}_tests.log" 2>&1
+grep -n -A6 -E 'Test Failed at|Error During Test at|Got exception outside of a @test' \
+    "${OUT%.txt}_tests.log" | head -120
+grep -E -A30 '^Test Summary:' "${OUT%.txt}_tests.log" | grep -vE '^\s*$' | head -40
+tail -3 "${OUT%.txt}_tests.log"
+echo "  (full log: ${OUT%.txt}_tests.log)"
+echo
+echo "  -- test_gpu.jl in the CUDA project (Pkg.test cannot run it):"
+$JL -e 'using CUDA, Test; include("test/test_gpu.jl")' 2>&1 |
+    grep -E -A6 'Test Failed at|Error During Test at|Test Summary:|^gpu backend|skipped' | head -60
 
 echo
 echo "################### 2. CPU vs GPU candidates (CORRECTNESS) ################"
