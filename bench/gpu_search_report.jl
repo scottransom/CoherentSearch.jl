@@ -37,12 +37,24 @@ const CS = CoherentSearch
 
 args = copy(ARGS)
 docpu = "--cpu" in args; filter!(!=("--cpu"), args)
-lo, hi = 0.1, 33.3333
+# `--paper`: the settings the cross-card table in the paper is taken with.
+# It pins the WIDE band and adds the fixed-cost fit below, because ns/trial on
+# the narrow band is inflated by the per-file fixed cost and the inflation GROWS
+# with card speed -- 4.3% on a GTX 1080, a projected 17-29% on an L40 -- which
+# compresses exactly the spread a cross-card table exists to show.  It also
+# adds the fixed-cost fit.  It does NOT turn on `--cpu`: a single-threaded CPU
+# arm over the wide band is several minutes, and `bench/paper_gpu_run.sh` times
+# the CPU separately at both 1 and all threads.
+paper = "--paper" in args; filter!(!=("--paper"), args)
+const NARROW_HI = 33.3333          # the six-card table's band; kept for the fit
+lo, hi = 0.1, paper ? 133.3333 : NARROW_HI
 if (i = findfirst(==("--band"), args)) !== nothing
     lo = parse(Float64, args[i+1]); hi = parse(Float64, args[i+2])
     deleteat!(args, i:i+2)
+    paper && @warn "--band overrides --paper's pinned 0.1-133.3333 band; the \
+                    result is NOT comparable with the paper table."
 end
-isempty(args) && error("usage: gpu_search_report.jl FILE.fft [--cpu] [--band lo hi]")
+isempty(args) && error("usage: gpu_search_report.jl FILE.fft [--paper] [--cpu] [--band lo hi]")
 fftfile = args[1]
 
 CUDA.functional() || error("no functional CUDA device")
@@ -218,6 +230,36 @@ end
 println("  NOTE: `scan` is this HOST's CPU and `download` is PCIe -- neither is a")
 println("        property of the card.  Compare cards on the device column.")
 
+# ---------------------------------------------------------------------------
+# The fixed-cost fit.  Two bands at the same blocksize give T = F + c*N, so the
+# report can quote the MARGINAL ns/trial (a property of the card) separately
+# from the per-file fixed cost F (the PCIe upload of the amplitudes plus plan
+# setup, which a production run amortises over many files in one invocation --
+# see `docs/gpu_design.md` 4.6).  Without this split, a fast card looks worse
+# than it is and the two bands' numbers cannot go in one table at all.
+if paper && !isempty(results)
+    println("\nfixed-cost fit (same blocksize, two bands):")
+    nnarrow = max(0, floor(Int, (NARROW_HI * ft.T - lo * ft.T) / lodr) + 1)
+    gon(bs) = search(ft, params; lofreq = lo, hifreq = NARROW_HI, blocksize = bs,
+                     threshold = 6.0, progress = :none, wisdom = false, backend = B)
+    gon(best[1])                                            # warm
+    tn = minimum(begin s = time_ns(); gon(best[1]); (time_ns() - s) / 1e9 end for _ in 1:2)
+    @printf("  narrow 0.1-%.4f Hz  %11d trials   %8.3f s   %6.1f ns/trial\n",
+            NARROW_HI, nnarrow, tn, tn * 1e9 / nnarrow)
+    @printf("  wide   0.1-%.4f Hz  %11d trials   %8.3f s   %6.1f ns/trial\n",
+            hi, total, best[2], best[2] * 1e9 / total)
+    if total != nnarrow
+        c = (best[2] - tn) / (total - nnarrow)              # marginal, s per trial
+        F = tn - c * nnarrow                                # fixed, s per file
+        @printf("  ->  fixed cost F = %.3f s/file,  marginal = %.1f ns/trial\n", F, c * 1e9)
+        @printf("      (the wide band's %.1f ns/trial is %.1f%% above marginal;\n",
+                best[2] * 1e9 / total, 100 * (best[2] / total / c - 1))
+        @printf("       the narrow band's %.1f is %.1f%% above it)\n",
+                tn * 1e9 / nnarrow, 100 * (tn / nnarrow / c - 1))
+        F < 0 && println("      NEGATIVE F: run-to-run scatter exceeded the effect; re-run on a quiet host.")
+    end
+end
+
 if docpu
     println("\nCPU arm (this host's CPU, NOT fitzroy's Xeon -- quote the host):")
     go(CPUBackend(), 2048)
@@ -229,8 +271,8 @@ println("\n" * "="^78)
 println("PASTE THIS BLOCK BACK:")
 @printf("  %s | sm_%s | %d SMs | %.2f GHz | L2 %.0f MB | %.1f GiB\n",
         CUDA.name(dev), string(cap), sms, clk, l2 / 2^20, tot / 2^30)
-@printf("  %s | %d trials | best blocksize %d | %.3f s | %.1f ns/trial | %d cands\n",
-        basename(fftfile), total, best[1], best[2], best[2] * 1e9 / total, length(cands))
+@printf("  %s | band %.4f-%.4f Hz | %d trials | best blocksize %d | %.3f s | %.1f ns/trial | %d cands\n",
+        basename(fftfile), lo, hi, total, best[1], best[2], best[2] * 1e9 / total, length(cands))
 @printf("  phases (of total):  %s\n",
         join((@sprintf("%s %.1f%%", n, 100 * s / acc) for (n, s) in pt), "  "))
 @printf("  phases (of device): %s   [device %.1f%% of instrumented]\n",
