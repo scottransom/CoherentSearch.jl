@@ -424,7 +424,11 @@ under-fill is **1.40x** (32768 → its 131072 optimum), and past that it hits an
 **L2 knee exactly where the size predicts** (interp output 488 B/trial: 64 MB
 fits the L40's 96 MB, 128 MB does not; 1.44x worse). The A100 crosses the same
 kind of knee and gets FASTER because its DRAM can feed it (§4.13's L2:DRAM
-discriminator). Bench vs search at the same Nprof disagree by 1.17x on the L40. The L40 has 4.6x the A100's FP32 and the same speed.
+discriminator). **The 4500 Ada repeats it** (under-fill 1.92x at its search's
+8192; knee between 32 and 64 MB against 48 MB of L2), and both Ada interps are
+on the `SMs x clock` line at their own optimum. **§4.16's `f` scaling of the
+per-phase rows is wrong per phase** (eiger's bench matches the UNscaled interp
+to 1.5%), so read the Ada per-phase splits as ±25%; the totals stand. The L40 has 4.6x the A100's FP32 and the same speed.
 **Also: §4.16's first per-phase table under-counted device phases** by applying
 §4.12's pre-overlap share×clean method; it now uses instrumented seconds.
 **The 2026-09-15/16 runs of `paper_gpu_run.sh` step 4 used `nproc`

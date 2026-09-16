@@ -3339,7 +3339,9 @@ instrumented-device)`. On the two small-chunk cards the timing-on
 synchronisation pushed the instrumented *device* total past the clean total:
 the L40 1.274x over 12,909 chunks, ~94 µs per chunk; the 4500 Ada 1.212x over
 51,639, ~30 µs. On those two cards `f` removes that inflation, assuming it is
-spread evenly across phases. `f` is 0.989–1.000 everywhere else.
+spread evenly across phases. `f` is 0.989–1.000 everywhere else. **That
+assumption turned out wrong** (see the interp sweep below), so for the two Ada
+rows read each phase as ±25%. The device totals are unaffected.
 
 | card | f | zero | interp | transp | xform | boxcar | **device** | clean total | device ns x SMxclk |
 |---|---|---|---|---|---|---|---|---|---|
@@ -3428,7 +3430,9 @@ device copy; `zero` omitted, since it now writes only the gave-up columns):
   highest DRAM share any issue-bound phase has shown in this log. **Reading:
   below ~6 GB/s per SM the boxcar stops being issue-bound and starts being fed
   by DRAM.** 65% is not 100%, so this is an approach to the bandwidth wall, not
-  a clean saturation.
+  a clean saturation. **The ordering survives dropping `f`**, which the
+  interp sweep below shows is not reliable per phase: unscaled, both Ada
+  boxcars read 51–53% of DRAM, still the two highest.
 - **Their transpose and transform are L2-resident** (112–259% of DRAM), which
   is the only reason those phases keep up. It is also why both cards want small
   chunks. At §4.13's ~4.1 kB/trial, the 4500 Ada's 8192 is a 34 MB working set,
@@ -3442,10 +3446,11 @@ device copy; `zero` omitted, since it now writes only the gave-up columns):
   at 262144 than at 65536, and these two cards run at 32768 and 8192, where a
   142-SM card cannot be filled. Tested on the L40 the same day (scored below).
 
-#### The L40's interpolator in isolation: under-fill confirmed, and an L2 knee at 96 MB
+#### Both Ada interpolators in isolation: under-fill confirmed, and L2 knees where predicted
 
-`bench/gpu_interp_bench.jl` on `talanah`, real NGC6624 amplitudes, ns per
-(harmonic, trial). Two runs; the second used `--nprof`:
+`bench/gpu_interp_bench.jl` on `talanah` and `eiger`, real NGC6624 amplitudes,
+ns per (harmonic, trial). The L40 ran twice; its second run and the 4500 Ada's
+run used `--nprof`:
 
 | Nprof | 2048 | 8192 | 16384 | **32768** (the search) | 65536 | **131072** | 262144 |
 |---|---|---|---|---|---|---|---|
@@ -3453,24 +3458,34 @@ device copy; `zero` omitted, since it now writes only the gave-up columns):
 | L40, run 1 | 0.3091 | — | — | — | 0.0255 | — | 0.0337 |
 | L40, run 2 | — | 0.0967 | 0.0546 | **0.0338** | 0.0259 | **0.0242** | 0.0348 |
 | L40, in search (2.38 ns/trial ÷ 60) | — | — | — | **0.0397** | — | — | — |
+| **RTX 4500 Ada**, bench (L2 48 MB) | — | **0.0956** (the search) | 0.0646 | 0.0517 | **0.0499** | 0.0608 | 0.0589 |
+| 4500 Ada, in search (4.66 ÷ 60; unscaled 5.65 ÷ 60) | — | 0.0777 (0.0942) | — | — | — | — | — |
 | A100, bench (§4.15) | — | — | — | — | 0.0470 | — | **0.0346** |
 
 The two runs agree to 1.6% at 65536 and 3.3% at 262144. Throughput per `SMs x
 clock` (1 / (ns × SMxclk), §4.15's column; higher is better): **L40 0.111 at
-65536 and 0.117 at its 131072 optimum**, against 0.103–0.147 for the other five
-cards at 65536 (§4.15 table).
+65536 and 0.117 at its 131072 optimum; 4500 Ada 0.129 at 65536, its optimum**,
+against 0.103–0.147 for the other cards at 65536 (§4.15 table). **Both Ada
+interpolators are on the §0.46 line at their own optimum**, so neither kernel
+is slow; each is slow at the blocksize its search picks.
 
-- **Under-fill is real: 1.40x.** Within the bench, 32768 → 131072 is
-  0.0338 → 0.0242. So the search's blocksize costs the L40's interpolator 1.40x
-  against its own optimum. At the 4500 Ada's 8192 it would cost 4.0x, which is
-  a likely reason the 4500 Ada's interp sits so far off the line (its own
-  sweep, on `eiger`, is pending).
-- **The upturn is an L2 knee, and it sits exactly where the L2 size predicts.**
-  The interpolator's output (61 `ComplexF32` columns, 488 B/trial) is 64 MB at
-  131072, which fits the L40's 96 MB of L2, and 128 MB at 262144, which does
-  not. Across that step the kernel gets **1.44x worse**, where every step below
-  it was a gain. That is the same knee the cuFFT sweep showed (k=1 leaves L2
-  between 65536 and 131072, at 60.5 → 121 MB).
+- **Under-fill is real: 1.40x on the L40, 1.92x on the 4500 Ada.** Within each
+  bench, the search's blocksize against the kernel's optimum is 0.0338 → 0.0242
+  (L40, 32768 → 131072) and 0.0956 → 0.0499 (4500 Ada, 8192 → 65536). That is
+  why the two cards' in-search interp sits 2.7–3.1x off the `SMs x clock` line
+  in the traffic table.
+- **The upturn is an L2 knee, and on both cards it sits exactly where the L2
+  size predicts.** The interpolator's output is 61 `ComplexF32` columns, 488
+  B/trial.
+  - **L40:** 64 MB at 131072 fits its 96 MB of L2, and 128 MB at 262144 does
+    not. The kernel gets **1.44x worse** across that step, after gaining at
+    every step below it.
+  - **4500 Ada:** 32 MB at 65536 fits its 48 MB, 64 MB at 131072 does not, and
+    it gets **1.22x worse** there.
+  - **Two cards, two L2 sizes, and each knee in the one octave its L2 allows.**
+    That is as close to a controlled test as this log has, and it matches both
+    cards' cuFFT knees (k=1 leaves L2 at 60.5 → 121 MB on the L40 and
+    30.2 → 60.5 MB on the 4500 Ada).
 - **The A100 crosses the same kind of knee and gets FASTER** (0.0470 → 0.0346
   from 65536 to 262144, i.e. 32 → 128 MB against 40 MB of L2). That is §4.13's
   L2:DRAM discriminator again. The A100's 1683 GB/s of copy (15.6 per SM) feeds
@@ -3480,15 +3495,22 @@ cards at 65536 (§4.15 table).
   A100 16%). This replaces the earlier draft's "consistent with DRAM, an
   inference": the knee position is measured, and the direction matches the
   memory-per-SM story.
-- **Bench vs search at the same Nprof: 1.17x, not §4.15's 0.2–2.6%.** The
-  search's interp at 32768 reads 0.0397 against the bench's 0.0338. Two
-  candidates: in the search the interpolator shares the 96 MB of L2 with the
-  transpose, transform and boxcar buffers (the whole pipeline is ~134 MB at
-  32768), and the bench has L2 to itself; and §4.16's `f = 0.785` correction
-  assumed the timing-on inflation is spread evenly over phases. Neither is
-  separated. Treat the in-search figure as ±15%.
-- **So the L40's blocksize is a three-way compromise.** The interp is best at
-  131072, the transform (probe) at 65536, and the whole search at 32768. At
+- **Bench vs search at the same Nprof: the `f` correction is NOT reliable per
+  phase.** On the 4500 Ada the bench at 8192 (0.0956) matches the *uncorrected*
+  in-search interp (0.0942) to 1.5%. With `f = 0.825` applied, the in-search
+  figure is 1.23x *faster* than the bench, which cannot be right. On the L40 the
+  corrected in-search figure is 1.17x slower than the bench (0.0397 vs 0.0338)
+  and the uncorrected one 1.49x slower. So the timing-on inflation is **not**
+  spread evenly over phases. On the 4500 Ada the interp carries none of it. On
+  the L40 some of the remaining gap may be L2 contention, since the pipeline is
+  ~134 MB at 32768 and the bench has L2 to itself. **Read the `f`-scaled
+  per-phase rows for the two Ada cards as ±25% per phase.** Their device totals
+  are fine, since `f` only removes what the clean total says is not there.
+- **So each Ada card's blocksize is a compromise.** On the 4500 Ada the interp
+  and the transform (probe) are both best at 32768–65536, and the whole search
+  at 8192, the largest chunk whose ~34 MB pipeline fits 48 MB of L2. Residency
+  of the whole pipeline outweighs the interp's 1.92x there. On the L40 the interp
+  is best at 131072, the transform at 65536, and the whole search at 32768. At
   65536 the pipeline's ~268 MB overflows L2 and something costs 1.14x end to
   end; the transpose and boxcar are the candidates. A phase table at 65536 on
   `talanah` would name the phase. (`gpu_search_report.jl` only tables the best
