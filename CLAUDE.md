@@ -83,7 +83,8 @@ repeatedly — now with a known mechanism (see the AVX-512 entry below).
   carry that figure's line numbers. Roughly **150–250x** slower than production
   and machine-dependent — the same command gave 177.1x and 190.8x on the laptop
   and 200.4x on fitzroy (~243 and ~359 vs ~1.27 and ~1.79 µs per trial
-  fundamental) — so quote it as a range and give it a narrow band. It reuses the
+  fundamental), and 232.3x on `bla0` over 0.1–3 Hz (198.3 vs 0.85 µs,
+  2026-09-15) — so quote it as a range and give it a narrow band. It reuses the
   production candidate collapsing and output verbatim, and differs deliberately
   in two ways: the full geometric width bank rather than the ladder-pruned one,
   and it was where the analytic σ was worked out and validated first.
@@ -182,31 +183,34 @@ at `../riptide`), not the Python original. Run
 `python3 compare/compare_riptide.py FILE.fft` — it is an *occasional* benchmark
 (~5 min at `--preset bench --repeat 3`), not a dev-loop tool.
 
-**We now beat `rseek` single-threaded on both hosts.** Re-measured **2026-08-24**
-(after the scatter fix and the `:f32` default) on
-`PM0063_034C1_DM445.0_red.fft`, `--preset bench`, both covering **0.1–200 Hz in
-120…20 bins**, median of 3:
+**We beat `rseek` single-threaded on all three hosts measured.** Re-measured
+**2026-09-15** (after the 2026-08-28 renormalisation) on
+`PM0063_034C1_DM445.0_red.fft`, `--preset bench`, `OMP_NUM_THREADS=1`, both
+covering **0.1–200 Hz in 120…20 bins**, median of 3:
 
-| | rseek | ours `-t 1` | ratio | ours, all cores |
-|---|---|---|---|---|
-| i7-10510U (laptop, 4 cores) | 21.13 s | **10.05 s** | **2.13x faster** | 5.20 s `-t 4` |
-| Xeon Silver 4114 (fitzroy, 20 cores) | 19.81 s | **13.45 s** | **1.46x faster** | 2.86 s `-t 20` |
+| | rseek | ours `-t 1` | ratio | start-up + search, rseek / ours | pure compute |
+|---|---|---|---|---|---|
+| i7-10510U (laptop, 4 cores) | 19.92 s | **9.20 s** | **2.16x faster** | 0.51 + 19.12 / 0.91 + 8.17 | **0.43x** |
+| Xeon Silver 4114 (fitzroy, 20 cores) | 20.31 s | **12.89 s** | **1.57x faster** | 1.07 + 19.17 / 1.36 + 11.50 | **0.60x** |
+| 2× EPYC 7413 (`bla0`, 48 cores) | 9.91 s | **7.25 s** | **1.37x faster** | 0.97 + 8.94 / 1.14 + 6.08 | **0.68x** |
 
-(2026-08-22, for comparison: laptop 22.25 / 11.99 / 1.84x / 7.77; fitzroy
-19.83 / 15.79 / 1.26x / 3.51. `rseek` itself is reproducible to ~1–5% across the
-two dates, which is the scatter to judge our column against.)
-
-Start-up split, same runs: laptop rseek 1.10 + 19.89 s against ours 0.85 +
-9.01 s (**pure compute 0.45x**); fitzroy rseek 0.79 + 18.74 s against ours
-1.44 + 11.89 s (**0.63x**). On both hosts the pure-compute ratio is at least as
+(2026-08-24, for comparison: laptop 21.13 / 10.05 / 2.13x; fitzroy
+19.81 / 13.45 / 1.46x, with `-t 4` 5.20 s and `-t 20` 2.86 s. 2026-08-22:
+laptop 22.25 / 11.99 / 1.84x; fitzroy 19.83 / 15.79 / 1.26x. `rseek` itself is
+reproducible to ~1–6% across the three dates, which is the scatter to judge our
+column against. **The EPYC is riptide's best host by 2x and our narrowest
+margin** — quote the host.) On every host the pure-compute ratio is at least as
 good as the wall-clock one, so start-up is not what the comparison measures.
 
-**And we detect more strongly**: the 7.1185 Hz pulsar at **S/N 12.30 vs
-riptide's 11.80** (ducy 10.0% against its 6.5% — its width bank is built from
-`bins_min` and cannot reach this pulse at the depth it folded), plus the
-0.2603 Hz candidate at 7.32 that it does not report. riptide's two extra entries
-are the `f/2` and `2f` of the pulsar, which it does not filter and we collapse.
-Both hosts report identical candidates, as they must. **Our S/N is now riptide's
+**The pulsar is now slightly WEAKER in ours: S/N 11.65 vs riptide's 11.80**
+(ducy 10.0% from the `k=6`, `H=10` fold, against its 6.5% — its width bank is
+built from `bins_min` and cannot reach this pulse at the depth it folded). It
+read 12.30 before the 2026-08-28 renormalisation, which took ~3.3% off `k=6`
+S/N. The 0.2603 Hz candidate at 7.32 is still ours alone. riptide's two
+extra entries are the `f/2` and `2f` of the pulsar, which it does not filter
+and we collapse. All three hosts report identical candidates, as they must.
+**The line "we detect more strongly" that stood here is retired** — and per
+§3.2 it was never a sensitivity statement anyway; the Monte Carlo is. **Our S/N is now riptide's
 statistic exactly**, so the two columns are finally the same quantity — but this
 is still one pulsar in one observation, so read §3.2 before drawing any
 sensitivity conclusion from the 0.5 between them.
@@ -392,15 +396,28 @@ optimisation below (1.84x vs 1.26x on the same code and the same data).
 (`ext/CoherentSearchCUDAExt.jl`, CUDA under `[weakdeps]`), so a CPU-only user
 downloads nothing and `src/search.jl` is untouched. **`docs/gpu_design.md` is the
 running log — read it before touching any of this**; it keeps the wrong turns in
-on purpose. **Six cards are now measured, 6 to 108 SMs, all reporting
-byte-identical candidates** (§4.8, §4.12). On the 105M-trial NGC6624 file, against
-fitzroy's 20-core Xeon (11.82 s): **A100-SXM4-80GB 9.62x**, RTX 4000 SFF Ada
-3.79x, **RTX A4000 3.48x**, RTX 2080 Super 2.65x, GTX 1080 1.24x, **RTX A400
-0.66x — the first card measured that LOSES to the CPU.** **The A100 and A4000
-figures are 2026-08-27 re-runs on QUIET hosts with the overlap (§4.15); the
-5.94x and 2.16x that stood here before were 18.86 and 51.9 ns/trial against
-today's 11.6 and 32.2, and the A4000's old row was taken on a 104-core node at
-load 31–102. The other four rows are all pre-overlap and are lower bounds.**
+on purpose. **Eight cards are now measured, 6 to 142 SMs, all agreeing with the
+CPU.** **The paper's numbers are §4.16** (2026-09-15/16, `bench/paper_gpu_run.sh`,
+NGC6624 over the WIDE band 0.1–133.3 Hz = 423M trials, all post-overlap and
+post-fused-transpose), against fitzroy's CPU at `-t 40` on the same band (39.79
+s, 94.1 ns/trial): **L40 8.96x (10.5 ns/trial), A100 8.81x (10.7)** — a tie —
+RTX 4500 Ada 5.51x (17.1), **RTX A4000 3.30x (28.5)**, GTX 1080 1.33x (70.7),
+**RTX A400 0.65x (145.0) — still the only card that LOSES to fitzroy.** **Do not
+compare these ratios with the older "vs fitzroy `-t 20`" ones (narrow band, 112.0
+ns/trial):** the A100 went 9.62x → 8.81x while its own ns/trial *improved*
+11.6 → 10.7. **A big CPU box beats a mid-range card**: `bla0`'s 2× EPYC 7413
+(10.02 s at `-t 96`) is faster than its own A4000, and `rocinante`'s 7975WX
+(9.14 s) is 6.7x its A400. On all six: 827/827 + 300/300, the past-Nyquist CPU
+vs GPU `.cohout` byte-identical, and below Nyquist only the last digit of four
+printed *periods* differs (one ulp of `1/f`; the six GPUs agree with each other
+exactly). The RTX 4000 SFF Ada and 2080 Super rows (§4.12, pre-overlap) were not
+re-run.
+**§4.12's "near-linear across SM count" does NOT survive the L40**: 2.3x the
+A100's `SMs x clock`, the same device ns/trial. The bandwidth-per-SM hypothesis
+is unmeasured; `bench/gpu_probe.jl` on `talanah`/`eiger` would test it.
+**`paper_gpu_run.sh` step 4 uses `nproc` (hyperthreads)**. `eiger`'s thread
+scaling puts that ~2x slow there, so its CPU row is unusable, and `talanah`'s is
+~1.3x pessimistic.
 **Two headline verdicts have been retired by the A100 (§4.12) — do not quote
 them:** (a) *"above ~48 SMs the workload does not care what you buy"* was three
 cards that all had 48 SMs; at fixed SM count that still holds (the three 48-SM
@@ -437,11 +454,14 @@ DRAM, impossible from memory — so residency is worth **2.32x** to it; the A100
 has the same 40 MB but 1683 GB/s of DRAM, never exceeds it, and is instead
 **2.21x** worse at the SMALL end because 108 SMs cannot be filled. Two
 mechanisms, opposite directions, near-equal size. 65536 is
-within **1.22x** of the optimum on the cards measured. **The one card it costs
-anything real is the RTX 4000 SFF Ada — pass `--blocksize 8192` there**, and
-that penalty GREW from 1.13x to **1.22x** once the overlap landed, because the
-overlap helps small chunks most and so sharpens a card that already wanted them
-(§4.13). The other five sweeps are pre-overlap; the bound is provisional.
+within **1.28x** of the optimum on the cards measured (§4.16, post-overlap on six):
+**both Ada workstation cards want 8192 — the RTX 4500 Ada pays 1.28x at the
+default, the RTX 4000 SFF Ada 1.22x** (that one grew from 1.13x once the overlap
+landed, because the overlap helps small chunks most, §4.13). The L40 pays 1.14x
+(optimum 32768), the A100 1.18x (1048576), the A4000 and 1080 1.06x, the A400
+1.00x. **262144 is within 1% of 65536 or better on every card it fits, but it does not fit
+the A400 beside a 1.29 GiB file** — so the open default question is a
+memory-clamped one, not a new constant (§4.16).
 `gpu_search_report.jl` still sweeps from 2048 and *recommends*, reporting the
 penalty against the GPU default; `--gpu` prints the default it used and warns
 only on an explicit `--blocksize <= 2048`; and the README has a GPU section. The governing rule, Scott's: **automate what can't hurt, measure what
@@ -600,6 +620,14 @@ re-deriving them.
     thread increase — but it is not negative. **Do not re-quote the old claim.**
   - The desktop carries ~2 cores of its own load (Chrome, Zoom), which is worth
     remembering before reading too much into the top of the curve.
+  - **Bigger hosts, 2026-09-15/16** (`docs/Summary_and_Future_Work.md` §3.1,
+    README): `bla0` (2× EPYC 7413) **26.8x at `-t 48`, `s` 0.017**; OzSTAR
+    `dave41` 24.6x at 32; `talanah` (2× Xeon 4514Y) 16.3x at 32; `eiger`
+    (w5-3433) 10.1x at 16. The first three ran NGC6624 at 0.1–33.3 Hz and
+    `eiger` ran PM0063. **So fitzroy's `s = 0.065` is the machine, not the
+    code.** Every host that went past its physical cores got SLOWER (`eiger`
+    10.1x → 4.7x at 32 threads), so `-t auto` is wrong on SMT boxes. The raw
+    CSVs/PNGs are in Scott's working tree, uncommitted.
 - **Done (2026-07):** quickselect median in `_profile_snr` (was 41% of runtime →
   7.5%) and a type-stable `Workspace{S,B,D}` (killed hot-loop dynamic `mul!`
   dispatch) — together ~1.6× warm single-thread, results unchanged. See §2 of

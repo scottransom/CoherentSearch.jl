@@ -1883,6 +1883,10 @@ directly comparable to §4.8 and *not* its 8192 optimum.
 | RTX 4000 Ada | 48 | 74.9 | 40 MB | 239 | 16384 | 1.42 | 6.92 | 3.74 | 13.43 | 9.52 | 2.65 | 2.97 | **35.0** | **40.7** |
 | **A100 80GB** | 108 | 152.3 | 40 MB | 1683 | 262144 | **0.31** | **2.02** | **1.79** | **3.96** | **4.21** | 2.10 | 3.54 | **12.29** | **18.86** |
 
+**SUPERSEDED FOR THE PAPER BY §4.16** (2026-09-15/16: six cards, wide band,
+post-overlap and post-fused-transpose, 2 new cards). The note below is the
+intermediate state.
+
 **SUPERSEDED FOR TWO ROWS — see §4.15.** Both the A4000 and the A100 have since
 been re-run on quiet hosts with the §4.13 overlap: **32.2 and 11.6 ns/trial**,
 against the 51.9 and 18.86 here. The A4000 row in particular was taken on a
@@ -3237,13 +3241,15 @@ access-pattern family is ruled out, so the list is much shorter than §4.12's.
      to take without writing a batched small-transform kernel, which §4.2's
      direct-DFT probe already measured at **4.3-4.5x slower** than cuFFT.
 
-3. **Re-sweep `--blocksize` and propose 262144 as the default.** 65536 now costs
+3. **Re-sweep `--blocksize` and propose 262144 as the default.** *(Re-swept on
+   five cards in §4.16; 262144 does not fit the A400 beside a 1.29 GiB file, so
+   the open question is now a memory-clamped default.)* 65536 now costs
    the A100 1.19x and the A4000 1.10x where 262144 costs 1.05x and 1.02x, and
    262144 still fits a 3.67 GiB card. Needs the A400 and 2080 Super re-swept
    post-overlap before it is more than a two-card argument.
 
-4. **Score the two open projections** — ~1.11x (A4000) and ~1.07x (A100) for the
-   zeroing plus fused transpose — on the next `gpu_search_report.jl` from each.
+4. ~~**Score the two open projections**~~ — **done in §4.16: A4000 1.099x
+   against ~1.11x, A100 1.091x against ~1.07x.**
 
 5. **Multi-GPU inside one invocation**, if `bin/parallel_search.py` ever stops
    being enough. The four `_CACHE_*` refs would need keying by `CuDevice` and one
@@ -3256,9 +3262,174 @@ staging load (1.55x slower, and it rules out the access-pattern family for that
 phase), having the interpolator write the rung stacks directly (§4.2's 2.54-2.65x
 scatter), and per-rung transform sub-batching (§4.10, scored at 1.000x).
 
----
+### 4.16 The paper's cross-card run — six cards, one script, 2026-09-15/16
 
-## 5. Correctness — the fourth pin
+`bench/paper_gpu_run.sh` on `NGC6624_16L_DM87.40_red.fft` (1.29 GiB,
+T = 26459 s), `-t 1`, **pinned wide band 0.1–133.3333 Hz = 423,032,692 trial
+fundamentals** (nharms 60, maxdecim 6, i.e. spin coverage to 800 Hz). Raw output
+is `paper_<host>_<card>_<date>.txt` in Scott's working tree. All but the A100
+ran at `79e08e5`. The A100 ran at `bdd63cf` plus one local edit, which is that
+commit's `bench/` fixes. **Every row is post-overlap (§4.13) and post-fused-
+transpose (§4.15), so this table supersedes §4.12's and §4.15's as the paper's
+numbers.** §4.12's rows remain the record of what was measured at the time.
+
+#### Correctness first: all six pass
+
+- `Pkg.test()` **827/827** and `test_gpu.jl` **300/300** on every host.
+- **Past the Nyquist knee** (108.846–136.058 Hz, the `nfilled` path of
+  2026-08-28's renormalisation): CPU and GPU `.cohout` **byte-identical**, 72
+  candidates, on all six.
+- **Below it** (0.1–5.0 Hz): 36 candidates each side. The same four lines differ
+  on every card, in the **last digit of the printed period** only (one ulp of
+  `1/f`: e.g. `4236.978935532090` vs `…091`). S/N, frequency and nharm agree.
+  The six GPUs agree with **each other** byte for byte.
+- The full wide-band search gives **285 candidates on every card**, with the same
+  top five.
+
+That is now eight cards across five compute capabilities (sm_61, sm_75, sm_80,
+sm_86 x2, sm_89 x3) agreeing with the CPU.
+
+#### The table
+
+| | **L40** | **A100-SXM4-80GB** | **RTX 4500 Ada** | **RTX A4000** | **GTX 1080** | **RTX A400** |
+|---|---|---|---|---|---|---|
+| host | `talanah` | `gina4` (OzSTAR) | `eiger` | `bla0` | `fitzroy` | `rocinante` |
+| compute cap. | 8.9 | 8.0 | 8.9 | 8.6 | 6.1 | 8.6 |
+| SMs / clock | **142** / 2.49 GHz | 108 / 1.41 | 60 / 2.58 | 48 / 1.56 | 20 / 1.73 | **6** / 1.76 |
+| SMs x clock | **353.6** | 152.3 | 154.8 | 74.9 | 34.7 | **10.6** |
+| L2 | **96 MB** | 40 MB | 48 MB | 4 MB | 2 MB | **1 MB** |
+| device memory | 44.4 GiB | 79.3 | 23.5 | 15.6 | 7.9 | 3.7 |
+| host load (at report) | 5.22 | 37.5 (batch node, cpuset-isolated) | 5.42 | 1.81 | 2.96 | 4.94 |
+| **best `--blocksize`** | **32768** | **1048576** | **8192** | 524288 | 262144 *(capped)* | 131072 *(capped)* |
+| **clean total** | **4.440 s** | **4.515 s** | 7.225 s | 12.065 s | 29.909 s | 61.359 s |
+| **ns/trial** | **10.5** | **10.7** | 17.1 | 28.5 | 70.7 | 145.0 |
+| marginal ns/trial (2-band fit) | 10.3 | 10.4 | 17.2 | 28.3 | 70.0 | 144.1 |
+| fixed cost F (s/file) | 0.081 | 0.107 | **−0.047** | 0.110 | 0.287 | 0.399 |
+| narrow band (0.1–33.3), ns/trial | 11.1 | 11.4 | 16.7 | 29.3 | 72.7 | 147.9 |
+| 65536 (the default) costs | 1.14x | 1.18x | **1.28x** | 1.06x | 1.06x | 1.00x |
+| 262144 costs | 1.14x | 1.05x | 1.13x | 1.01x | 1.00x | does not fit |
+| CPU default 2048 costs | 4.98x | 6.82x | 2.94x | 2.59x | 1.80x | 1.26x |
+| **vs fitzroy CPU `-t 40`** (39.79 s) | **8.96x** | **8.81x** | 5.51x | 3.30x | 1.33x | **0.65x** |
+| vs its own host's CPU | 4.66x (`-t 64`) | — | *(see below)* | **0.83x** (`-t 96`) | 1.33x (`-t 40`) | **0.15x** (`-t 64`) |
+
+**The L40 and the A100 are tied**, 1.7% apart on wall clock and 1% on marginal
+ns/trial. That is not a ranking, and the two hosts differ in load and CPU.
+**The A400 is still the only card slower than fitzroy's 20 cores**, and on its
+own host (a 32-core Threadripper PRO 7975WX, 9.14 s at `-t 64`) it is 6.7x
+slower. **The RTX A4000 also loses to its own host**, 2× EPYC 7413 at 10.02 s,
+which makes a point worth putting in the paper: a modern many-core CPU box is
+competitive with a mid-range GPU on this workload.
+
+**The fitzroy reference changed and old ratios are not comparable.** §4.12/§4.15
+quoted "vs fitzroy `-t 20`" on the *narrow* band (11.82 s, 112.0 ns/trial). This
+row is `-t 40` (all hardware threads) on the *wide* band, 94.1 ns/trial. That
+denominator is 16% smaller, so the A100's 9.62x → 8.81x is the reference moving,
+not the card getting slower: its own ns/trial improved 11.6 → 10.7.
+
+#### Per-phase ns/trial, at each card's best blocksize
+
+Computed the §4.12 way: share of the instrumented total × clean total ÷ trials.
+
+| card | zero | interp | transp | xform | boxcar | dload | scan | **device** | **total** | device ns x SMxclk |
+|---|---|---|---|---|---|---|---|---|---|---|
+| L40 | 0.14 | 1.76 | 0.84 | 2.71 | 2.35 | 0.62 | 2.08 | **7.80** | **10.5** | 2757 |
+| A100 80GB | 0.01 | 1.27 | 0.81 | 2.85 | 2.61 | 0.69 | 2.41 | **7.56** | **10.7** | **1151** |
+| RTX 4500 Ada | 0.51 | 3.88 | 1.79 | 3.74 | 4.29 | 0.87 | 2.00 | **14.21** | **17.1** | 2200 |
+| RTX A4000 | 0.09 | 3.28 | 3.34 | 9.53 | 5.39 | 0.80 | 6.10 | **21.62** | **28.5** | 1619 |
+| GTX 1080 | 0.07 | 11.95 | 7.00 | 29.13 | 13.36 | 3.25 | 5.94 | **61.51** | **70.7** | 2133 |
+| RTX A400 | 0.15 | 29.73 | 19.73 | 52.36 | 38.15 | 2.61 | 2.32 | **140.11** | **145.0** | 1481 |
+
+Device-only shares:
+
+| card | zero | interp | transpose | transform | boxcar | device % of instrumented |
+|---|---|---|---|---|---|---|
+| L40 | 1.8% | 22.7% | 10.7% | **34.7%** | 30.2% | 74.3% |
+| A100 80GB | 0.1% | 16.8% | 10.8% | **37.7%** | 34.6% | 70.9% |
+| RTX 4500 Ada (8192) | 3.6% | 27.3% | 12.6% | 26.3% | **30.2%** | 83.1% |
+| RTX A4000 | 0.4% | 15.1% | 15.5% | **44.1%** | 25.0% | 75.8% |
+| GTX 1080 | 0.1% | 19.4% | 11.3% | **47.4%** | 21.7% | 86.9% |
+| RTX A400 | 0.1% | 21.2% | 14.1% | **37.4%** | 27.2% | 96.6% |
+
+- **§4.15's two fixes show in the `zero` and `transpose` columns.** `zero` is
+  ≤0.4% of device time on the four cards whose optimum blocksize is ≥131072, and
+  larger only on the two that want small chunks (4500 Ada 3.6%, L40 1.8%).
+  `transpose`'s device share fell on every card re-measured since §4.12: A4000
+  19.5 → 15.5%, A400 17.6 → 14.1%, 1080 15.0 → 11.3%, A100 14.6 → 10.8%.
+- **The transform is the largest device phase on five of six cards.** The
+  exception is the 4500 Ada at its 8192 optimum, where the boxcar leads, as it
+  did on the other Ada at 8192 in §4.12. §4.15's "tied on the 40 MB cards" now
+  reads 37.7% against 34.6% on the A100. So §4.15's item 2, **the C2C-vs-C2R
+  probe, is still the next device-side experiment**, and the phase it targets is
+  the biggest one almost everywhere.
+- **The L40 does not follow `SMs x clock`.** It has 2.3x the A100's `SMs x clock`
+  and about the same device ns/trial, so its `device ns x SMxclk` is 2.4x the
+  A100's. The 4500 Ada sits nearly as high, at 2200. Bandwidth per SM is the
+  obvious suspect: on nominal spec-sheet figures the L40 has ~6 GB/s per SM,
+  the 4500 Ada ~7 and the A100 80GB ~19. But the GTX 1080 (~16) sits at 2133
+  and does not fit that ordering, and **none of it is measured**.
+  `bench/gpu_probe.jl` on `talanah` and `eiger` would give achieved bandwidth and
+  FP32 in one cheap run each. Until then, **§4.12's "near-linear across SM
+  count" does not survive a 142-SM card**, and the paper should not state it as
+  a rule.
+
+#### Two predictions scored
+
+§4.15's item 4 pre-registered the zeroing + fused transpose at **~1.11x
+(A4000)** and **~1.07x (A100)**.
+
+- **A4000: 1.099x.** Narrow band, quiet `bla0` both times: 32.2 → 29.3 ns/trial
+  (1048576 then, 524288 now, and 1048576 reads 28.6 against 28.5 on the wide band
+  today, so the blocksize change is worth <1%). **Hit.**
+- **A100: 1.091x.** Wide band at 1048576: 4.926 → 4.515 s (11.65 → 10.67
+  ns/trial). **Hit, 2% over**, with two confounds: §4.15 ran on `gina8`, this
+  on `gina4`; and the 2026-08-28 renormalisation cut this band's candidates
+  802 → 285, which removes host rescan work (bounded by the ~2% host share).
+- Not pre-registered, recorded for completeness: the **A400** went 169.2 → 147.9
+  ns/trial on the narrow band since §4.12 (1.144x, overlap + both fixes, and a
+  blocksize 65536 → 131072 that the memory gate's reclaim fix made reachable), and the
+  **GTX 1080**'s narrow band reads 72.7 against the 72.0 of its post-fix
+  re-measure: flat.
+
+#### Data-quality notes
+
+- **`eiger`'s fixed-cost fit came out negative** (F = −0.047 s): the narrow
+  band's ns/trial was *lower* than the wide band's, which scatter can produce
+  and a real cost cannot. Load was 5.42 during the report against 0.00 when the
+  script started, so something else was running. Its sweep is also **non-monotone**, 8192 →
+  7.23 s, 65536 → 9.22, 1048576 → 7.84, which is the §4.11 Ada shape again: a
+  minimum at small chunks and a second, lower-occupancy branch at large ones.
+  Its ns/trial is usable. Do not quote its F.
+- **`eiger`'s CPU number is not usable.** Step 4 ran `-t 32` = all hardware
+  threads on a 16-core w5-3433 and read 55.4 s (131 ns/trial), and
+  `eiger_16core_thread_scaling.csv`, taken 12 minutes later, shows the same
+  collapse: 32 threads is **2.16x slower than 16** there, with 4.4x the
+  CPU-seconds. (Given the load above, that run may be contaminated too. It needs
+  repeating on a quiet `eiger` before it is quoted as a property of the CPU.) The script uses `nproc`, which
+  counts hyperthreads. `talanah` is milder (its 64-thread point is 1.28x behind
+  its 32-thread best on the thread-scaling run), so the L40's 4.66x
+  over-states the card against a well-configured host by about that much.
+  **`paper_gpu_run.sh` step 4 should use the physical core count.**
+- **Two sweeps are capped by the memory gate again**, not by the card: the 1080
+  (524288 needs 3.31 GiB against 3.41 free after the desktop's share) and the A400
+  (262144 "needs 2.3 GiB but only 2.45 GiB is free" — the 0.90 margin, the same
+  self-contradictory-looking message §4.13 documented). Both were still
+  gaining at their last row, so their optima are lower bounds.
+- `gina4` was a batch node at load 37 with this job cpuset-isolated. The
+  report's own guard (instrumented total above the clean total, 6.25 vs 4.52 s)
+  passed, so the phase table stands.
+
+#### What this changes in §4.15's next-work list
+
+- **Item 3 (propose 262144 as the default)** now has five post-overlap cards
+  instead of two. 262144 is within 1.05x on three (A100, A4000, 1080), 1.13x and
+  1.14x on the two small-chunk cards (4500 Ada, L40), where 65536 is 1.28x and
+  1.14x. So it is **never worse than 65536** on any card it fits. But **it does
+  not fit the A400 alongside this 1.29 GiB file**, so as a fixed default it
+  would turn a working search into an error on the smallest card. A
+  memory-clamped default (the largest of {262144, 131072, 65536} the gate
+  accepts) would avoid that. It is a design decision, not a measurement, and it
+  has not been made.
+- **Item 4 is closed** (scored above).
 
 The existing three pins (Python oracle → end-to-end equivalence → interpolator)
 are untouched, because the CPU path does not change. The GPU adds a fourth rung

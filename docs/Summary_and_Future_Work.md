@@ -773,6 +773,40 @@ optimisations differently, and `Float32` is the case in point: 1.14x at `-t 16`,
 recording that the choice exists, because several past decisions here were made
 against an unstated assumption of multi-threaded deployment.
 
+#### Larger machines, and the current 20-core curve (2026-08-24 → 2026-09-16)
+
+The table above is historical. The 20-core curve after the AVX-512 scatter fix
+and the `:f32` default (2026-08-24, `docs/thread_scaling.csv`) is 11.58 s at
+`-t 1` → 1.29 s at `-t 20`, **9.00x, Amdahl `s = 0.065`**. The same script on
+four more hosts (warm in-process, median per point; `bench/thread_scaling.jl`
+defaults, threshold 6.3):
+
+| host | CPU | physical cores | file | `-t 1` | best | `s` (fit to ≤ physical) | CPU-s inflation at the physical count |
+|---|---|---|---|---|---|---|---|
+| `bla0` | 2× EPYC 7413 | 48 | NGC6624 | 77.7 s | **26.8x @ 48** | **0.017** | +43% |
+| `dave41` (OzSTAR) | not recorded | 32 (allocation) | NGC6624 | 75.9 s | 24.6x @ 32 | 0.020 | +24% |
+| `talanah` | 2× Xeon Silver 4514Y | 32 | NGC6624 | 74.3 s | 16.3x @ 32 | 0.028 | +69% |
+| `eiger` | Xeon w5-3433 | 16 | PM0063 | 5.49 s | 10.1x @ 16 | 0.030 | +45% |
+| `fitzroy` | 2× Xeon Silver 4114 | 20 | PM0063 | 11.58 s | 9.00x @ 20 | 0.065 | +62% |
+
+NGC6624 is `NGC6624_16L_DM87.40_red.fft` at 0.1–33.3 Hz (105.5M trials, 42
+candidates at every thread count); PM0063 is the bench config above (3
+candidates).
+
+- **The parallel decomposition is not the limit.** On the AMD boxes the serial
+  fraction is 3–4x smaller than on fitzroy, and `bla0`'s CPU-seconds are flat to
+  +10% up to 16 threads. fitzroy's `s = 0.065` is a property of that machine
+  (its memory bandwidth per core), as this section already argued.
+- **Hyperthreads never help.** Past the physical core count every host that
+  measured it got slower: `dave41` 24.6x → 21.6x at 48, `talanah` 16.3x →
+  14.2x → 12.7x at 48/64, `eiger` 10.1x → 4.7x at 32. So `-t auto` (logical
+  CPUs) is the wrong production setting on SMT machines, and
+  `bench/paper_gpu_run.sh`'s CPU step, which uses `nproc`, under-states the CPU on
+  `eiger` and `talanah` (`docs/gpu_design.md` §4.16).
+- `eiger`'s collapse at 32 threads (CPU-seconds 4.4x) was measured minutes after a
+  GPU report that saw load 5.4 on the same box. Repeat it quietly before quoting
+  the size of the effect. The direction matches the other hosts.
+
 #### Where Float32's extra `-t 1` cost actually is (2026-08-15)
 
 Profiled both arms at `-t 1` over the *same* band the A/B used. **Note the

@@ -17,9 +17,10 @@ a GPU cleanly, none of which the FFA's recursion does easily.
 
 In short:
 
-- **More sensitive.** In an injection Monte Carlo over ~120,000 noise
-  realisations, with every code's threshold matched to the same measured
-  false-alarm rate, we detect **76%** of white-noise injections. riptide's
+- **More sensitive.** In an injection Monte Carlo over 76,105 white-noise
+  realisations (plus 84,871 with red noise), with every code's threshold
+  matched to the same measured false-alarm rate, we detect **76%** of
+  white-noise injections. riptide's
   `rseek` detects 71% in its deepest configuration (which costs ~6x our
   runtime) and 50% in the configuration matched to our frequency coverage;
   PRESTO's `accelsearch` detects 42%. See `docs/comparison_points.md`, and read
@@ -33,9 +34,10 @@ In short:
   threshold flat — 6.75 on white noise, 6.70–6.75 out to a 50 Hz red-noise knee.
   riptide detrends in the time domain instead, and over the same range its
   matched threshold climbs from 7.6 to 250.
-- **Fast.** Single-threaded it is **1.5–2.1x** `rseek` over matched frequency
-  coverage. It scales ~9x across 20 cores, and the whole search runs on a GPU:
-  an A100 is ~9.6x a 20-core Xeon, an RTX A4000 ~3.5x.
+- **Fast.** Single-threaded it is **1.4–2.2x** as fast as `rseek` over matched
+  frequency coverage on three machines. It scales ~27x across 48 cores, and the
+  whole search runs on a GPU: an L40 or an A100 is ~9x a 20-core Xeon, an RTX
+  A4000 ~3.3x.
 - **Pinned, not eyeballed.** Every numerical result is cross-validated against
   the original Python [`coherent_search`](../coherent_search) package used as an
   independent oracle (~1e-16 relative), the optimised search is pinned against
@@ -170,11 +172,11 @@ Nearly every non-obvious choice below follows from one of them.
 - **Chunk-parallel, whole chunks per thread.** Trials are grouped into chunks of
   2048 and handed to tasks round-robin, each with a private workspace. That is
   what lets a harmonic's Fourier-bin window be loaded once per chunk and read
-  back from L1 by every trial in it. ~9x on 20 cores.
+  back from L1 by every trial in it. ~9x on 20 cores, ~27x on 48.
 - **A GPU extension.** The whole search runs on a CUDA card
   (`ext/CoherentSearchCUDAExt.jl`); CUDA is a weak dependency, so a CPU-only
-  user downloads nothing. Six cards have been measured, 6 to 108 SMs, all
-  reporting byte-identical candidates.
+  user downloads nothing. Eight cards have been measured, 6 to 142 SMs, all
+  reporting the same candidates as the CPU.
 - **Start-up is a real cost and is treated as one.** Julia's JIT once dominated
   short runs (15.6 s wall for 1.4 s of searching). A precompile workload plus
   keeping the CLI inside the package cut that to 2.4 s, and one invocation
@@ -581,48 +583,54 @@ fmax     = 1 / Pmin        hifreq   = fmax / maxdecim   (our fundamental range;
 0.1–200 Hz in 120…20 bins. `Pmin` defaults to `tsamp * bmin`, riptide's own
 floor, so both run the widest band the data support.
 
-Measured **2026-08-24** on `PM0063_034C1_DM445.0_red.fft` (T=2097 s),
-`--preset bench`, both covering 0.1–200 Hz, median of 3, on both development
-machines:
+Measured **2026-09-15** on `PM0063_034C1_DM445.0_red.fft` (T=2097 s),
+`--preset bench`, both covering 0.1–200 Hz, median of 3, `OMP_NUM_THREADS=1`,
+on three machines:
 
-| | `rseek` | ours `-t 1` | like-for-like | ours, all cores |
-|---|---|---|---|---|
-| i7-10510U (laptop, 4 cores) | 21.13 s | **10.05 s** | **2.13× faster** | 5.20 s (`-t 4`) |
-| Xeon Silver 4114 (20 cores) | 19.81 s | **13.45 s** | **1.46× faster** | 2.86 s (`-t 20`) |
+| | `rseek` | ours `-t 1` | like-for-like |
+|---|---|---|---|
+| i7-10510U (laptop, 4 cores) | 19.92 s | **9.20 s** | **2.16× faster** |
+| Xeon Silver 4114 (20 cores) | 20.31 s | **12.89 s** | **1.57× faster** |
+| EPYC 7413 (2×24 cores) | 9.91 s | **7.25 s** | **1.37× faster** |
 
-The two hosts differ by more than any single optimisation in the code, so quote
-the machine and the date with the ratio.
+The hosts differ by more than any single optimisation in the code, so quote
+the machine and the date with the ratio. (On 2026-08-24 the first two read
+2.13× and 1.46×, and `rseek`'s own times agree with today's to 2–6%.)
 
 The harness also splits start-up from searching, so the obvious objection —
 that this is really measuring Julia's start-up — is answered on every run. It
 is not; if anything start-up works against us, since ours is the larger of the
-two on the workstation and we win anyway.
+two on every host and we win anyway.
 
 | | start-up | searching | pure-compute ratio |
 |---|---|---|---|
-| `rseek` (laptop) | 1.10 s (Python import) | 19.89 s | |
-| ours `-t 1` (laptop) | 0.85 s (boot + JIT + FFTW plans) | 9.01 s | **0.45×** |
-| `rseek` (Xeon) | 0.79 s | 18.74 s | |
-| ours `-t 1` (Xeon) | 1.44 s | 11.89 s | **0.63×** |
+| `rseek` (laptop) | 0.51 s (Python import) | 19.12 s | |
+| ours `-t 1` (laptop) | 0.91 s (boot + JIT + FFTW plans) | 8.17 s | **0.43×** |
+| `rseek` (Xeon) | 1.07 s | 19.17 s | |
+| ours `-t 1` (Xeon) | 1.36 s | 11.50 s | **0.60×** |
+| `rseek` (EPYC) | 0.97 s | 8.94 s | |
+| ours `-t 1` (EPYC) | 1.14 s | 6.08 s | **0.68×** |
 
-so on both hosts the pure-compute ratio is at least as good as the wall-clock
-one. Note that riptide's `find_peaks` is 9.5 s on the laptop — 48% of its
-compute — and is a separate pass doing candidate work we do inline; comparing
+so on every host the pure-compute ratio is at least as good as the wall-clock
+one. Note that riptide's `find_peaks` is 29–35% of its compute (6.7 s on the
+laptop) and is a separate pass doing candidate work we do inline; comparing
 our figure against its `ffa_search` alone would be wrong.
 
-**Single-threaded we are 1.5–2.1× faster, while doing ~2.8× the folds** — the
+**Single-threaded we are 1.4–2.2× faster, while doing ~2.8× the folds** — the
 harness prints that work ratio before it times anything, because the two numbers
 have to be read together. We fold every frequency below `hifreq` once per
 decimation factor, where `rseek` folds it exactly once; that redundancy is our
-harmonic-sum ladder and it is what buys the sensitivity below.
+harmonic-sum ladder.
 
-**We also detect the 7.1185 Hz pulsar more strongly: S/N 12.30 vs 11.80** (at a
-10.0% duty cycle against riptide's 6.5% — its width bank is built from
-`bins_min`, so it cannot reach this pulse's width at the depth it folded), and
-we find a candidate it does not (0.2603 Hz at S/N 7.32). riptide's two extra
-entries are the `f/2` and `2f` of the pulsar, which it does not filter and we
-collapse by default (`--noharmremove` for a like-for-like count). Both hosts
-report identical candidates, as they must — the search is deterministic.
+**The 7.1185 Hz pulsar reads S/N 11.65 against riptide's 11.80** (at a 10.0%
+duty cycle from the `k = 6` fold, against riptide's 6.5% — its width bank is
+built from `bins_min`, so it cannot reach this pulse's width at the depth it
+folded). Before the 2026-08-28 band-limited renormalisation (see
+[Design notes](#a-calculable-false-alarm-rate)) ours read 12.30. We also find a candidate it does not (0.2603 Hz at S/N 7.32).
+riptide's two extra entries are the `f/2` and `2f` of the pulsar, which it does
+not filter and we collapse by default (`--noharmremove` for a like-for-like
+count). All three hosts report identical candidates, as they must — the search
+is deterministic.
 
 For a pure algorithm-vs-algorithm timing at *equal* work, use `--preset matched`,
 which runs one fold depth on each side and equalises the work to a few percent.
@@ -632,10 +640,10 @@ the obvious-looking choice — has us search 6× riptide's band and reports us a
 2.1× slower, which is an artefact of the mismatch, not a result.
 
 The threading axis is ours alone rather than a like-for-like win: riptide's C
-extension is built without OpenMP, so `rseek` cannot use more cores. Measured on
-the 20-core workstation with `bench/thread_scaling.jl`, which times only the
-*warm in-process* search so that the fixed start-up cost does not contaminate
-the fit:
+extension is built without OpenMP, so `rseek` cannot use more cores. Measured
+with `bench/thread_scaling.jl`, which times only the *warm in-process* search so
+that the fixed start-up cost does not contaminate the fit. On the 20-core
+workstation (2026-08-24):
 
 ![Thread scaling on a 20-core Xeon Silver 4114](docs/thread_scaling.png)
 
@@ -648,9 +656,31 @@ The Amdahl fit gives a serial fraction of 0.065 (ceiling 15.5×). The right-hand
 panel is the part worth reading: CPU-seconds for *identical* work inflate 62%
 across the sweep, which is memory-stall and clock-throttle time, not a code
 defect — and on a dual-socket box past 16 threads the marginal core is also
-paying for cross-socket traffic. Production searches are often run as one
-single-threaded process per DM, in which case the `-t 1` CPU-seconds column
-governs throughput rather than this curve.
+paying for cross-socket traffic.
+
+On larger machines (2026-09-15/16), speedup at each thread count:
+
+| host | physical cores | work | `-t 1` | 2 | 4 | 8 | 16 | 32 | 48 | best |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `bla0`, 2× EPYC 7413 | 48 | NGC6624 | 77.7 s | 1.94× | 3.59× | 7.08× | 14.6× | 24.6× | **26.8×** | 26.8× @ 48 |
+| OzSTAR `dave41` | 32 (allocated) | NGC6624 | 75.9 s | 1.96× | 3.58× | 6.40× | 14.4× | **24.6×** | 21.6× | 24.6× @ 32 |
+| `talanah`, 2× Xeon Silver 4514Y | 32 | NGC6624 | 74.3 s | 1.98× | 3.51× | 7.18× | 11.2× | **16.3×** | 14.2× | 16.3× @ 32 |
+| `eiger`, Xeon w5-3433 | 16 | PM0063 | 5.49 s | 1.95× | 3.80× | 6.53× | **10.1×** | 4.70× | 5.03× | 10.1× @ 16 |
+
+"NGC6624" is `NGC6624_16L_DM87.40_red.fft` over 0.1–33.3 Hz (105.5M trial
+fundamentals, 42 candidates); "PM0063" is the configuration of the 20-core
+table above (3 candidates), where `eiger` is 2.1× faster single-threaded. Fit to
+the points up to the physical core count, Amdahl's serial fraction is 0.017 on
+`bla0` and 0.020 on `dave41`, against 0.065 on the 20-core Xeon. **Threads
+beyond the physical cores lost on all three hosts where that was measured**, and
+on `eiger` badly (CPU-seconds
+4.4× those at 16 threads), so use `-t` equal to the physical core count, not
+`-t auto`, which counts hyperthreads. `talanah` is the weakest of the four
+past 8 threads, with CPU-seconds up 69% at 32 threads.
+
+Production searches are often run as one single-threaded process per DM, in
+which case the `-t 1` CPU-seconds column governs throughput rather than these
+curves.
 
 Reading the output: **the two S/N values are the same statistic** as of
 2026-08-24 — both are the peak of riptide's zero-mean unit-L2 boxcar matched
@@ -689,7 +719,8 @@ search.
 on the machine and the band; measured at `-t 1` over 0.1–0.4 Hz of
 `PM0063_034C1_DM445.0_red.fft`, two runs of the same command on the laptop gave
 190.8× and 177.1×, and the 20-core Xeon gave 200.4× (~243 and ~359 µs per trial
-fundamental against production's ~1.27 and ~1.79 µs).
+fundamental against production's ~1.27 and ~1.79 µs). Over 0.1–3 Hz on an EPYC
+7413 it was 232.3× (198.3 against 0.85 µs).
 
 It differs from the production search in exactly two ways, both deliberate and
 both documented in the file: it scans the full geometric width bank rather than
@@ -715,9 +746,30 @@ pins the analytic noise scale against synthetic normalised white noise.
 
 ## GPU support (`--gpu`)
 
-A CUDA GPU can run the whole search. On the cards measured so far it is roughly
-**1.2x to 3x a 20-core Xeon**, and candidates agree with the CPU path to ~2e-7
-(comparable, deliberately not guaranteed bit-identical — see below).
+A CUDA GPU can run the whole search, and candidates agree with the CPU path to
+~2e-7 (comparable, deliberately not guaranteed bit-identical — see below).
+
+Measured 2026-09-15/16 with `bench/paper_gpu_run.sh` on
+`NGC6624_16L_DM87.40_red.fft` (T = 26459 s) over 0.1–133.3 Hz — 423M trial
+fundamentals, spin coverage to 800 Hz — at each card's best `--blocksize`,
+`-t 1` on the host:
+
+| card | SMs | best `--blocksize` | wall (s) | ns/trial | vs 20-core Xeon |
+|---|---|---|---|---|---|
+| L40 | 142 | 32768 | **4.44** | **10.5** | **8.96x** |
+| A100-SXM4-80GB | 108 | 1048576 | **4.52** | **10.7** | **8.81x** |
+| RTX 4500 Ada | 60 | 8192 | 7.23 | 17.1 | 5.51x |
+| RTX A4000 | 48 | 524288 | 12.07 | 28.5 | 3.30x |
+| GTX 1080 | 20 | 262144 | 29.91 | 70.7 | 1.33x |
+| RTX A400 | 6 | 131072 | 61.36 | 145.0 | **0.65x** |
+
+The reference is `fitzroy`'s 2× Xeon Silver 4114 at `-t 40` on the same file
+and band: 39.79 s, 94.1 ns/trial. The CPU still wins on a big enough machine: a
+32-core Threadripper PRO 7975WX (`-t 64`) takes 9.14 s, and 2× EPYC 7413
+(`-t 96`) take 10.02 s, faster than an RTX A4000. All six cards give the same
+285 candidates as the CPU. The only difference is the last digit of four
+printed periods (one ulp of `1/f`), and even that vanishes in a band past this
+file's Nyquist knee, where the output is byte-identical.
 
 CUDA is a **weak dependency**: it is not installed unless you ask for it, and a
 CPU-only user downloads nothing. The GPU code lives in a package extension
@@ -772,17 +824,18 @@ node that shares the filesystem, then run on the GPU node with the same
 environment and `JULIA_DEPOT_PATH` — that case is fine, because it really is one
 machine's worth of hardware.
 
-### Tune `--blocksize` for your card — it is worth up to ~1.2x over the default
+### Tune `--blocksize` for your card — it is worth up to ~1.3x over the default
 
 **Not urgent any more, but still worth one run.** `--blocksize` (trial
 fundamentals per chunk) defaults to **65536 under `--gpu`** and 2048 on the CPU;
-the two backends want values 32x apart. 65536 is one constant chosen for its
-worst case — it is within **~1.2x** of the optimum on the cards we have
-measured, spanning 6 to 108 SMs and 1 to 40 MB of L2 — and it is not a per-device
-rule, because the optimum is *not* predictable from the hardware: the A100 and
-the RTX 4000 Ada have the same 40 MB of L2 and want opposite ends of a 32x range.
+the two defaults are 32x apart. 65536 is one constant chosen
+for its worst case — it is within **1.28x** of the optimum on the cards we have
+measured, spanning 6 to 142 SMs and 1 to 96 MB of L2 — and it is not a
+per-device rule, because the optimum is *not* predictable from the hardware: the
+A100 and the RTX 4000 Ada have the same 40 MB of L2 and want opposite ends of a
+128x range.
 
-The best value is a property of the card and spans **8192 to 262144**. To find
+The best value is a property of the card and spans **8192 to 1048576**. To find
 yours:
 
 ```sh
@@ -804,22 +857,34 @@ or less explicitly — that is the CPU's value and it costs 1.4x to 5.6x on a GP
 directions. A large L2 wants a **small** chunk, so the whole pipeline stays
 resident in cache; a lot of SMs want a **big** one, because a small chunk cannot
 fill them. Which wins is not predictable from a spec sheet: the RTX 4000 Ada
-(40 MB L2, 48 SMs) wants **8192**, while the A100 (the same 40 MB, but 108 SMs)
-wants **262144** and is nearly 2x slower at 8192. Cards with a small L2 cannot
-hold the working set at any chunk size, so only occupancy and launch
+(40 MB L2, 48 SMs) and the RTX 4500 Ada (48 MB, 60 SMs) want **8192**, while
+the A100 (40 MB, but 108 SMs) wants **1048576** and is 2.2x slower at 8192.
+The L40 (96 MB, 142 SMs) sits between them at 32768. Cards with a small L2
+cannot hold the working set at any chunk size, so only occupancy and launch
 amortisation are left and bigger always wins.
 
-Measured optima: RTX 4000 Ada 8192, RTX 2080 Super 262144, GTX 1080 262144,
-RTX A400 65536 or above (its sweep was capped by device memory), and — re-run on
-quiet hosts with the sweep extended to 1048576 — **RTX A4000 1048576** and
-**A100 1048576**, both still gaining slightly at the top row.
+Measured optima, and what the default costs on each:
 
-**If you are on an RTX 4000 SFF Ada, pass `--blocksize 8192`** (65536 costs it
-1.22x). On the two big cards the default costs 1.10x (A4000) and 1.19x (A100),
-and **262144 gets both to within 1.05x** while still fitting a 4 GB card — so if
-you do not want to sweep, `--blocksize 262144` is a better guess than the default
-on anything with 40+ SMs and enough memory (~1.1 GiB of workspace on top of your
-`.fft`).
+| card | L2 | optimum | 65536 costs | 262144 costs |
+|---|---|---|---|---|
+| RTX 4500 Ada | 48 MB | 8192 | **1.28x** | 1.13x |
+| RTX 4000 SFF Ada | 40 MB | 8192 | 1.22x | ~1.23x |
+| L40 | 96 MB | 32768 | 1.14x | 1.14x |
+| A100 80GB | 40 MB | 1048576 | 1.18x | 1.05x |
+| RTX A4000 | 4 MB | 524288 | 1.06x | 1.01x |
+| GTX 1080 | 2 MB | 262144 (sweep capped by memory) | 1.06x | 1.00x |
+| RTX 2080 Super | 4 MB | 262144 | — | — |
+| RTX A400 | 1 MB | 131072 (sweep capped by memory) | 1.00x | does not fit |
+
+(The RTX 4000 SFF Ada and 2080 Super rows are from older sweeps; see
+`docs/gpu_design.md`.)
+
+**If you are on an RTX 4000 or 4500 Ada, pass `--blocksize 8192`.** On the
+cards it fits, **262144 is as good as the default or better** (within 1% on the
+SFF Ada) and gets the A100 and A4000 to within 1.05x. So if you do not want to sweep, `--blocksize 262144` is
+a better guess than the default on anything with 40+ SMs and enough memory
+(~1.1 GiB of workspace on top of your `.fft`; it does not fit a 4 GB card
+alongside a 1.29 GiB file).
 
 ### What the GPU path does and does not support
 
@@ -847,8 +912,16 @@ Two properties *are* guaranteed and tested:
 - **Transform sub-batching is bit-exact**, likewise — it is a scheduling change
   only.
 
-`test/test_gpu.jl` (226 tests) runs automatically as part of `Pkg.test()` when a
-functional CUDA device is present, and skips itself when there is not.
+`test/test_gpu.jl` (300 tests) is **not** run by `Pkg.test()`, even on a GPU
+host: `test/Project.toml` has no CUDA, so it skips itself there. Run it in your
+CUDA environment:
+
+```sh
+julia --project=~/gpuenv -e 'using CUDA, Test; include("test/test_gpu.jl")'
+```
+
+`bench/paper_gpu_run.sh` does this, then diffs CPU against GPU candidates in a
+band below and a band past the file's Nyquist knee.
 
 ### Reporting a new card
 
@@ -856,7 +929,7 @@ functional CUDA device is present, and skips itself when there is not.
 issue or email. Results from cards we have not seen are genuinely useful: the
 design log (`docs/gpu_design.md`) keeps per-card measurements, and the
 `--blocksize`
-guidance above is built from only three GPUs so far.
+guidance above is built from only eight GPUs so far.
 
 If you want to bootstrap Julia and CUDA.jl on a bare GPU host with no root,
 `bench/gpu_probe_setup.sh` does the whole thing and needs nothing from this repo
