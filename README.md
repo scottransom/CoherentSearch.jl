@@ -9,25 +9,25 @@ harmonic phases is what separates this from the incoherent harmonic sum most
 FFT-based searches use: the profile comes back with its *shape* intact, so the
 search can tell a pulsar-like pulse from an arbitrary pile of harmonic power.
 
-What comes out is close to what a fast folding algorithm (FFA) computes, but it
-is reached through one long FFT rather than through repeated partial sums. That
-difference is the point. The work factors into dense, regular, independent
-kernels — interpolate, transform, filter — which vectorise, thread, and port to
-a GPU cleanly, none of which the FFA's recursion does easily.
+What comes out is close to what a fast folding algorithm (FFA) computes,
+but it is reached through one long FFT rather than through repeated
+partial sums. The work factors into dense, regular, independent kernels —
+interpolate, transform, filter — which vectorize, thread, and port to a
+GPU cleanly, none of which the FFA's recursion does easily.
 
 In short:
 
 - **More sensitive.** In an injection Monte Carlo over 76,105 white-noise
-  realisations (plus 84,871 with red noise), with every code's threshold
+  realizations (plus 84,871 with red noise), with every code's threshold
   matched to the same measured false-alarm rate, we detect **76%** of
   white-noise injections. riptide's
   `rseek` detects 71% in its deepest configuration (which costs ~6x our
   runtime) and 50% in the configuration matched to our frequency coverage;
   PRESTO's `accelsearch` detects 42%. See `docs/comparison_points.md`, and read
   its caveats before quoting any of this.
-- **A calculable false-alarm rate.** The input FFT is normalised, so the noise
+- **A calculable false-alarm rate.** The input FFT is normalized, so the noise
   in every reconstructed profile is known in closed form rather than estimated,
-  and the boxcar template is normalised so that each (phase, width) trial is
+  and the boxcar template is normalized so that each (phase, width) trial is
   `N(0,1)`. One `--threshold` therefore means one false-alarm rate at every fold
   depth and across the whole band — which is what makes it safe to lower it.
 - **Resilient to red noise.** Searching a whitened FFT keeps the matched
@@ -38,13 +38,13 @@ In short:
   frequency coverage on three machines. It scales ~27x across 48 cores, and the
   whole search runs on a GPU: an L40 or an A100 is ~9x a 20-core Xeon, an RTX
   A4000 ~3.3x.
-- **Pinned, not eyeballed.** Every numerical result is cross-validated against
+- **Validated.** Every numerical result is cross-validated against
   the original Python [`coherent_search`](../coherent_search) package used as an
-  independent oracle (~1e-16 relative), the optimised search is pinned against
-  an unoptimised reference path inside this repo, and a change that should not
+  independent oracle (~1e-16 relative), the optimized search is pinned against
+  an unoptimized reference path inside this repo, and a change that should not
   move results is checked by `diff` on the candidate file.
 
-`bin/toy_coherent_search.jl` is the same algorithm with **every optimisation
+`bin/toy_coherent_search.jl` is the same algorithm with **every optimizaation
 removed** — brute-force per-point interpolation, one inverse FFT per fold, the
 boxcar filter straight from its definition, plain nested loops. It is a complete,
 working search, roughly 150–250x slower than the production code, and it exists
@@ -99,11 +99,11 @@ Nearly every non-obvious choice below follows from one of them.
 
 ### Sensitivity
 
-- **Coherent harmonic summing.** Harmonic amplitudes are summed as complex
-  numbers, not as powers, so the inverse transform of the stack is the actual
-  pulse profile. Discarding the phases — what an incoherent sum does — throws
-  away the pulse shape and with it the ability to reject a detection that is
-  not pulsar-like.
+- **Coherent harmonic summing.** The harmonic amplitudes from the FFT are
+  kept as complex numbers, not as powers, so the inverse Fourier transform
+  of those harmonics is the actual pulse profile. Discarding the phases —
+  what an incoherent sum does — throws away the pulse shape and with it
+  the ability to reject a detection that is not pulsar-like.
 - **Exact Fourier interpolation.** A pulsar almost never sits on an integer
   Fourier bin, and a harmonic's phase rotates a full turn between bins. The
   Eqn.-30 kernel is evaluated *exactly* at each trial frequency rather than
@@ -117,28 +117,28 @@ Nearly every non-obvious choice below follows from one of them.
   fast pulsars for nearly free — and the rungs below `hifreq` overlap on
   purpose. They look redundant and are not: a wide pulse is better detected in a
   shallow fold, and restricting each `k` to a disjoint band models out ~8% of
-  recovered S/N. Do not "optimise" the overlap away.
+  recovered S/N. Do not "optimize" the overlap away.
 - **A boxcar bank set by each profile's own length**, geometrically spaced out
   to 30% duty cycle, so every fold depth is filtered to the same duty cycles.
 
 ### A calculable false-alarm rate
 
-- **A normalised template.** Each boxcar is made zero-mean and unit-L2 before
+- **A normalized template.** Each boxcar is made zero-mean and unit-L2 before
   correlating, so every (phase, width) trial is `N(0,1)` under white noise and
   the distribution of the peak is analytic. This is numerically identical to
   riptide's `snr1`, so the two codes report the same quantity.
 - **Held-at-zero DC.** The zero-frequency bin is forced to zero, so every
   profile's mean is *exactly* zero. There is no mean to estimate, which removes
   a term from the statistic's variance.
-- **An analytic noise scale.** For a normalised input FFT the per-bin noise of
-  the reconstructed profile follows from the FFT normalisation alone —
+- **An analytic noise scale.** For a normalized input FFT the per-bin noise of
+  the reconstructed profile follows from the FFT normalization alone —
   `σ = sqrt(2·nlow + 0.5·nnyq)/nbins` — so it is computed, not measured. That is
   both faster and *more* accurate than the subsampled robust estimator it
   replaced (3.0% spread against 5.4%), and it removes a ~1% per-chunk noise term
   that used to land directly on every reported S/N.
-- **Renormalised for a band-limited fold.** Profile bins from an inverse FFT of
+- **Renormalized for a band-limited fold.** Profile bins from an inverse FFT of
   a truncated harmonic stack are correlated, so the textbook `snr1`
-  normalisation is wrong for them. Dividing by the exact variance of the boxcar
+  normalization is wrong for them. Dividing by the exact variance of the boxcar
   sum fixes two biases: a `sqrt(nbins/2H)` inflation past the Nyquist knee (on
   pure noise the peak ran 9.09 at 500 Hz against 5.32 at 20 Hz; now 5.01 and
   5.28) and a ~3.4% offset *between* ladder rungs that made shallow folds win
@@ -156,24 +156,24 @@ Nearly every non-obvious choice below follows from one of them.
   the data instead, which is the right answer when the noise level varies with
   frequency (residual red noise, an RFI comb, a `rednoise` pass that did not
   take). And because the analytic assumption fails *silently* and in the
-  dangerous direction — a normalisation error inflates every S/N — the search
+  dangerous direction — a normalization error inflates every S/N — the search
   scores a few chunks both ways and warns when they disagree by more than 10%.
 - Skipping the de-reddening step is not an option, and we measured that on our
   own default path: detection falls 76% → 1% across the knee range.
 
 ### Speed
 
-- **Regular kernels, then vectorise along the long axis.** The interpolator
-  vectorises across *trials* (a group of consecutive trials becomes a
+- **Regular kernels, then vectorize along the long axis.** The interpolator
+  vectorizes across *trials* (a group of consecutive trials becomes a
   matrix-vector product against one contiguous slice of Fourier bins — no
-  gather, no horizontal reduce), and the boxcar scan vectorises across
+  gather, no horizontal reduce), and the boxcar scan vectorizes across
   *profiles*, 128 at a time, since the phase axis is only 20–120 long. Both
-  choices are worth 1.5–4x on their phase.
+  choices are worth speed-ups of 1.5–4x in their portions of the code.
 - **Chunk-parallel, whole chunks per thread.** Trials are grouped into chunks of
   2048 and handed to tasks round-robin, each with a private workspace. That is
   what lets a harmonic's Fourier-bin window be loaded once per chunk and read
   back from L1 by every trial in it. ~9x on 20 cores, ~27x on 48.
-- **A GPU extension.** The whole search runs on a CUDA card
+- **A GPU extension.** The whole search runs quite well on a CUDA card
   (`ext/CoherentSearchCUDAExt.jl`); CUDA is a weak dependency, so a CPU-only
   user downloads nothing. Eight cards have been measured, 6 to 142 SMs, all
   reporting the same candidates as the CPU.
@@ -197,14 +197,14 @@ Nearly every non-obvious choice below follows from one of them.
 - **FFT conventions.** `irfft` of the stacked harmonic amplitudes matches
   numpy's `np.fft.irfft` (both ignore the imaginary parts of the DC/Nyquist
   bins); this is verified directly in the tests.
-- **Two paths that must agree.** A deliberately unoptimised *reference* path
+- **Two paths that must agree.** A deliberately unoptimized *reference* path
   (`block_metrics` / `reference_profiles`) is pinned to the Python oracle at
-  ~1e-16, and the whole optimised machinery is pinned to that reference at
-  8.4e-16. Every optimisation has to keep both green.
+  ~1e-16, and the whole optimized machinery is pinned to that reference at
+  8.4e-16. Every optimization has to keep both green.
 
 ## Installation and first use
 
-If you've never used Julia before, install it using either your systems package
+If you've never used Julia before, install it using either your system's package
 manager, or via a method from <https://julialang.org/downloads/>.
 On Linux or Mac, the following should work:
 
@@ -239,7 +239,7 @@ pass `--plot` for it.
 The profile stage runs in `Float32` by default (`--precision f32`): the
 interpolated harmonic amplitudes, the batched inverse FFT and the folded
 profiles the metric reads. Everything reported — candidate frequencies, the S/N
-metric, the normalisation — stays `Float64`. This is worth ~1.2× at every thread
+metric, the normalization — stays `Float64`. This is worth ~1.2× at every thread
 count on both development machines and costs ~1e-7 in the profiles, five orders
 of magnitude under the ~1.3% of signal power the `m = 16` interpolation
 truncation already discards. Pass `--precision f64` to reproduce a run made
@@ -391,22 +391,24 @@ read depth already covers every `k`) and the full bookkeeping.
 The S/N metric divides by a per-bin noise scale `σ`, and as of 2026-08-24 that
 scale is **computed rather than measured** (`--sigma analytic`, the default).
 
-The search is only meaningful on a normalised `.fft` — Fourier powers with mean
-1 — and that assumption already fixes the fold's noise. Mean power 1 means the
-real and imaginary part of every amplitude have variance ½, so the hot loop's
-unnormalised `brfft` of a stack of `H` harmonics with DC held at zero gives
+The search is only meaningful on a normalized `.fft` — Fourier powers with
+mean 1 — and that assumption already fixes the fold's noise. Mean power 1
+means the real and imaginary part of every amplitude have variance ½, so
+the inner loop's unnormalized `brfft` (i.e. inverse FFT) of a stack of `H`
+harmonics with DC held at zero gives
 
 ```
 σ = sqrt(2·nlow + 0.5·nnyq)
 ```
 
-where `nlow` counts the stacked harmonics below the profile's own Nyquist bin
-and `nnyq` is 1 if that bin carries data (halved because the transform keeps only
-its real part). That is `sqrt(nbins)` times a `sqrt(1 − 3/(4H))` correction — 0.6%
-at `H = 60` but **3.8% at the `H = 10` of a `k = 6` fold**, so it is not
-decoration: omitting it would bias the shallow folds against the deep ones.
-Harmonics past Nyquist are zero rows and carry no noise, so the *fill count*, not
-the stack length, is what enters.
+where `nlow` counts the stacked harmonics below the profile's own Nyquist
+bin and `nnyq` is 1 if that bin carries data (halved because the transform
+keeps only its real part). That is `sqrt(nbins)` times a `sqrt(1 −
+3/(4H))` correction — 0.6% at `H = 60` but **3.8% at the `H = 10` of a `k
+= 6` fold**, so it is not decoration: omitting it would bias the shallow
+(i.e. small numbers of harmonics) folds against the deep (i.e. large
+numbers of harmonics) ones. Harmonics past Nyquist are treated as zero and
+carry no noise, so the *fill count*, not the stack length, is what matters.
 
 This replaced a robust MAD estimated per chunk, and it is both faster and more
 accurate:
@@ -435,7 +437,7 @@ bias wins.
 Because that failure is silent and inflates S/N (a candidate list full of noise
 rather than an empty one), `search` **checks it**: three chunks spread across the
 band are scored both ways, and a disagreement over 10% produces a warning naming
-both numbers. It costs ~0.1% of the runtime. On an un-normalised input the check
+both numbers. It costs ~0.1% of the runtime. On an un-normalized input the check
 fires immediately — the raw test fixture is out by a factor of ~1000.
 
 ### Candidate de-duplication
@@ -468,27 +470,28 @@ identifies the decimation). `Ducy(%)` is the duty cycle of the best-fitting
 boxcar — `width / profile bins`, exactly as riptide's `rseek` defines `ducy`, so
 the two searches can be compared directly. It is `-` when unmeasured.
 
-The search's hot loop deliberately discards *which* boxcar width won (it runs
-~1e8 times and only reported candidates need it), so the width is recovered
-afterwards by refolding each reported candidate — see `measure_ducy`. This is
-exact, not an approximation: the noise scale σ multiplies every width's score
-equally and so cannot change which one wins, which is what lets the width be
-recovered from an isolated profile.
+The search's inner loop deliberately discards *which* boxcar width won (it
+runs ~1e8 times and only reported candidates need it), so the width is
+recovered afterwards by refolding each reported candidate — see
+`measure_ducy`. This is exact, not an approximation: the noise scale σ
+multiplies every width's score equally and so cannot change which one
+wins, which is what lets the width be recovered from an isolated profile.
 
 ### Candidate profile plots
 
-With `--plot`, the CLI reconstructs and plots the pulse profile of every reported
-candidate, one grid of panels per US-Letter portrait page, written as
-zero-padded PNGs (`<stem>_01.png`, `<stem>_02.png`, …).  It is **off by default**:
-CairoMakie costs ~9 s to load, and because plotting is deferred to the end of the
-run it keeps every input's mmap live until then, which a bulk pipeline does not
-want.  (`--noplot` is still accepted and ignored, so existing scripts keep
-working.)  Each profile is folded
-with a high-accuracy exact-interpolation path (independent of the throughput-
-tuned search) and rotated so its peak sits at phase 0.5; the panel caption
-carries the full text-line information (index, S/N, frequency, period, harmonic
-count, and the decimation `k`).  Plotting loads CairoMakie lazily — searches
-without `--plot`, the test suite, and the cross-validation never load it.
+With `--plot`, the CLI reconstructs and plots the pulse profile of every
+reported candidate, one grid of panels per US-Letter portrait page,
+written as zero-padded PNGs (`<stem>_01.png`, `<stem>_02.png`, …).  It is
+**off by default**: CairoMakie costs ~9 s to load, and because plotting is
+deferred to the end of the run it keeps every input's mmap live until
+then, which a bulk pipeline does not want.  (`--noplot` is still accepted
+and ignored, so existing scripts keep working.)  Each profile is folded
+with a high-accuracy exact-interpolation path (independent of the
+throughput- tuned search) and rotated so its peak sits at phase 0.5; the
+panel caption carries the full text-line information (index, S/N,
+frequency, period, harmonic count, and the decimation `k`).  Plotting
+loads CairoMakie lazily — searches without `--plot`, the test suite, and
+the cross-validation never load it.
 
 Every profile is folded at the **full `--nharms` harmonic depth**, regardless of
 the harmonic-decimation factor `k` that found the candidate (a `k=3` detection
@@ -529,7 +532,7 @@ address it, and a third is available for production.
    as a top-level script, inferring `main` alone cost ~4.7 s per run. Together
    these took the run above to **2.4 s**. The cost is ~3.4 s of extra
    precompilation after each `src/` edit.
-2. **Batching files** into one invocation (see above) amortises what remains.
+2. **Batching files** into one invocation (see above) amortizes what remains.
 3. **A sysimage** (`sysimage/`) removes CairoMakie's load — and, as measured,
    nothing else:
 
@@ -556,10 +559,11 @@ address it, and a third is available for production.
 
 ## Comparison against riptide's FFA
 
-The external bar for this search is [riptide](https://github.com/v-morello/riptide),
-the Fast Folding Algorithm implementation. `compare/compare_riptide.py` runs
-`rseek` and this code over the same observation with matched settings, times
-both, and cross-matches the candidate lists:
+The external bar for this search is
+[riptide](https://github.com/v-morello/riptide), a state-of-the-art Fast
+Folding Algorithm implementation. `compare/compare_riptide.py` runs
+`rseek` and this code over the same observation with matched settings,
+times both, and cross-matches the candidate lists:
 
 ```sh
 python3 compare/compare_riptide.py --repeat 3 --threads 4 FILE.fft
@@ -593,14 +597,14 @@ on three machines:
 | Xeon Silver 4114 (20 cores) | 20.31 s | **12.89 s** | **1.57× faster** |
 | EPYC 7413 (2×24 cores) | 9.91 s | **7.25 s** | **1.37× faster** |
 
-The hosts differ by more than any single optimisation in the code, so quote
+The hosts differ by more than any single optimization in the code, so quote
 the machine and the date with the ratio. (On 2026-08-24 the first two read
 2.13× and 1.46×, and `rseek`'s own times agree with today's to 2–6%.)
 
-The harness also splits start-up from searching, so the obvious objection —
-that this is really measuring Julia's start-up — is answered on every run. It
-is not; if anything start-up works against us, since ours is the larger of the
-two on every host and we win anyway.
+The comparison code also splits start-up time from searching, so the
+obvious objection — that this is really measuring Julia's start-up — is
+answered on every run. However, start-up works against us, since ours is
+the larger of the two on every host and our search is faster anyway.
 
 | | start-up | searching | pure-compute ratio |
 |---|---|---|---|
@@ -616,35 +620,38 @@ one. Note that riptide's `find_peaks` is 29–35% of its compute (6.7 s on the
 laptop) and is a separate pass doing candidate work we do inline; comparing
 our figure against its `ffa_search` alone would be wrong.
 
-**Single-threaded we are 1.4–2.2× faster, while doing ~2.8× the folds** — the
-harness prints that work ratio before it times anything, because the two numbers
-have to be read together. We fold every frequency below `hifreq` once per
-decimation factor, where `rseek` folds it exactly once; that redundancy is our
-harmonic-sum ladder.
+**Single-threaded we are 1.4–2.2× faster, while doing ~2.8× the folds** —
+the comparison code prints that work ratio before it times anything,
+because the two numbers have to be read together. We fold every frequency
+below `hifreq` once per decimation factor, where `rseek` folds it exactly
+once; that redundancy is our harmonic-sum ladder.
 
-**The 7.1185 Hz pulsar reads S/N 11.65 against riptide's 11.80** (at a 10.0%
-duty cycle from the `k = 6` fold, against riptide's 6.5% — its width bank is
-built from `bins_min`, so it cannot reach this pulse's width at the depth it
-folded). Before the 2026-08-28 band-limited renormalisation (see
-[Design notes](#a-calculable-false-alarm-rate)) ours read 12.30. We also find a candidate it does not (0.2603 Hz at S/N 7.32).
-riptide's two extra entries are the `f/2` and `2f` of the pulsar, which it does
-not filter and we collapse by default (`--noharmremove` for a like-for-like
-count). All three hosts report identical candidates, as they must — the search
-is deterministic.
+**The 7.1185 Hz pulsar reads S/N 11.65 against riptide's 11.80** (at a
+10.0% duty cycle from the `k = 6` fold, against riptide's 6.5% — its width
+bank is built from `bins_min`, so it cannot reach this pulse's width at
+the depth it folded). Before the 2026-08-28 band-limited renormalization
+(see [Design notes](#a-calculable-false-alarm-rate)) ours read 12.30. We
+also find a candidate it does not (0.2603 Hz at S/N 7.32). riptide's two
+extra entries are the `f/2` and `2f` of the pulsar, which it does not
+filter and we collapse by default (`--noharmremove` for a like-for-like
+count). All three hosts report identical candidates, as they must — the
+search is deterministic.
 
 For a pure algorithm-vs-algorithm timing at *equal* work, use `--preset matched`,
 which runs one fold depth on each side and equalises the work to a few percent.
 
 Getting this wrong is easy and expensive: setting our `hifreq` to `1/Pmin` —
 the obvious-looking choice — has us search 6× riptide's band and reports us as
-2.1× slower, which is an artefact of the mismatch, not a result.
+2.1× slower, which is an artifact of the mismatch, not a result.
 
-The threading axis is ours alone rather than a like-for-like win: riptide's C
-extension is built without OpenMP, so `rseek` cannot use more cores. Measured
-with `bench/thread_scaling.jl`, which times only the *warm in-process* search so
-that the fixed start-up cost does not contaminate the fit. On 48 cores
+The threading axis belongs to `CoherentSearch.jl` since riptide's C
+extension is built without OpenMP or explicit multi-threading, so `rseek`
+cannot use more cores. The thread performanance can be measured with
+`bench/thread_scaling.jl`, which times only the *warm in-process* search
+so that the fixed start-up cost does not contaminate the fit. On 48 cores
 (`bla0`, 2× AMD EPYC 7413, 2026-09-15), searching
-`NGC6624_16L_DM87.40_red.fft` over 0.1–33.3 Hz (105.5M trial fundamentals):
+`NGC6624_16L_DM87.40_red.fft` over 0.1–33.3 Hz (105.5M trial
+fundamentals):
 
 ![Thread scaling on 48 cores, 2x AMD EPYC 7413](docs/thread_scaling_bla0.png)
 
@@ -656,8 +663,8 @@ that the fixed start-up cost does not contaminate the fit. On 48 cores
 The Amdahl fit gives a serial fraction of 0.017 (ceiling 58.6×), and efficiency
 stays at 88–97% through 16 threads. Past that the curve bends: 32 → 48
 threads adds only 9%, and the right-hand panel shows why. CPU-seconds for
-*identical* work rise at most 9% up to 16 threads, then inflate to +43% at 48.
-That is memory-stall time on a dual-socket box, not a code defect.
+*identical* work rise at most 9% up to 16 threads, then inflates to +43% at 48.
+That is likely memory-stall time on a dual-CPU-socket system.
 
 The same measurement on other machines (2026-08-24 for fitzroy, 2026-09-15/16
 for the rest), speedup at each thread count:
@@ -703,7 +710,7 @@ settled by the injection Monte Carlo described in
 ## The toy search
 
 `bin/toy_coherent_search.jl` is the whole algorithm with none of the
-optimisation: brute-force per-point Fourier interpolation, one `irfft` per fold,
+optimization: brute-force per-point Fourier interpolation, one `irfft` per fold,
 the boxcar matched filter evaluated straight from its definition, and plain
 single-threaded nested loops. It exists to be *read* — it is the code the
 paper's pseudo-code figure describes, line for line, and each function carries
@@ -719,18 +726,19 @@ It takes the options that set the search itself (`--threshold`, `--nharms`,
 collapsing and output code unchanged, because that is bookkeeping rather than
 search.
 
-**Expect roughly 150–250× slower**, so give it a narrow band. How much depends
-on the machine and the band; measured at `-t 1` over 0.1–0.4 Hz of
-`PM0063_034C1_DM445.0_red.fft`, two runs of the same command on the laptop gave
-190.8× and 177.1×, and the 20-core Xeon gave 200.4× (~243 and ~359 µs per trial
-fundamental against production's ~1.27 and ~1.79 µs). Over 0.1–3 Hz on an EPYC
-7413 it was 232.3× (198.3 against 0.85 µs).
+**Expect roughly 150–250× slower**, so give it a narrow search band. How
+much depends on the machine and the band; measured at `-t 1` over 0.1–0.4
+Hz of `PM0063_034C1_DM445.0_red.fft`, two runs of the same command on the
+laptop gave 190.8× and 177.1×, and the 20-core Xeon gave 200.4× (~243 and
+~359 µs per trial fundamental against production's ~1.27 and ~1.79 µs).
+Over 0.1–3 Hz on an EPYC 7413 it was 232.3× (198.3 against 0.85 µs).
 
-It differs from the production search in exactly two ways, both deliberate and
-both documented in the file: it scans the full geometric width bank rather than
-the ladder-pruned one, and it divides by an **analytic** noise scale rather than
-a measured one. For a normalised input FFT the folded profile's per-bin noise is
-known in closed form,
+It differs from the production search in exactly two ways, both deliberate
+and both documented in the file: it scans the full geometric width bank
+rather than the ladder-pruned one, and it always divides by the
+**analytic** noise scale rather than the optional measured one. For a
+normalized input FFT the folded profile's per-bin noise is known in closed
+form,
 
 ```
 sigma = sqrt(2*nlow + 0.5*nnyq) / nbins
@@ -740,13 +748,13 @@ where `nlow` counts the stacked harmonics below the profile's own Nyquist bin
 and `nnyq` is 1 if that bin carries data — about `1/sqrt(nbins)`, times a
 `sqrt(1 - 3/(4H))` correction that is 0.6% at `H = 60` but 3.8% at the `H = 10`
 of a `k = 6` fold. Harmonics past Nyquist are zero and carry no noise, so the
-count, not the stack length, is what enters.
+actual harmonic count, and not the stack length, is what enters.
 
 `bench/toy_vs_production.jl` times the two arms against each other, cross-matches
 their candidate lists, and reports the analytic noise scale against the measured
-one per fold depth and across the band. `test/test_toy.jl` pins the toy's
+one per fold depth and across the band. `test/test_toy.jl` verifies the toy's
 interpolation, fold and metric against the oracle-validated reference path, and
-pins the analytic noise scale against synthetic normalised white noise.
+verifies the analytic noise scale against synthetic normalized white noise.
 
 ## GPU support (`--gpu`)
 
@@ -784,7 +792,7 @@ CPU-only user downloads nothing. The GPU code lives in a package extension
 ### Installing CUDA.jl
 
 You need an NVIDIA **driver**. You do *not* need a system CUDA toolkit, `nvcc`,
-or a module-loaded CUDA — CUDA.jl ships its own toolkit as artifacts and will
+or a module-loaded CUDA — `CUDA.jl` ships its own toolkit as artifacts and will
 use those in preference to anything on the system.
 
 **Install CUDA into a separate environment, not into this repo.** `Pkg.add`
@@ -817,7 +825,7 @@ export JULIA_DEPOT_PATH=/fast/local/depot
 it next to that machine's depot.** Watch for a shared `$HOME` in particular — and
 note that the same home *path* on two machines is not proof they share, nor
 proof they do not. The environment holds a `Manifest.toml`, and
-a Manifest pins the exact `CUDA_Runtime_jll` and artifact versions the depot has
+a Manifest defines the exact `CUDA_Runtime_jll` and artifact versions the depot has
 to contain — a choice that depends on the host's driver and card. Put one
 environment on a shared NFS `$HOME` and two machines will fight over it: whoever
 installed last wins, and the other tries to instantiate artifacts its depot has
@@ -867,7 +875,7 @@ fill them. Which wins is not predictable from a spec sheet: the RTX 4000 Ada
 the A100 (40 MB, but 108 SMs) wants **1048576** and is 2.2x slower at 8192.
 The L40 (96 MB, 142 SMs) sits between them at 32768. Cards with a small L2
 cannot hold the working set at any chunk size, so only occupancy and launch
-amortisation are left and bigger always wins.
+amortization are left and bigger always wins.
 
 Measured optima, and what the default costs on each:
 
@@ -879,18 +887,14 @@ Measured optima, and what the default costs on each:
 | A100 80GB | 40 MB | 1048576 | 1.18x | 1.05x |
 | RTX A4000 | 4 MB | 524288 | 1.06x | 1.01x |
 | GTX 1080 | 2 MB | 262144 (sweep capped by memory) | 1.06x | 1.00x |
-| RTX 2080 Super | 4 MB | 262144 | — | — |
 | RTX A400 | 1 MB | 131072 (sweep capped by memory) | 1.00x | does not fit |
 
-(The RTX 4000 SFF Ada and 2080 Super rows are from older sweeps; see
-`docs/gpu_design.md`.)
-
 **If you are on an RTX 4000 or 4500 Ada, pass `--blocksize 8192`.** On the
-cards it fits, **262144 is as good as the default or better** (within 1% on the
-SFF Ada) and gets the A100 and A4000 to within 1.05x. So if you do not want to sweep, `--blocksize 262144` is
-a better guess than the default on anything with 40+ SMs and enough memory
-(~1.1 GiB of workspace on top of your `.fft`; it does not fit a 4 GB card
-alongside a 1.29 GiB file).
+cards it fits, **262144 is as good as the default or better** (within 1%
+on the SFF Ada) and gets the A100 and A4000 to within 1.05x. So if you do
+not want to sweep, `--blocksize 262144` is a better guess than the default
+on anything with 40+ SMs and enough memory (~1.1 GiB of workspace on top
+of your `.fft`; it does not fit a 4 GB card alongside a 1.29 GiB file).
 
 ### What the GPU path does and does not support
 
@@ -906,7 +910,7 @@ Each of these errors clearly rather than silently doing something different.
 ### Accuracy, and how the GPU is pinned
 
 The GPU is `Float32` throughout and agrees with the CPU to **~2e-7** on profiles
-and on the boxcar metric, against a pinned tolerance of 1e-5. In practice
+and on the boxcar metric, against a defined tolerance of 1e-5. In practice
 candidate lists have come out byte-identical on real data, but that is **not
 guaranteed** — a trial sitting exactly on the threshold could cross either way.
 
@@ -973,68 +977,24 @@ On the bundled `harmonics_hi.fft` test pulsar (10.0123 Hz) the accuracy check
 agrees with Python to ~1e-16 relative, confirming the indexing and FFT
 conventions are correct.
 
-## Status
+### Some Notes on Fourier Interpolation
 
-Kernels, file I/O, CLI, tests, and Python-oracle cross-validation are in place
-and passing. The search is chunk-parallel with cached FFTW plans and
-interpolation kernels, an allocation-free hot loop, a batched inverse FFT, and
-exact per-trial Fourier interpolation.
+Harmonic amplitudes come from the Eqn.-30 interpolation kernel evaluated
+*exactly* at each trial Fourier frequency. Factoring the coefficients as
+`A(dr)/(dr-j)` makes the weights real, so a point costs `m` real
+multiply-adds and reads only `m` consecutive bins; the handful of distinct
+`dr` values a whole search visits are tabulated once per harmonic and
+indexed by exact integer arithmetic. There is no fine grid, no
+`numbetween`, and no linear interpolation.
 
-The detection metric is the **peak boxcar matched filter**: each profile is
-correlated with a geometric bank of top-hat widths, each made *zero-mean and
-unit-L2*, and scored
-
-```
-max_{w,phase} (S_w − δ·S_tot) / (σ̂ · sqrt(w·(1−δ))),      δ = w / nbins
-```
-
-with the per-bin noise scale `σ̂` computed analytically by default (see
-[The noise scale](#the-noise-scale-analytic-by-default)). Because the widths
-are fixed a priori,
-every (phase, width) trial is `N(0,1)` under noise, so the pure-noise
-distribution is analytic and — unlike the older on-pulse sums — flat across
-harmonic decimations: one `--threshold` means one false-alarm rate at every `k`.
-
-This is **exactly riptide's `snr1`** (`cpp/snr.hpp`), verified against the
-`rseek` binary itself to 1.4e-7 on real folds, which is riptide's own `Float32`
-accumulation; the two codes' S/N columns are therefore the same quantity. It is
-also a port of the Python `snr_metric` and is oracle-pinned to machine
-precision (1.4e-16). It replaced an earlier form that subtracted each profile's
-*median* and divided by `σ̂√w`: that normalisation drifted with source
-brightness, so it had no calculable false-alarm rate, and at matched FAP the
-zero-mean template detects strictly better at every duty cycle.
-
-> The earlier width-penalised on-pulse metrics (`--metric non` = `N_on^p`,
-> `--metric sd2` = `Σd²^p`) were retired here and upstream. On real data `non`
-> produced many more false positives than `sd2`, and their noise floors scaled
-> with the profile bin count, which biased a fixed threshold toward the
-> low-decimation passes — the problem the boxcar metric was written to fix.
-
-Near-identical candidates are collapsed by default (`--noremove`
-disables it, `--drtol` sets the tolerance), and harmonically-related candidates
-(the `f/2`, `2f`, `3f/2`, … family) are collapsed to their strongest member
-(`--noharmremove`, `--numharm`). A cheap multi-frequency search by harmonic
-decimation (`--maxdecim`) re-uses the interpolated harmonics to fold at integer
-multiples of each fundamental, pinned by a test that every decimation pass
-reproduces the native reduced-harmonic fold. A progress meter prints to stderr
-(`--progressbar`, `--noprogress`).
-
-### Interpolation
-
-Harmonic amplitudes come from the Eqn.-30 kernel evaluated *exactly* at each
-trial frequency. Factoring the coefficients as `A(dr)/(dr-j)` makes the weights
-real, so a point costs `m` real multiply-adds and reads only `m` consecutive
-bins; the handful of distinct `dr` values a whole search visits are tabulated
-once per harmonic and indexed by exact integer arithmetic. There is no fine
-grid, no `numbetween`, and no linear interpolation.
-
-The FFT-correlation method ported from the Python original — build a uniform
-fine grid of `numbetween` points per Fourier bin with two transforms, then
-linearly interpolate it — survives only as the *reference* path
-(`reference_profiles(...; kernel=:fft)`, `finterp_fft`), which is what the Python
-oracle is pinned to. It was retired from the search because it is both slower
-(~3.8× on the interpolation) and an approximation: its linear interpolation is
-worth up to ~5% in amplitude at high harmonics with `numbetween=16`.
+The FFT-correlation method ported from the Python original — build a
+uniform fine grid of `numbetween` points per Fourier bin with two
+transforms, then linearly interpolate it — survives only as the
+*reference* path (`reference_profiles(...; kernel=:fft)`, `finterp_fft`),
+which is what the Python oracle is referenced against. It was retired from
+the search because it is both slower (~3.8× on the interpolation) and an
+approximation: its linear interpolation is worth up to ~5% in amplitude at
+high harmonics with `numbetween=16`.
 
 `bench/interp_bench.jl` compares the two on throughput and accuracy, and
 `--verbose` prints the trial grid, chunking and interpolation phase-cycle
