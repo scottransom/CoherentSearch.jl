@@ -3328,16 +3328,30 @@ not the card getting slower: its own ns/trial improved 11.6 → 10.7.
 
 #### Per-phase ns/trial, at each card's best blocksize
 
-Computed the §4.12 way: share of the instrumented total × clean total ÷ trials.
+**NOT the §4.12 way.** §4.12 took each phase as (share of the instrumented
+total) × (clean total). That was right before the overlap, when the clean run was
+serial. Since §4.13 the host work is hidden behind the device, and on a
+device-bound card this method under-counts every device phase by
+instrumented/clean: 1.38x on the A100. (An earlier draft of this section did
+exactly that, and read the A100's boxcar as 2.61 ns against §4.15's 3.80.) Used
+here: **instrumented phase seconds ÷ trials**, scaled by `f = min(1, clean ÷
+instrumented-device)`. On the two small-chunk cards the timing-on
+synchronisation pushed the instrumented *device* total past the clean total:
+the L40 1.274x over 12,909 chunks, ~94 µs per chunk; the 4500 Ada 1.212x over
+51,639, ~30 µs. On those two cards `f` removes that inflation, assuming it is
+spread evenly across phases. `f` is 0.989–1.000 everywhere else.
 
-| card | zero | interp | transp | xform | boxcar | dload | scan | **device** | **total** | device ns x SMxclk |
-|---|---|---|---|---|---|---|---|---|---|---|
-| L40 | 0.14 | 1.76 | 0.84 | 2.71 | 2.35 | 0.62 | 2.08 | **7.80** | **10.5** | 2757 |
-| A100 80GB | 0.01 | 1.27 | 0.81 | 2.85 | 2.61 | 0.69 | 2.41 | **7.56** | **10.7** | **1151** |
-| RTX 4500 Ada | 0.51 | 3.88 | 1.79 | 3.74 | 4.29 | 0.87 | 2.00 | **14.21** | **17.1** | 2200 |
-| RTX A4000 | 0.09 | 3.28 | 3.34 | 9.53 | 5.39 | 0.80 | 6.10 | **21.62** | **28.5** | 1619 |
-| GTX 1080 | 0.07 | 11.95 | 7.00 | 29.13 | 13.36 | 3.25 | 5.94 | **61.51** | **70.7** | 2133 |
-| RTX A400 | 0.15 | 29.73 | 19.73 | 52.36 | 38.15 | 2.61 | 2.32 | **140.11** | **145.0** | 1481 |
+| card | f | zero | interp | transp | xform | boxcar | **device** | clean total | device ns x SMxclk |
+|---|---|---|---|---|---|---|---|---|---|
+| L40 | 0.785 | 0.19 | 2.38 | 1.12 | 3.64 | 3.16 | **10.50** | 10.5 | **3711** |
+| A100 80GB | 1.000 | 0.01 | 1.76 | 1.13 | 3.94 | 3.63 | **10.47** | 10.7 | 1595 |
+| RTX 4500 Ada | 0.825 | 0.62 | 4.66 | 2.15 | 4.50 | 5.15 | **17.08** | 17.1 | 2644 |
+| RTX A4000 | 0.989 | 0.11 | 4.32 | 4.41 | 12.56 | 7.12 | **28.52** | 28.5 | 2136 |
+| GTX 1080 | 1.000 | 0.09 | 13.72 | 8.02 | 33.52 | 15.36 | **70.70** | 70.7 | 2452 |
+| RTX A400 | 1.000 | 0.14 | 30.76 | 20.35 | 54.11 | 39.45 | **144.81** | 145.0 | **1531** |
+
+Every card is now device-bound (device ≈ clean total), so the device column
+*is* the card.
 
 Device-only shares:
 
@@ -3362,15 +3376,84 @@ Device-only shares:
   probe, is still the next device-side experiment**, and the phase it targets is
   the biggest one almost everywhere.
 - **The L40 does not follow `SMs x clock`.** It has 2.3x the A100's `SMs x clock`
-  and about the same device ns/trial, so its `device ns x SMxclk` is 2.4x the
-  A100's. The 4500 Ada sits nearly as high, at 2200. Bandwidth per SM is the
-  obvious suspect: on nominal spec-sheet figures the L40 has ~6 GB/s per SM,
-  the 4500 Ada ~7 and the A100 80GB ~19. But the GTX 1080 (~16) sits at 2133
-  and does not fit that ordering, and **none of it is measured**.
-  `bench/gpu_probe.jl` on `talanah` and `eiger` would give achieved bandwidth and
-  FP32 in one cheap run each. Until then, **§4.12's "near-linear across SM
-  count" does not survive a 142-SM card**, and the paper should not state it as
-  a rule.
+  and the same device ns/trial, so its `device ns x SMxclk` is 2.3x the A100's;
+  the 4500 Ada is 1.7x. **§4.12's "near-linear across SM count" does not survive
+  a 142-SM card**, and the paper should not state it as a rule. The probes below
+  say why.
+
+#### The two Ada cards, probed: memory per SM is the limit (2026-09-16)
+
+`bench/gpu_probe.jl` on `eiger` and `talanah`, raw output in
+`{eiger,talanah}_gpu_probe.txt`:
+
+| | **L40** | **RTX 4500 Ada** |
+|---|---|---|
+| FP32 achieved | **78183 GFLOP/s** (86% of 90516) | 34156 (86% of 39629) |
+| device copy | **587 GB/s** (68% of 864) | 361 (84% of 432) |
+| L2 | 96 MB | 48 MB |
+| cuFFT k=1 falls out of L2 at | Nprof 131072 (121 MB) | Nprof 65536 (60.5 MB) |
+| best transform-stage Nprof | 65536 (0.018 s; 28x CPU `-t 20`) | 32768 (0.034 s; 15x) |
+| cuFFT rows above DRAM | up to **281%** | up to **247%** |
+| direct DFT vs cuFFT | 7.4x / 1.7x slower (65536 / 262144) | 2.6x / 2.1x slower |
+
+- **Both L2 knees sit exactly where the L2 size predicts**, and both cards run
+  L2-resident cuFFT rows at 2–2.8x their DRAM, the §4.13 Ada mechanism.
+- **The direct DFT is dead on these two as well** (§0.1).
+- **The L40 has the most FP32 of any card measured, 4.6x the A100's, and the same
+  speed.** This workload was never FLOP-bound (§0.1), so FP32 was not
+  expected to help, but this is the largest demonstration of it.
+
+**The traffic model of §4.15, applied to all six cards** (bytes/trial:
+interp 488, transpose 1712 after §4.15's fusion, transform 2400, boxcar 1200;
+achieved GB/s = bytes ÷ ns, quoted as a percentage of each card's measured
+device copy; `zero` omitted, since it now writes only the gave-up columns):
+
+| card | copy GB/s per SM | interp | transpose | transform | **boxcar** | boxcar ns x SMxclk | interp ns x SMxclk |
+|---|---|---|---|---|---|---|---|
+| L40 | **4.1** | 35% | **259%** | **112%** | **65%** | **1119** | **841** |
+| RTX 4500 Ada | **6.0** | 29% | **221%** | **148%** | **65%** | 798 | 721 |
+| RTX A4000 | 7.9 | 30% | 102% | 50% | 44% | 533 | 323 |
+| GTX 1080 | 11.8 | 15% | 90% | 30% | 33% | 533 | 476 |
+| RTX A400 | 15.0 | 18% | 93% | 49% | 34% | 417 | 325 |
+| A100 80GB | 15.6 | 17% | 90% | 36% | **20%** | 552 | 267 |
+
+(Copy per SM uses the probe's *achieved* copy: 587, 361, 381, 237, 90 and
+1683 GB/s.)
+
+- **The boxcar's share of DRAM falls as memory per SM rises, monotonically to within a point:**
+  20% at 15.6 GB/s per SM, rising to 65% at 4–6 GB/s. On the four cards with
+  ≥ 7.9 GB/s per SM, `boxcar ns x SMxclk` is 417–552, flat to 1.3x: §4.12's
+  finding that the boxcar is issue-bound and tracks `SMs x clock`. On the two
+  Ada cards it is 1.5x and 2.1x above that line, at 65% of DRAM. That is the
+  highest DRAM share any issue-bound phase has shown in this log. **Reading:
+  below ~6 GB/s per SM the boxcar stops being issue-bound and starts being fed
+  by DRAM.** 65% is not 100%, so this is an approach to the bandwidth wall, not
+  a clean saturation.
+- **Their transpose and transform are L2-resident** (112–259% of DRAM), which
+  is the only reason those phases keep up. It is also why both cards want small
+  chunks. At §4.13's ~4.1 kB/trial, the 4500 Ada's 8192 is a 34 MB working set,
+  the largest power of two that fits its 48 MB of L2. The L40's 32768 is 134 MB,
+  past its 96 MB, so the L40 sits in the middle of §4.13's two opposed
+  mechanisms: 16384 would be resident and costs 1.17x; 65536 fills better and
+  costs 1.14x.
+- **The interpolator is the other off-line phase**, 2.7–3.1x the A100's
+  `ns x SMxclk`, at only 29–35% of DRAM, so it is not bandwidth-starved. The
+  likely cause is **under-fill**: §4.15 measured the A100's interp 1.36x faster
+  at 262144 than at 65536, and these two cards run at 32768 and 8192, where a
+  142-SM card cannot be filled. **Not yet tested.** `bench/gpu_interp_bench.jl` on
+  `talanah` across Nprof would settle it: it should show ns/(harm,trial) falling
+  well below today's value by 262144 if under-fill is the cause.
+- **So the Ada-generation workstation cards are shaped for this workload the
+  wrong way round:** a big L2 and many fast SMs, fed by GDDR6 at 4–6 GB/s per
+  SM. The two phases that need bandwidth get it from L2, which forces small
+  chunks. Small chunks starve the two issue-bound phases of fill, and the
+  boxcar also runs short of DRAM. The A100's HBM2e (15.6 GB/s per SM) avoids
+  all three, which is how 108 SMs match 142.
+- **For the paper:** the honest one-line model is *device throughput tracks `SMs
+  x clock` while memory per SM is ≳ 8 GB/s, and falls below that line in
+  proportion to the shortfall*. That is six cards and one mechanism, with a
+  monotone ordering but no fitted functional form. Present it as an observation,
+  not a law.
 
 #### Two predictions scored
 
