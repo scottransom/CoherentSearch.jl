@@ -400,8 +400,8 @@ on purpose. **Eight cards are now measured, 6 to 142 SMs, all agreeing with the
 CPU.** **The paper's numbers are §4.16** (2026-09-15/16, `bench/paper_gpu_run.sh`,
 NGC6624 over the WIDE band 0.1–133.3 Hz = 423M trials, all post-overlap and
 post-fused-transpose), against fitzroy's CPU at `-t 40` on the same band (39.79
-s, 94.1 ns/trial): **L40 8.96x (10.5 ns/trial), A100 8.81x (10.7)** — a tie —
-RTX 4500 Ada 5.51x (17.1), **RTX A4000 3.30x (28.5)**, GTX 1080 1.33x (70.7),
+s, 94.1 ns/trial): **L40 9.25x (10.2 ns/trial), A100 8.81x (10.7)** — a tie —
+RTX 4500 Ada 5.45x (17.2), **RTX A4000 3.30x (28.5)**, GTX 1080 1.33x (70.7),
 **RTX A400 0.65x (145.0) — still the only card that LOSES to fitzroy.** **Do not
 compare these ratios with the older "vs fitzroy `-t 20`" ones (narrow band, 112.0
 ns/trial):** the A100 went 9.62x → 8.81x while its own ns/trial *improved*
@@ -431,12 +431,17 @@ per-phase rows is wrong per phase** (eiger's bench matches the UNscaled interp
 to 1.5%), so read the Ada per-phase splits as ±25%; the totals stand. The L40 has 4.6x the A100's FP32 and the same speed.
 **Also: §4.16's first per-phase table under-counted device phases** by applying
 §4.12's pre-overlap share×clean method; it now uses instrumented seconds.
-**The 2026-09-15/16 runs of `paper_gpu_run.sh` step 4 used `nproc`
-(hyperthreads)**. `eiger`'s thread scaling puts that ~2x slow there, so its CPU
-row is unusable, and `talanah`'s is ~1.3x pessimistic. **Fixed afterwards**: the
-script now uses the physical cores in its cpuset (`CPU_THREADS=N` overrides).
-The same `nproc` gate had honoured `OMP_NUM_THREADS=1` and silently skipped the
-`-t 1` row on fitzroy, eiger and rocinante. Re-runs pending.
+**The first runs of `paper_gpu_run.sh` step 4 used `nproc` (hyperthreads)**,
+which made `eiger`'s CPU row unusable and cost `talanah` 1.41x. **Fixed**: the
+script now uses the physical cores in its cpuset (`CPU_THREADS=N` overrides),
+which also un-skips the `-t 1` row that `OMP_NUM_THREADS=1` had suppressed. The
+L40 and 4500 Ada were **re-run quietly with the fix** (§4.16's columns). The L40
+is 3.41x its host (`-t 32`, 14.66 s) and the 4500 Ada 5.90x its host (`-t 16`,
+43.04 s). The 4500 Ada's **negative fixed cost is real**: only the wide band
+crosses Nyquist, and `zero` is 4.5% of device time at 8192-trial chunks. So F
+is unmeasurable on small-chunk cards, and a negative value does not mean a
+noisy run. **Per-phase splits on the L40 moved ~25% between two runs while the
+total moved 3%**; quote the Ada cards' totals, not their phase splits.
 **Two headline verdicts have been retired by the A100 (§4.12) — do not quote
 them:** (a) *"above ~48 SMs the workload does not care what you buy"* was three
 cards that all had 48 SMs; at fixed SM count that still holds (the three 48-SM
@@ -473,10 +478,10 @@ DRAM, impossible from memory — so residency is worth **2.32x** to it; the A100
 has the same 40 MB but 1683 GB/s of DRAM, never exceeds it, and is instead
 **2.21x** worse at the SMALL end because 108 SMs cannot be filled. Two
 mechanisms, opposite directions, near-equal size. 65536 is
-within **1.28x** of the optimum on the cards measured (§4.16, post-overlap on six):
-**both Ada workstation cards want 8192 — the RTX 4500 Ada pays 1.28x at the
+within **1.24x** of the optimum on the cards measured (§4.16, post-overlap on six):
+**both Ada workstation cards want 8192 — the RTX 4500 Ada pays 1.24x at the
 default, the RTX 4000 SFF Ada 1.22x** (that one grew from 1.13x once the overlap
-landed, because the overlap helps small chunks most, §4.13). The L40 pays 1.14x
+landed, because the overlap helps small chunks most, §4.13). The L40 pays 1.21x
 (optimum 32768), the A100 1.18x (1048576), the A4000 and 1080 1.06x, the A400
 1.00x. **262144 is within 1% of 65536 or better on every card it fits, but it does not fit
 the A400 beside a 1.29 GiB file** — so the open default question is a

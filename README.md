@@ -756,9 +756,9 @@ fundamentals, spin coverage to 800 Hz — at each card's best `--blocksize`,
 
 | card | SMs | best `--blocksize` | wall (s) | ns/trial | vs 20-core Xeon |
 |---|---|---|---|---|---|
-| L40 | 142 | 32768 | **4.44** | **10.5** | **8.96x** |
+| L40 | 142 | 32768 | **4.30** | **10.2** | **9.25x** |
 | A100-SXM4-80GB | 108 | 1048576 | **4.52** | **10.7** | **8.81x** |
-| RTX 4500 Ada | 60 | 8192 | 7.23 | 17.1 | 5.51x |
+| RTX 4500 Ada | 60 | 8192 | 7.30 | 17.2 | 5.45x |
 | RTX A4000 | 48 | 524288 | 12.07 | 28.5 | 3.30x |
 | GTX 1080 | 20 | 262144 | 29.91 | 70.7 | 1.33x |
 | RTX A400 | 6 | 131072 | 61.36 | 145.0 | **0.65x** |
@@ -766,7 +766,9 @@ fundamentals, spin coverage to 800 Hz — at each card's best `--blocksize`,
 The reference is `fitzroy`'s 2× Xeon Silver 4114 at `-t 40` on the same file
 and band: 39.79 s, 94.1 ns/trial. The CPU still wins on a big enough machine: a
 32-core Threadripper PRO 7975WX (`-t 64`) takes 9.14 s, and 2× EPYC 7413
-(`-t 96`) take 10.02 s, faster than an RTX A4000. All six cards give the same
+(`-t 96`) take 10.02 s, faster than an RTX A4000. Against their own hosts'
+physical cores, the L40 is 3.4x a 2× Xeon Silver 4514Y (14.66 s at `-t 32`) and
+the RTX 4500 Ada 5.9x a 16-core Xeon w5-3433 (43.04 s at `-t 16`). All six cards give the same
 285 candidates as the CPU. The only difference is the last digit of four
 printed periods (one ulp of `1/f`), and even that vanishes in a band past this
 file's Nyquist knee, where the output is byte-identical.
@@ -824,12 +826,12 @@ node that shares the filesystem, then run on the GPU node with the same
 environment and `JULIA_DEPOT_PATH` — that case is fine, because it really is one
 machine's worth of hardware.
 
-### Tune `--blocksize` for your card — it is worth up to ~1.3x over the default
+### Tune `--blocksize` for your card — it is worth up to ~1.25x over the default
 
 **Not urgent any more, but still worth one run.** `--blocksize` (trial
 fundamentals per chunk) defaults to **65536 under `--gpu`** and 2048 on the CPU;
 the two defaults are 32x apart. 65536 is one constant chosen
-for its worst case — it is within **1.28x** of the optimum on the cards we have
+for its worst case — it is within **1.24x** of the optimum on the cards we have
 measured, spanning 6 to 142 SMs and 1 to 96 MB of L2 — and it is not a
 per-device rule, because the optimum is *not* predictable from the hardware: the
 A100 and the RTX 4000 Ada have the same 40 MB of L2 and want opposite ends of a
@@ -867,9 +869,9 @@ Measured optima, and what the default costs on each:
 
 | card | L2 | optimum | 65536 costs | 262144 costs |
 |---|---|---|---|---|
-| RTX 4500 Ada | 48 MB | 8192 | **1.28x** | 1.13x |
+| RTX 4500 Ada | 48 MB | 8192 | **1.24x** | 1.12x |
 | RTX 4000 SFF Ada | 40 MB | 8192 | 1.22x | ~1.23x |
-| L40 | 96 MB | 32768 | 1.14x | 1.14x |
+| L40 | 96 MB | 32768 | 1.21x | 1.20x |
 | A100 80GB | 40 MB | 1048576 | 1.18x | 1.05x |
 | RTX A4000 | 4 MB | 524288 | 1.06x | 1.01x |
 | GTX 1080 | 2 MB | 262144 (sweep capped by memory) | 1.06x | 1.00x |

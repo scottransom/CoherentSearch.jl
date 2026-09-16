@@ -3291,6 +3291,11 @@ sm_86 x2, sm_89 x3) agreeing with the CPU.
 
 #### The table
 
+**The L40 and 4500 Ada columns are the 2026-09-16 re-runs** (at `d81c997`, with
+the physical-core fix to step 4, on quiet hosts: load 0.05 and 0.02). Their
+first runs, at load 5.2 and 5.4, read 4.440 s and 7.225 s, within 3% and 1% of
+these. The notes below say where the first run is still quoted.
+
 | | **L40** | **A100-SXM4-80GB** | **RTX 4500 Ada** | **RTX A4000** | **GTX 1080** | **RTX A400** |
 |---|---|---|---|---|---|---|
 | host | `talanah` | `gina4` (OzSTAR) | `eiger` | `bla0` | `fitzroy` | `rocinante` |
@@ -3299,21 +3304,23 @@ sm_86 x2, sm_89 x3) agreeing with the CPU.
 | SMs x clock | **353.6** | 152.3 | 154.8 | 74.9 | 34.7 | **10.6** |
 | L2 | **96 MB** | 40 MB | 48 MB | 4 MB | 2 MB | **1 MB** |
 | device memory | 44.4 GiB | 79.3 | 23.5 | 15.6 | 7.9 | 3.7 |
-| host load (at report) | 5.22 | 37.5 (batch node, cpuset-isolated) | 5.42 | 1.81 | 2.96 | 4.94 |
+| host load (at start) | 0.05 | 37.8 (batch node, cpuset-isolated) | 0.02 | 1.81 | 2.96 | 4.94 |
 | **best `--blocksize`** | **32768** | **1048576** | **8192** | 524288 | 262144 *(capped)* | 131072 *(capped)* |
-| **clean total** | **4.440 s** | **4.515 s** | 7.225 s | 12.065 s | 29.909 s | 61.359 s |
-| **ns/trial** | **10.5** | **10.7** | 17.1 | 28.5 | 70.7 | 145.0 |
-| marginal ns/trial (2-band fit) | 10.3 | 10.4 | 17.2 | 28.3 | 70.0 | 144.1 |
-| fixed cost F (s/file) | 0.081 | 0.107 | **−0.047** | 0.110 | 0.287 | 0.399 |
+| **clean total** | **4.303 s** | **4.515 s** | 7.296 s | 12.065 s | 29.909 s | 61.359 s |
+| **ns/trial** | **10.2** | **10.7** | 17.2 | 28.5 | 70.7 | 145.0 |
+| marginal ns/trial (2-band fit) | 9.9 | 10.4 | 17.4 | 28.3 | 70.0 | 144.1 |
+| fixed cost F (s/file) | 0.128 | 0.107 | **−0.071** *(real; see notes)* | 0.110 | 0.287 | 0.399 |
 | narrow band (0.1–33.3), ns/trial | 11.1 | 11.4 | 16.7 | 29.3 | 72.7 | 147.9 |
-| 65536 (the default) costs | 1.14x | 1.18x | **1.28x** | 1.06x | 1.06x | 1.00x |
-| 262144 costs | 1.14x | 1.05x | 1.13x | 1.01x | 1.00x | does not fit |
-| CPU default 2048 costs | 4.98x | 6.82x | 2.94x | 2.59x | 1.80x | 1.26x |
-| **vs fitzroy CPU `-t 40`** (39.79 s) | **8.96x** | **8.81x** | 5.51x | 3.30x | 1.33x | **0.65x** |
-| vs its own host's CPU | 4.66x (`-t 64`) | — | *(see below)* | **0.83x** (`-t 96`) | 1.33x (`-t 40`) | **0.15x** (`-t 64`) |
+| 65536 (the default) costs | 1.21x | 1.18x | **1.24x** | 1.06x | 1.06x | 1.00x |
+| 262144 costs | 1.20x | 1.05x | 1.12x | 1.01x | 1.00x | does not fit |
+| CPU default 2048 costs | 5.07x | 6.82x | 2.95x | 2.59x | 1.80x | 1.26x |
+| **vs fitzroy CPU `-t 40`** (39.79 s) | **9.25x** | **8.81x** | 5.45x | 3.30x | 1.33x | **0.65x** |
+| vs its own host's CPU | **3.41x** (`-t 32`, 14.66 s) | — | **5.90x** (`-t 16`, 43.04 s) | **0.83x** (`-t 96`) | 1.33x (`-t 40`) | **0.15x** (`-t 64`) |
 
-**The L40 and the A100 are tied**, 1.7% apart on wall clock and 1% on marginal
-ns/trial. That is not a ranking, and the two hosts differ in load and CPU.
+**The L40 and the A100 are effectively tied.** The quiet L40 re-run is 4.9%
+faster on wall clock (4.303 vs 4.515 s) and 5% on marginal ns/trial (9.9 vs
+10.4), but the A100's number was taken on a batch node at load 38, and the L40's
+own first run was 3% slower. That is not a ranking.
 **The A400 is still the only card slower than fitzroy's 20 cores**, and on its
 own host (a 32-core Threadripper PRO 7975WX, 9.14 s at `-t 64`) it is 6.7x
 slower. **The RTX A4000 also loses to its own host**, 2× EPYC 7413 at 10.02 s,
@@ -3345,38 +3352,44 @@ rows read each phase as ±25%. The device totals are unaffected.
 
 | card | f | zero | interp | transp | xform | boxcar | **device** | clean total | device ns x SMxclk |
 |---|---|---|---|---|---|---|---|---|---|
-| L40 | 0.785 | 0.19 | 2.38 | 1.12 | 3.64 | 3.16 | **10.50** | 10.5 | **3711** |
+| L40 | 0.757 | 0.18 | 1.74 | 1.16 | 3.29 | 3.80 | **10.17** | 10.2 | **3597** |
 | A100 80GB | 1.000 | 0.01 | 1.76 | 1.13 | 3.94 | 3.63 | **10.47** | 10.7 | 1595 |
-| RTX 4500 Ada | 0.825 | 0.62 | 4.66 | 2.15 | 4.50 | 5.15 | **17.08** | 17.1 | 2644 |
+| RTX 4500 Ada | 0.814 | 0.77 | 4.63 | 2.11 | 4.57 | 5.16 | **17.25** | 17.2 | 2670 |
 | RTX A4000 | 0.989 | 0.11 | 4.32 | 4.41 | 12.56 | 7.12 | **28.52** | 28.5 | 2136 |
 | GTX 1080 | 1.000 | 0.09 | 13.72 | 8.02 | 33.52 | 15.36 | **70.70** | 70.7 | 2452 |
 | RTX A400 | 1.000 | 0.14 | 30.76 | 20.35 | 54.11 | 39.45 | **144.81** | 145.0 | **1531** |
 
 Every card is now device-bound (device ≈ clean total), so the device column
-*is* the card.
+*is* the card. The two Ada rows are the quiet re-runs. **Their per-phase split
+is not stable between runs**, though their totals are. The L40's first run
+(same blocksize, `f` 0.785) read interp 2.38 and boxcar 3.16 against today's
+1.74 and 3.80, and device shares interp 22.7% / transform 34.7% / boxcar 30.2%
+against today's 17.1 / 32.3 / 37.3. The total moved 3%. The 4500 Ada's two
+runs agree to a few percent per phase.
 
 Device-only shares:
 
 | card | zero | interp | transpose | transform | boxcar | device % of instrumented |
 |---|---|---|---|---|---|---|
-| L40 | 1.8% | 22.7% | 10.7% | **34.7%** | 30.2% | 74.3% |
+| L40 | 1.8% | 17.1% | 11.4% | 32.3% | **37.3%** | 74.3% |
 | A100 80GB | 0.1% | 16.8% | 10.8% | **37.7%** | 34.6% | 70.9% |
-| RTX 4500 Ada (8192) | 3.6% | 27.3% | 12.6% | 26.3% | **30.2%** | 83.1% |
+| RTX 4500 Ada (8192) | 4.5% | 26.8% | 12.2% | 26.5% | **29.9%** | 83.3% |
 | RTX A4000 | 0.4% | 15.1% | 15.5% | **44.1%** | 25.0% | 75.8% |
 | GTX 1080 | 0.1% | 19.4% | 11.3% | **47.4%** | 21.7% | 86.9% |
 | RTX A400 | 0.1% | 21.2% | 14.1% | **37.4%** | 27.2% | 96.6% |
 
 - **§4.15's two fixes show in the `zero` and `transpose` columns.** `zero` is
   ≤0.4% of device time on the four cards whose optimum blocksize is ≥131072, and
-  larger only on the two that want small chunks (4500 Ada 3.6%, L40 1.8%).
+  larger only on the two that want small chunks (4500 Ada 4.5%, L40 1.8%).
   `transpose`'s device share fell on every card re-measured since §4.12: A4000
   19.5 → 15.5%, A400 17.6 → 14.1%, 1080 15.0 → 11.3%, A100 14.6 → 10.8%.
-- **The transform is the largest device phase on five of six cards.** The
-  exception is the 4500 Ada at its 8192 optimum, where the boxcar leads, as it
-  did on the other Ada at 8192 in §4.12. §4.15's "tied on the 40 MB cards" now
-  reads 37.7% against 34.6% on the A100. So §4.15's item 2, **the C2C-vs-C2R
-  probe, is still the next device-side experiment**, and the phase it targets is
-  the biggest one almost everywhere.
+- **The transform is the largest device phase on the four large-chunk cards;
+  the boxcar leads on both Ada cards.** That is as it was on the other Ada at
+  8192 in §4.12. (The L40's first run had the transform ahead, 34.7% against
+  30.2%, within the run-to-run instability above.) §4.15's "tied on the 40 MB
+  cards" now reads 37.7% against 34.6% on the A100. So §4.15's item 2, **the
+  C2C-vs-C2R probe, is still the next device-side experiment**, and the
+  boxcar is the other half of the device budget everywhere.
 - **The L40 does not follow `SMs x clock`.** It has 2.3x the A100's `SMs x clock`
   and the same device ns/trial, so its `device ns x SMxclk` is 2.3x the A100's;
   the 4500 Ada is 1.7x. **§4.12's "near-linear across SM count" does not survive
@@ -3412,8 +3425,8 @@ device copy; `zero` omitted, since it now writes only the gave-up columns):
 
 | card | copy GB/s per SM | interp | transpose | transform | **boxcar** | boxcar ns x SMxclk | interp ns x SMxclk |
 |---|---|---|---|---|---|---|---|
-| L40 | **4.1** | 35% | **259%** | **112%** | **65%** | **1119** | **841** |
-| RTX 4500 Ada | **6.0** | 29% | **221%** | **148%** | **65%** | 798 | 721 |
+| L40 | **4.1** | 48% | **251%** | **124%** | **54%** | **1343** | **614** |
+| RTX 4500 Ada | **6.0** | 29% | **225%** | **145%** | **64%** | 799 | 717 |
 | RTX A4000 | 7.9 | 30% | 102% | 50% | 44% | 533 | 323 |
 | GTX 1080 | 11.8 | 15% | 90% | 30% | 33% | 533 | 476 |
 | RTX A400 | 15.0 | 18% | 93% | 49% | 34% | 417 | 325 |
@@ -3423,16 +3436,19 @@ device copy; `zero` omitted, since it now writes only the gave-up columns):
 1683 GB/s.)
 
 - **The boxcar's share of DRAM falls as memory per SM rises, monotonically to within a point:**
-  20% at 15.6 GB/s per SM, rising to 65% at 4–6 GB/s. On the four cards with
-  ≥ 7.9 GB/s per SM, `boxcar ns x SMxclk` is 417–552, flat to 1.3x: §4.12's
-  finding that the boxcar is issue-bound and tracks `SMs x clock`. On the two
-  Ada cards it is 1.5x and 2.1x above that line, at 65% of DRAM. That is the
+  20% at 15.6 GB/s per SM, rising to 54–65% at 4–6 GB/s (the L40's two runs
+  read 65% and 54%). On the four cards with ≥ 7.9 GB/s per SM,
+  `boxcar ns x SMxclk` is 417–552, flat to 1.3x: §4.12's finding that the
+  boxcar is issue-bound and tracks `SMs x clock`. The 4500 Ada is at 799 and
+  the L40 at 1119–1343 (two runs), **1.4–2.4x above that line**. That is the
   highest DRAM share any issue-bound phase has shown in this log. **Reading:
-  below ~6 GB/s per SM the boxcar stops being issue-bound and starts being fed
-  by DRAM.** 65% is not 100%, so this is an approach to the bandwidth wall, not
-  a clean saturation. **The ordering survives dropping `f`**, which the
-  interp sweep below shows is not reliable per phase: unscaled, both Ada
-  boxcars read 51–53% of DRAM, still the two highest.
+  below ~6 GB/s per SM the boxcar stops tracking `SMs x clock` and starts being
+  held back by DRAM.** 54–65% is not 100%, so this is an approach to the
+  bandwidth wall, not a clean saturation. **The DRAM ordering is weaker than the
+  off-line result:** without `f`, which the interp sweep below shows is not
+  reliable per phase, the 4500 Ada reads 52% and the L40 51% (first run) or
+  41% (re-run), against the A4000's 44%. The L40's distance from the
+  `SMs x clock` line is the robust number. Its DRAM share is suggestive.
 - **Their transpose and transform are L2-resident** (112–259% of DRAM), which
   is the only reason those phases keep up. It is also why both cards want small
   chunks. At §4.13's ~4.1 kB/trial, the 4500 Ada's 8192 is a 34 MB working set,
@@ -3440,8 +3456,9 @@ device copy; `zero` omitted, since it now writes only the gave-up columns):
   past its 96 MB, so the L40 sits in the middle of §4.13's two opposed
   mechanisms: 16384 would be resident and costs 1.17x; 65536 fills better and
   costs 1.14x.
-- **The interpolator is the other off-line phase**, 2.7–3.1x the A100's
-  `ns x SMxclk`, at only 29–35% of DRAM, so it is not bandwidth-starved. The
+- **The interpolator is the other off-line phase**, 2.3–3.1x the A100's
+  `ns x SMxclk` (across the L40's two runs), at only 29–48% of DRAM, so it is
+  not obviously bandwidth-starved. The
   likely cause is **under-fill**: §4.15 measured the A100's interp 1.36x faster
   at 262144 than at 65536, and these two cards run at 32768 and 8192, where a
   142-SM card cannot be filled. Tested on the L40 the same day (scored below).
@@ -3499,8 +3516,10 @@ is slow; each is slow at the blocksize its search picks.
   phase.** On the 4500 Ada the bench at 8192 (0.0956) matches the *uncorrected*
   in-search interp (0.0942) to 1.5%. With `f = 0.825` applied, the in-search
   figure is 1.23x *faster* than the bench, which cannot be right. On the L40 the
-  corrected in-search figure is 1.17x slower than the bench (0.0397 vs 0.0338)
-  and the uncorrected one 1.49x slower. So the timing-on inflation is **not**
+  first run's corrected in-search figure is 1.17x slower than the bench (0.0397
+  vs 0.0338) and the uncorrected one 1.49x slower. The quiet re-run reads
+  0.0290 corrected (1.17x *faster* than the bench) and 0.0383 uncorrected
+  (1.13x slower). The two runs bracket the bench. So the timing-on inflation is **not**
   spread evenly over phases. On the 4500 Ada the interp carries none of it. On
   the L40 some of the remaining gap may be L2 contention, since the pipeline is
   ~134 MB at 32768 and the bench has L2 to itself. **Read the `f`-scaled
@@ -3548,14 +3567,23 @@ is slow; each is slow at the blocksize its search picks.
 
 #### Data-quality notes
 
-- **`eiger`'s fixed-cost fit came out negative** (F = −0.047 s): the narrow
-  band's ns/trial was *lower* than the wide band's, which scatter can produce
-  and a real cost cannot. Load was 5.42 during the report against 0.00 when the
-  script started, so something else was running. Its sweep is also **non-monotone**, 8192 →
-  7.23 s, 65536 → 9.22, 1048576 → 7.84, which is the §4.11 Ada shape again: a
-  minimum at small chunks and a second, lower-occupancy branch at large ones.
-  Its ns/trial is usable. Do not quote its F.
-- **`eiger`'s CPU number is not usable.** Step 4 ran `-t 32` = all hardware
+- **`eiger`'s negative fixed cost is REAL, not scatter**, and the script's
+  "re-run on a quiet host" advice was wrong for it. The first run gave F =
+  −0.047 s at load 5.4. The quiet re-run (load 0.02) gives −0.071 s, and both
+  runs read 16.7 ns/trial on the narrow band against 17.1–17.2 on the wide one.
+  The two-band fit assumes the marginal cost per trial is the same in both
+  bands, and on this card it is not. Only the wide band crosses this file's
+  Nyquist knee (108.8 Hz), where harmonics give up and the `zero` phase must
+  clear their columns every chunk. At the 4500 Ada's 8192-trial chunks, `zero`
+  is **4.5% of device time**, 0.8–0.9 ns/trial averaged over the wide band
+  (scaled / unscaled) and ~0 on the narrow one. That covers the whole
+  0.5 ns/trial difference. On the
+  large-chunk cards `zero` is ≤0.4% and F comes out positive. **Read F as
+  "not measurable" on small-chunk cards**, not as a failed run. The sweep is
+  also **non-monotone** (8192 → 7.30 s, 65536 → 9.08, 1048576 → 7.83), the
+  §4.11 Ada shape: a minimum at small chunks and a second, lower-occupancy
+  branch at large ones.
+- **`eiger`'s FIRST CPU number was not usable** (fixed in the re-run). Step 4 ran `-t 32` = all hardware
   threads on a 16-core w5-3433 and read 55.4 s (131 ns/trial), and
   `docs/thread_scaling_eiger.csv`, taken 12 minutes later, shows the same
   collapse: 32 threads is **2.16x slower than 16** there, with 4.4x the
@@ -3568,8 +3596,16 @@ is slow; each is slow at the blocksize its search picks.
   use the physical cores in the process's cpuset, from `lscpu`, with
   `CPU_THREADS=N` as an override. The same `nproc` also honoured
   `OMP_NUM_THREADS=1` and **silently skipped the `-t 1` row** on fitzroy, eiger
-  and rocinante, which is why only `bla0` and `talanah` have one. `eiger` (and
-  probably `talanah`) will be re-run.
+  and rocinante, which is why only `bla0` and `talanah` have one.
+  **Re-run 2026-09-16 with the fix:** `eiger` `-t 16` 43.04 s (101.8 ns/trial)
+  and `-t 1` 286.4 s (677.0); `talanah` `-t 32` 14.66 s (34.6) against its
+  `-t 64` 20.69, i.e. **1.41x** from dropping the hyperthreads, and `-t 1`
+  311.4 s (736.2). So the L40 is **3.41x** its own host, not 4.66x.
+  **`eiger`'s CPU scales only 6.7x on 16 cores on this workload** (the wide
+  NGC6624 band), against 10.1x on the PM0063 thread-scaling run. Per core it is
+  the fastest CPU measured (677 ns/trial against `talanah`'s 736 and `bla0`'s
+  802), but at `-t 16` it is slower than fitzroy's 20 cores (101.8 against
+  94.1). Not investigated.
 - **Two sweeps are capped by the memory gate again**, not by the card: the 1080
   (524288 needs 3.31 GiB against 3.41 free after the desktop's share) and the A400
   (262144 "needs 2.3 GiB but only 2.45 GiB is free" — the 0.90 margin, the same
@@ -3582,9 +3618,9 @@ is slow; each is slow at the blocksize its search picks.
 #### What this changes in §4.15's next-work list
 
 - **Item 3 (propose 262144 as the default)** now has five post-overlap cards
-  instead of two. 262144 is within 1.05x on three (A100, A4000, 1080), 1.13x and
-  1.14x on the two small-chunk cards (4500 Ada, L40), where 65536 is 1.28x and
-  1.14x. So it is **never worse than 65536** on any card it fits. But **it does
+  instead of two. 262144 is within 1.05x on three (A100, A4000, 1080), 1.12x and
+  1.20x on the two small-chunk cards (4500 Ada, L40), where 65536 is 1.24x and
+  1.21x. So it is **never worse than 65536** on any card it fits. But **it does
   not fit the A400 alongside this 1.29 GiB file**, so as a fixed default it
   would turn a working search into an error on the smallest card. A
   memory-clamped default (the largest of {262144, 131072, 65536} the gate
