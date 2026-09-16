@@ -3442,44 +3442,58 @@ device copy; `zero` omitted, since it now writes only the gave-up columns):
   at 262144 than at 65536, and these two cards run at 32768 and 8192, where a
   142-SM card cannot be filled. Tested on the L40 the same day (scored below).
 
-#### The L40's interpolator in isolation: under-fill confirmed, and no gain past 65536
+#### The L40's interpolator in isolation: under-fill confirmed, and an L2 knee at 96 MB
 
 `bench/gpu_interp_bench.jl` on `talanah`, real NGC6624 amplitudes, ns per
-(harmonic, trial):
+(harmonic, trial). Two runs; the second used `--nprof`:
 
-| Nprof | 2048 | 32768 (the search) | 65536 | 262144 |
-|---|---|---|---|---|
-| L40, bench | 0.3091 | *not in the bench's list* | **0.0255** | 0.0337 |
-| L40, in search (2.38 ns/trial ÷ 60) | — | **0.0397** | — | — |
-| A100, bench (§4.15) | — | — | 0.0470 | **0.0346** |
+| Nprof | 2048 | 8192 | 16384 | **32768** (the search) | 65536 | **131072** | 262144 |
+|---|---|---|---|---|---|---|---|
+| interp working set (488 B/trial) | 1 MB | 4 MB | 8 MB | 16 MB | 32 MB | **64 MB** | **128 MB** |
+| L40, run 1 | 0.3091 | — | — | — | 0.0255 | — | 0.0337 |
+| L40, run 2 | — | 0.0967 | 0.0546 | **0.0338** | 0.0259 | **0.0242** | 0.0348 |
+| L40, in search (2.38 ns/trial ÷ 60) | — | — | — | **0.0397** | — | — | — |
+| A100, bench (§4.15) | — | — | — | — | 0.0470 | — | **0.0346** |
 
-Throughput per `SMs x clock` (1 / (ns × SMxclk), §4.15's column; higher is
-better): **L40 0.111 at 65536**, against 0.103–0.147 for the other five cards at
-the same Nprof (§4.15 table).
+The two runs agree to 1.6% at 65536 and 3.3% at 262144. Throughput per `SMs x
+clock` (1 / (ns × SMxclk), §4.15's column; higher is better): **L40 0.111 at
+65536 and 0.117 at its 131072 optimum**, against 0.103–0.147 for the other five
+cards at 65536 (§4.15 table).
 
-- **The prediction was "well below today's value by 262144", and it half
-  holds.** At 65536 the L40 reads 0.0255, **1.56x below** the in-search 0.0397
-  at 32768, so under-fill at the search blocksize is real and about that size.
-  (Assuming the bench tracks the search, as it did to 0.2–2.6% on the A4000 and
-  A100 in §4.15. There is no bench point at 32768; `--nprof` was added for this
-  and should be run at `8192,16384,32768,65536,131072,262144`.) At 262144,
-  though, it gets **1.32x worse** again, where the A100 gets 1.36x *better*. So
-  "keeps falling" is wrong.
-- **At fixed Nprof 65536 the L40 is on the §0.46 line** (0.111, among the 48-SM
-  and 20-SM cards), so its interpolator is not intrinsically slow. What sets it
-  apart is that it cannot use a bigger chunk. At 65536 the kernel moves
-  488 B / 1.53 ns = **319 GB/s, 54% of the card's copy speed**, the highest
-  interp DRAM share measured (A4000 28%, A100 16%). The upturn at 262144 is
-  consistent with running into that bandwidth, the same memory-per-SM limit as
-  the boxcar. That is an inference, not a measurement.
-- **So both of the L40's issue-bound phases hit the same wall**, and the chunk
-  size cannot help both at once. The search's 32768 is a compromise among
-  interp (best at 65536), transform (probe best 65536), and whatever made
-  65536 1.14x slower end to end. The transpose and boxcar are the candidates
-  there, since at 65536 the working set is ~268 MB against 96 MB of L2. A
-  phase table at 65536 on `talanah` would name the phase.
-  (`gpu_search_report.jl` only tables the best blocksize today, so this needs a
-  small option.) It is not needed for the paper.
+- **Under-fill is real: 1.40x.** Within the bench, 32768 → 131072 is
+  0.0338 → 0.0242. So the search's blocksize costs the L40's interpolator 1.40x
+  against its own optimum. At the 4500 Ada's 8192 it would cost 4.0x, which is
+  a likely reason the 4500 Ada's interp sits so far off the line (its own
+  sweep, on `eiger`, is pending).
+- **The upturn is an L2 knee, and it sits exactly where the L2 size predicts.**
+  The interpolator's output (61 `ComplexF32` columns, 488 B/trial) is 64 MB at
+  131072, which fits the L40's 96 MB of L2, and 128 MB at 262144, which does
+  not. Across that step the kernel gets **1.44x worse**, where every step below
+  it was a gain. That is the same knee the cuFFT sweep showed (k=1 leaves L2
+  between 65536 and 131072, at 60.5 → 121 MB).
+- **The A100 crosses the same kind of knee and gets FASTER** (0.0470 → 0.0346
+  from 65536 to 262144, i.e. 32 → 128 MB against 40 MB of L2). That is §4.13's
+  L2:DRAM discriminator again. The A100's 1683 GB/s of copy (15.6 per SM) feeds
+  its SMs without L2. The L40's 587 (4.1 per SM) cannot, so falling out of L2
+  costs it. At 131072 the L40 interpolator already moves 488 B / 1.45 ns =
+  **336 GB/s, 57% of copy**, the highest interp DRAM share measured (A4000 28%,
+  A100 16%). This replaces the earlier draft's "consistent with DRAM, an
+  inference": the knee position is measured, and the direction matches the
+  memory-per-SM story.
+- **Bench vs search at the same Nprof: 1.17x, not §4.15's 0.2–2.6%.** The
+  search's interp at 32768 reads 0.0397 against the bench's 0.0338. Two
+  candidates: in the search the interpolator shares the 96 MB of L2 with the
+  transpose, transform and boxcar buffers (the whole pipeline is ~134 MB at
+  32768), and the bench has L2 to itself; and §4.16's `f = 0.785` correction
+  assumed the timing-on inflation is spread evenly over phases. Neither is
+  separated. Treat the in-search figure as ±15%.
+- **So the L40's blocksize is a three-way compromise.** The interp is best at
+  131072, the transform (probe) at 65536, and the whole search at 32768. At
+  65536 the pipeline's ~268 MB overflows L2 and something costs 1.14x end to
+  end; the transpose and boxcar are the candidates. A phase table at 65536 on
+  `talanah` would name the phase. (`gpu_search_report.jl` only tables the best
+  blocksize today, so this needs a small option.) It is not needed for the
+  paper.
 - **So the Ada-generation workstation cards are shaped for this workload the
   wrong way round:** a big L2 and many fast SMs, fed by GDDR6 at 4–6 GB/s per
   SM. The two phases that need bandwidth get it from L2, which forces small
