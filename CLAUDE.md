@@ -419,8 +419,10 @@ GB/s per SM falls: 20% on the A100 (15.6), 65% on both Ada cards (4.1 and 6.0).
 Above ~8 GB/s per SM the boxcar tracks `SMs x clock`; on the Ada cards it is
 1.5–2.1x off that line. Their transpose and transform survive only by being
 L2-resident (112–259% of DRAM), which forces small chunks and under-fills the
-interpolator (2.7–3.1x off the line; the under-fill cause is not yet tested with
-`gpu_interp_bench.jl`). The L40 has 4.6x the A100's FP32 and the same speed.
+interpolator (2.7–3.1x off the line). `gpu_interp_bench.jl` on the L40 confirmed
+the under-fill (0.0255 ns/(harm,trial) at Nprof 65536 against 0.0397 in the
+search at 32768, 1.56x), but unlike the A100 it gets WORSE at 262144 (0.0337),
+at 54% of DRAM: the same memory-per-SM wall. `--nprof` was added to the bench. The L40 has 4.6x the A100's FP32 and the same speed.
 **Also: §4.16's first per-phase table under-counted device phases** by applying
 §4.12's pre-overlap share×clean method; it now uses instrumented seconds.
 **The 2026-09-15/16 runs of `paper_gpu_run.sh` step 4 used `nproc`

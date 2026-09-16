@@ -2,6 +2,12 @@
 # GPU against CPU, on the production plan tables and a real `.fft`.
 #
 #   julia --project=<env-with-CoherentSearch+CUDA> bench/gpu_interp_bench.jl [FILE.fft]
+#   ... bench/gpu_interp_bench.jl FILE.fft --nprof 8192,16384,32768,65536,131072,262144
+#
+# `--nprof` replaces the GPU arm's Nprof list (default 2048,65536,262144).  Use it
+# to measure at a card's actual search blocksize: the interpolator's cost per
+# (harmonic, trial) depends strongly on Nprof (under-fill), so a bench point at a
+# different Nprof does not describe the search (docs/gpu_design.md §4.16).
 #
 # Reports ns per (harmonic, trial) so the two are comparable across chunk sizes,
 # and the GPU at several `Nprof` because §3.2 expects the GPU chunk to be ~10^5
@@ -55,7 +61,13 @@ function load_or_synth(path)
                    real(amps[1]), imag(amps[1])), "synthetic (PM0063 geometry)"
 end
 
-fftfile = length(ARGS) >= 1 ? ARGS[1] : (isfile(REF_FFT) ? REF_FFT : nothing)
+args = copy(ARGS)
+GPU_NPROF = [2048, 65536, 262144]
+if (i = findfirst(==("--nprof"), args)) !== nothing
+    GPU_NPROF = parse.(Int, split(args[i+1], ","))
+    deleteat!(args, i:i+1)
+end
+fftfile = length(args) >= 1 ? args[1] : (isfile(REF_FFT) ? REF_FFT : nothing)
 ft, ftname = load_or_synth(fftfile)
 params = SearchParams(nharms = 60, m = 16, decimations = collect(1:6))
 r_lo = 0.1 * ft.T
@@ -110,7 +122,7 @@ for n in (2048, 65536)
     n == 2048 && (CPU_NS[] = ns)
     @printf("  CPU  -t 1  %7d  %8.3f    %8.4f\n", n, t * 1e3, ns)
 end
-for n in (2048, 65536, 262144)
+for n in GPU_NPROF
     t = gpu_fill_time(n)
     ns = t * 1e9 / (n * params.nharms)
     @printf("  GPU        %7d  %8.3f    %8.4f    %6.1fx one core\n",

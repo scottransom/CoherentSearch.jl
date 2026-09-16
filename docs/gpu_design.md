@@ -3440,9 +3440,46 @@ device copy; `zero` omitted, since it now writes only the gave-up columns):
   `ns x SMxclk`, at only 29–35% of DRAM, so it is not bandwidth-starved. The
   likely cause is **under-fill**: §4.15 measured the A100's interp 1.36x faster
   at 262144 than at 65536, and these two cards run at 32768 and 8192, where a
-  142-SM card cannot be filled. **Not yet tested.** `bench/gpu_interp_bench.jl` on
-  `talanah` across Nprof would settle it: it should show ns/(harm,trial) falling
-  well below today's value by 262144 if under-fill is the cause.
+  142-SM card cannot be filled. Tested on the L40 the same day (scored below).
+
+#### The L40's interpolator in isolation: under-fill confirmed, and no gain past 65536
+
+`bench/gpu_interp_bench.jl` on `talanah`, real NGC6624 amplitudes, ns per
+(harmonic, trial):
+
+| Nprof | 2048 | 32768 (the search) | 65536 | 262144 |
+|---|---|---|---|---|
+| L40, bench | 0.3091 | *not in the bench's list* | **0.0255** | 0.0337 |
+| L40, in search (2.38 ns/trial ÷ 60) | — | **0.0397** | — | — |
+| A100, bench (§4.15) | — | — | 0.0470 | **0.0346** |
+
+Throughput per `SMs x clock` (1 / (ns × SMxclk), §4.15's column; higher is
+better): **L40 0.111 at 65536**, against 0.103–0.147 for the other five cards at
+the same Nprof (§4.15 table).
+
+- **The prediction was "well below today's value by 262144", and it half
+  holds.** At 65536 the L40 reads 0.0255, **1.56x below** the in-search 0.0397
+  at 32768, so under-fill at the search blocksize is real and about that size.
+  (Assuming the bench tracks the search, as it did to 0.2–2.6% on the A4000 and
+  A100 in §4.15. There is no bench point at 32768; `--nprof` was added for this
+  and should be run at `8192,16384,32768,65536,131072,262144`.) At 262144,
+  though, it gets **1.32x worse** again, where the A100 gets 1.36x *better*. So
+  "keeps falling" is wrong.
+- **At fixed Nprof 65536 the L40 is on the §0.46 line** (0.111, among the 48-SM
+  and 20-SM cards), so its interpolator is not intrinsically slow. What sets it
+  apart is that it cannot use a bigger chunk. At 65536 the kernel moves
+  488 B / 1.53 ns = **319 GB/s, 54% of the card's copy speed**, the highest
+  interp DRAM share measured (A4000 28%, A100 16%). The upturn at 262144 is
+  consistent with running into that bandwidth, the same memory-per-SM limit as
+  the boxcar. That is an inference, not a measurement.
+- **So both of the L40's issue-bound phases hit the same wall**, and the chunk
+  size cannot help both at once. The search's 32768 is a compromise among
+  interp (best at 65536), transform (probe best 65536), and whatever made
+  65536 1.14x slower end to end. The transpose and boxcar are the candidates
+  there, since at 65536 the working set is ~268 MB against 96 MB of L2. A
+  phase table at 65536 on `talanah` would name the phase.
+  (`gpu_search_report.jl` only tables the best blocksize today, so this needs a
+  small option.) It is not needed for the paper.
 - **So the Ada-generation workstation cards are shaped for this workload the
   wrong way round:** a big L2 and many fast SMs, fed by GDDR6 at 4–6 GB/s per
   SM. The two phases that need bandwidth get it from L2, which forces small
