@@ -6,12 +6,68 @@ Section 1 is meant to be readable by someone who has never run a pulsar search;
 everything after it is for us.
 
 **Provenance.** `mc_analyze.py /data1/mc/run2 /data1/mc/run3 --fap 0.1` on
-fitzroy, 2026-09-14, against the **completed** run 3 (`report_v4_fap0.1.txt`).
+fitzroy, against the **completed** run 3, **re-run 2026-09-16 with run 4's
+patches merged** (`report_v4_fap0.1.txt`, analysis at `79e08e5`; the white
+band-matched cells of §4 and the cost lines of §8 come from a `--sections
+knee` / `--sections cost` re-run with the two fixes below).
 **160,976 realisations / 869,574 injections**: run 2 (white noise, 76,105) plus
 run 3 (red noise, 84,871), with **411,078 paired injections**. Band-matched
 numbers are the same data with `--match knee,band`
-(`report_v4_band_fap0.1.txt`). Analysis code `e0be51d`, i.e. with the three
-defects of §9 fixed.
+(`report_v4_band_fap0.1.txt`).
+
+**Run 4** (eiger, 2026-09-14 → 16) re-ran `accelsearch`, `rseek_A` (and
+`rseek_B` one in ten), the new `rseek_W`, and `coherent` on **22,368 of run 2's
+76,105 white realisations**, as patch records in run 2's directory. It gives the
+white side per-band false-alarm tails and runner-up hits. It regenerates
+run 2's noise from the index, so the re-run arms should reproduce run 2, and
+**no headline number below moved** (`rseek_B` white 71.3 → 71.4, on 99,720
+injections instead of 87,564). **It covered white noise only**, which limits
+what it closes (§5, §11).
+
+**Checked record by record** (2026-09-16, fitzroy; hits and the head of the
+false-alarm tail, per re-run arm, against run 2's record, with run 2's
+`accelsearch` repair patches applied):
+
+| arm | identical | differ |
+|---|---|---|
+| `rseek_A` | 22,368 | 0 |
+| `rseek_B` | 436 | 0 (1,777 ran only in run 4) |
+| `accelsearch` | 22,367 | 1 (tail) |
+| `coherent` | 22,362 | 6 (a candidate count ±1, a tail, one hit) |
+| `coherent_tier` | 22,354 | 14 (e.g. one S/N 7.12 → 7.11) |
+| **`accelsearch_red`** | **13,802** | **8,566** |
+
+- **Every search arm is reproducible across the two hosts except
+  `accelsearch_red`.** The handful of `coherent` differences are at the
+  last-digit level, consistent with host-specific FFTW plans.
+- **`accelsearch_red` differs on 38% of records**, in hits and in the tail,
+  and still on 31% when compared to 2 decimals. So this is not rounding. It is
+  **not the PRESTO build date**: fitzroy's PRESTO was rebuilt on 2026-09-10 for
+  the accelsearch repair, and repaired and unrepaired records differ at the
+  same rate. Plain `accelsearch` on the raw `.fft` is 100% reproducible, and so
+  is `coherent`, which reads the very same `_red.fft`. **Cause unidentified.**
+  The obvious hypothesis, untested: `rednoise`'s output differs between hosts
+  at the floating-point level, `coherent` (S/N to 2 decimals, fixed trial grid)
+  does not see it, and something in `accelsearch`'s candidate pipeline
+  amplifies it.
+  Its white detection fraction is unchanged (38.5 in both reports), so no
+  number here moves. But it is the one arm whose per-record output depends on
+  where it ran. The merge applies fitzroy's repair patch last, so the analysis
+  uses fitzroy's `accelsearch_red` wherever one exists and eiger's elsewhere.
+
+**Two analysis defects found on 2026-09-16, both with the same shape as §9's**
+(fixed in the commit that added this paragraph, pinned in `test_mc.py`):
+
+* **The white cell of the band-matched knee row was the per-knee number,
+  relabelled.** `sec_knee` builds a `CutBook` per knee bin, and a book holding
+  no red-noise records downgraded itself to pooled matching. Before run 4
+  the white bin had no band tails, so the cell printed blank. After run 4 it
+  printed the POOLED white fraction (76.3 for `coherent`) under the
+  band-matched heading. The real value is in §4.
+* **The per-host cost lines filed run 4's eiger timings under fitzroy**,
+  because a patch's timings were merged into its run-2 parent and attributed
+  to the parent's host. `rseek_W`, which ran only on eiger, printed on the
+  fitzroy line. §8 is from the fixed re-run.
 
 **Eiger was stopped on 2026-09-14 at 84,871 red realisations of a planned
 396,000, deliberately.** Going from 43,901 to 82,370 red realisations — a
@@ -55,8 +111,9 @@ spectrum. So when the noise wanders faster than that, riptide's candidate list
 fills with junk at slow periods, and one threshold for the whole list buries
 everything: its detection rate goes to **zero**. Give it its own threshold in
 each frequency band and it recovers to 71% (mild red noise) and 37% (severe) —
-against our 84% and 54% under the same treatment. **This is riptide running the
-way its authors intend, and the paper must say so.**
+against our 84% and 54% under the same treatment. (On clean data, under that
+same per-band treatment, it is 72% against our 84%.) **This is riptide running
+the way its authors intend, and the paper must say so.**
 
 **5. Red noise costs us little, and only at low frequencies.** The pulsar
 brightness we need for a 50% detection rises by a factor of 1.00, 1.00, 1.05,
@@ -154,13 +211,14 @@ Detection fraction, per knee / per (knee × f0 band):
 
 | | white | 0.1–0.5 | 0.5–2 | 2–6 | 6–15 | 15–50 |
 |---|---|---|---|---|---|---|
-| `coherent` | 76.3 | 76.2 / 84.2 | 75.2 / 82.7 | 69.8 / 77.6 | 61.3 / 68.7 | 47.9 / 54.5 |
-| `coh+tier` | 77.6 | 77.5 / 83.9 | 75.7 / 82.4 | 70.5 / 77.4 | 61.9 / 68.7 | 48.9 / 54.4 |
-| `rseek_A` | 50.2 | 50.2 / 71.5 | **0.0** / 65.6 | 0.0 / 55.0 | 0.0 / 50.8 | 0.0 / 36.8 |
-| `rseek_B` | 71.3 | 69.2 / 79.6 | **0.1** / 71.1 | 0.0 / 61.6 | 0.1 / 45.6 | 0.0 / 30.9 |
-| `accelsearch` | 41.6 | 41.3 / 57.7 | 39.6 / 55.2 | 36.4 / 50.9 | 31.9 / 44.6 | 26.3 / 35.3 |
-| `accelsearch_red` | 38.5 | 38.3 / 56.4 | 36.2 / 54.2 | 33.9 / 49.5 | 29.5 / 43.1 | 24.4 / 34.0 |
-| `coherent_tier` | 51.6 | 52.0 / 55.6 | 49.8 / 54.1 | 44.6 / 49.1 | 36.7 / 40.6 | 22.5 / 26.5 |
+| `coherent` | 76.3 / **84.2** | 76.2 / 84.2 | 75.2 / 82.7 | 69.8 / 77.6 | 61.3 / 68.7 | 47.9 / 54.5 |
+| `coh+tier` | 77.6 / 83.9 | 77.5 / 83.9 | 75.7 / 82.4 | 70.5 / 77.4 | 61.9 / 68.7 | 48.9 / 54.4 |
+| `rseek_A` | 50.2 / **72.5** | 50.2 / 71.5 | **0.0** / 65.6 | 0.0 / 55.0 | 0.0 / 50.8 | 0.0 / 36.8 |
+| `rseek_B` | 71.4 / **80.7** | 69.2 / 79.6 | **0.1** / 71.1 | 0.0 / 61.6 | 0.1 / 45.6 | 0.0 / 30.9 |
+| `accelsearch` | 41.6 / 57.9 | 41.3 / 57.7 | 39.6 / 55.2 | 36.4 / 50.9 | 31.9 / 44.6 | 26.3 / 35.3 |
+| `accelsearch_red` | 38.5 / 56.6 | 38.3 / 56.4 | 36.2 / 54.2 | 33.9 / 49.5 | 29.5 / 43.1 | 24.4 / 34.0 |
+| `coherent_tier` | 51.6 / 55.6 | 52.0 / 55.6 |
+| `rseek_W` | 49.0 / 71.3 | — | — | — | — | — | 49.8 / 54.1 | 44.6 / 49.1 | 36.7 / 40.6 | 22.5 / 26.5 |
 
 **Both columns belong in the paper.** Per knee is what a pipeline tuned to one
 observation applies, and it is where riptide goes to zero. Per (knee × band)
@@ -170,15 +228,69 @@ hides the operational cost of an uncalibrated statistic.
 
 **The two columns are not on the same scale and must never be read against each
 other.** The band-matched column allows `--fap` false alarms *in each of seven
-bands*, so up to 7x the pooled rate. It also has **no white zero point**: run 2
-stored no per-band false-alarm tails, so its band-matched row is blank by
-construction, not by measurement.
+bands*, so up to 7x the pooled rate.
+
+**The band-matched row now has a white zero point** (run 4; the white cell of
+the report printed before 2026-09-16 is wrong, see the provenance note). It
+agrees with the mildest knee to about a point for every code (`coherent` 84.2
+against 84.2, `rseek_A` 72.5 against 71.5, `rseek_B` 80.7 against 79.6), as a
+zero point should. Two things follow:
+
+- **Per-band matching narrows the white gap to riptide, but does not close
+  it.** Against `rseek_A` it goes from 26.1 points to **11.7**, and against the
+  deep `rseek_B` from 4.9 to **3.5**. Every code gains from the 7x looser rate,
+  and riptide's matched configuration gains most (+22.3 against our +7.9). The
+  per-band table below shows where. This is **not** its slow folds on white
+  noise: there its three slowest bands sit at its reporting floor, and its
+  highest per-band cuts are in the fast bands (7.1–7.3).
+- **Red-noise degradation can now be read along the band-matched row too.**
+  `coherent` 84.2 → 54.5 across the knees; `rseek_A` 72.5 → 36.8; `rseek_B`
+  80.7 → 30.9. riptide's deep configuration loses more than we do and falls
+  below us at every knee, and below its own matched configuration past 6 Hz.
 
 **The `accelsearch`/riptide ordering FLIPS with that choice** — per knee,
 `accelsearch` beats riptide at every knee ≥ 0.5 Hz; per band, riptide beats
 `accelsearch` below ~6 Hz knee (71.5 vs 57.7 at 0.1–0.5). Both statements are
 mostly about preprocessing, not about the FFA versus the harmonic sum. Ours is
 above both under either matching.
+
+### White noise, per frequency band: the zero point run 4 added
+
+Detection %, every cut matched inside its band at 0.1 false alarms per
+realisation. That allows up to 7x the pooled rate over the whole list, so these
+numbers are NOT comparable with the per-knee white column. The cuts come from
+the 22,368 run-4 realisations that store band tails, applied to all 76,105:
+
+| f0 band (Hz) | 0–1 | 1–5 | 5–20 | 20–100 | 100–200 | 200–400 | 400+ |
+|---|---|---|---|---|---|---|---|
+| injections | 72,963 | 100,681 | 84,505 | 49,893 | 7,814 | 82,748 | 12,474 |
+| `coherent` | 85.9 | **86.0** | **84.6** | **80.8** | **83.1** | **83.9** | 84.6 |
+| `rseek_B` | **87.0** | 84.5 | 82.8 | 75.2 | 69.1 | 77.4 | **86.2** |
+| `rseek_A` | 58.4 | 66.6 | 73.4 | 77.3 | 69.5 | 76.9 | 85.3 |
+| `rseek_W` | 56.3 | 65.8 | 72.5 | 76.6 | 67.4 | 75.6 | 83.6 |
+| `accelsearch` | 32.6 | 48.7 | 60.3 | 60.2 | 70.4 | 68.3 | 63.3 |
+| `prepfold_snr1` (ceiling) | 99.3 | 99.8 | 99.9 | 100.0 | — | 100.0 | 100.0 |
+
+(Bootstrap errors: ±0.1–0.4 for most cells; `rseek_B` ±0.3–1.4, since it ran on
+one realisation in ten; 100–200 Hz ±0.4–1.4.)
+
+- **This is the honest white-noise statement of where riptide stands, and it is
+  closer than the per-knee 76 vs 50 suggests.** Given its own cut in each
+  band, riptide's deep configuration **beats us below 1 Hz** (87.0 vs 85.9) and
+  **edges us above 400 Hz** (86.2 vs 84.6, about 1.7σ). The matched
+  configuration `rseek_A` is within a point of us above 400 Hz (85.3 vs 84.6).
+  We lead everywhere between, by up to **14 points at 100–200 Hz** against
+  `rseek_B` and by 27 points below 1 Hz against `rseek_A`.
+- **Per-band matching loosens every code's cut, and riptide gains more from
+  it.** `coherent` goes from 6.75 pooled to 5.75–6.56 per band (76.3 → 84.2
+  overall), and `rseek_A` from 7.55 to 6.1–7.3 (50.2 → 72.5). Below 20 Hz,
+  `rseek_A`'s 6.1s are its reporting floor: it made too few false alarms there
+  to set a cut, so its three slowest cells are upper bounds. That is §4's red-noise
+  argument, already present at a smaller scale without any red noise.
+- **Cost still has to sit next to this.** `rseek_B` is the configuration that
+  matches us per band, and it costs ~6–7x our runtime (§8).
+- **`prepfold` 100–200 Hz is still blank.** Run 4 re-used run 2's seeds, so it
+  regenerated the same too-thin null folds, as predicted.
 
 ### Where our margin comes from
 
@@ -205,17 +317,15 @@ detects**:
 
 | | white | 0.1–0.5 | 0.5–2 | 2–6 | 6–15 | 15–50 |
 |---|---|---|---|---|---|---|
-| `coherent` | — | 0.03 | 0.04 | 0.08 | 0.16 | 0.27 |
-| `accelsearch` | — | 0.29 | 0.35 | 0.40 | 0.50 | 0.66 |
-| `accelsearch_red` | — | 0.05 | 0.07 | 0.05 | 0.07 | 0.09 |
-| `rseek_A` | — | 0.31 | 2.44 | 4.34 | 7.22 | **16.01** |
-| `rseek_B` | — | 0.07 | 0.10 | 0.32 | 0.72 | 1.30 |
+| `coherent` | 0.02 | 0.03 | 0.04 | 0.08 | 0.16 | 0.27 |
+| `accelsearch` | 0.04 | 0.29 | 0.35 | 0.40 | 0.50 | 0.66 |
+| `accelsearch_red` | 0.05 | 0.05 | 0.07 | 0.05 | 0.07 | 0.09 |
+| `rseek_A` | 0.15 | 0.31 | 2.44 | 4.34 | 7.22 | **16.01** |
+| `rseek_B` | 0.07 | 0.07 | 0.10 | 0.32 | 0.72 | 1.30 |
+| `rseek_W` | 0.16 | — | — | — | — | — |
 
-(White is blank because this matching has no white cut at all — run 2 stored no
-per-band tails, so no detections are scored there. The white result is the
-closing paragraph of this section instead: above every code's matched cut the
-99th-percentile hit offset is 0.15–0.23 bins and the residual is 0.00% for every
-coherent arm.)
+(The white column is new with run 4, whose band tails give white a band-matched
+cut; before it, the column was blank. The red columns are unchanged.)
 
 **This is the one number that qualifies finding 4's rehabilitation of riptide.**
 Its band-matched 36.8% at the worst knee still carries ~16% chance coincidences;
@@ -228,6 +338,13 @@ real one, and rejecting it scores a miss the code may not have made. The
 `displaced` row bounds that, and for `rseek_A` it reaches **80% of detections**
 at the worst knee. Storing every hit rather than the best is the only thing that
 would close this, and it needs a re-run (§10).
+
+**Run 4 stores the runners-up, but only on white noise, so this caveat still
+stands for every red column.** On white the bound is small anyway: displaced
+0.8% of `rseek_A`'s detections and 0.1% of ours, band-matched, and run 4's
+records (29% of the white set) can now *rescue* a displaced real hit rather
+than only bound it. Closing the red side needs runners-up on run 3's indices,
+i.e. a red top-up with `--hits-per-inj`.
 
 **Run 2 is unaffected, so the white results stand**: above every code's matched
 cut the 99th-percentile hit offset is 0.15–0.23 bins, ≤ 0.07% lie beyond 0.5,
@@ -278,14 +395,24 @@ within ~1% at every knee (76.5 / 74.4 / 69.2 / 60.9 / 47.7 against
 **Per host, because run 2 ran on fitzroy and run 3 on eiger** — the pooled
 median mixes two machines and a ratio taken from it would be part hardware:
 
-| median s per realisation | `rseek_B` | `coherent_deep` | `rseek_A` | `coherent` | `prepfold` | `coherent_tier` | `accelsearch` |
-|---|---|---|---|---|---|---|---|
-| eiger (run 3) | 121.3 | — | 27.5 | **16.9** | 5.5 | 5.0 | 1.5 |
-| fitzroy (run 2) | 179.8 | 75.3 | 42.3 | **29.4** | 8.8 | 8.0 | 2.3 |
+| median s per realisation | `rseek_B` | `coherent_deep` | `rseek_W` | `rseek_A` | `coherent` | `prepfold` | `coherent_tier` | `accelsearch` |
+|---|---|---|---|---|---|---|---|---|
+| eiger (runs 3 + 4) | 121.8 | — | 29.7 | 27.8 | **17.0** | 5.5 | 5.0 | 1.5 |
+| fitzroy (run 2) | 179.8 | 75.3 | — | 42.2 | **29.4** | 8.8 | 8.0 | 2.3 |
+
+(From the 2026-09-16 re-run with the per-host fix. Each timing counts under
+the host that produced it. The eiger row now includes run 4's white patches:
+84,871 + 22,368 realisations, both at 15 workers. It moved by ≤0.5 s against
+run 3 alone: 121.3 / 27.5 / 16.9. The fitzroy row lost the 22,368 timings run 4
+overwrote for its arms and moved by 0.1 s.)
 
 Both hosts agree on the ratios that matter: we are **1.4–1.6x cheaper than
 `rseek_A`** and **11–13x more expensive than `accelsearch`**. That last number
-belongs next to `accelsearch`'s 41.6% against our 76.3%.
+belongs next to `accelsearch`'s 41.6% against our 76.3%. **`rseek_W` costs 7%
+more than `rseek_A`** on eiger (29.7 against 27.8 s, including the `realfft` →
+`rednoise` → `realfft -inv` round trip). And `rseek_B`, the configuration that
+comes within 3.5 points of us under per-band matching (§4), costs **7.2x** our
+runtime on eiger and 6.1x on fitzroy.
 
 ---
 
@@ -358,12 +485,19 @@ All three had the same shape: a number that looked measured and was not.
 
 * **No RFI.** riptide has no zapping stage, so FFT → zap → iFFT would be a step
   *we* impose on it. Revisit only if a referee asks.
-* **No whitened-rseek arm.** Per-band matching already makes its fast end a fair
-  comparison, and a one-off check showed whitening restores riptide exactly: 172
-  candidates on white, 917 on red, ~170 on the same red data whitened, with the
-  200 Hz pulsar back at 11.1 against 11.2 and its top false alarm back at 7.5
-  from 155.8. **Note this is n = 1**, and §5 is the reason it might be worth
-  more than that.
+* **A whitened-rseek arm exists on WHITE noise only.** Run 4 added `rseek_W`
+  (riptide on a PRESTO-whitened time series, its own running median off) on
+  22,368 white realisations. There it reads **49.0% against `rseek_A`'s 50.2%**
+  at the same 7.55 cut, and 1–2 points below `rseek_A` in every white band
+  (§4). (`rseek_A`'s figure is over all 76,105 white realisations and
+  `rseek_W`'s over run 4's 29% of them, so this is a comparison of samples, not
+  a paired one.) So the whitening round trip costs riptide about a point and changes
+  nothing else, which is the control the arm needed. **On red noise it is still
+  unmeasured**: the one-off check (172 candidates on white, 917 on red, ~170 on
+  the same red data whitened; the 200 Hz pulsar back at 11.1 against 11.2, its
+  top false alarm back at 7.5 from 155.8) remains **n = 1**. Per-band matching
+  already makes riptide's fast end a fair comparison, and §5 is the reason a
+  red `rseek_W` might still be worth running.
 * **`coherent_deep` is parked** — run 2 measured it at 70.6% against 71.0% for
   2.6x the cost.
 
@@ -373,19 +507,20 @@ All three had the same shape: a number that looked measured and was not.
 
 1. ~~Re-run the analysis on the completed run 3~~ — **done 2026-09-14**; every
    number above comes from `report_v4_*`. Signs and orderings did not move.
-2–4. **Run 4 — implemented 2026-09-14, waiting to be launched.** One pass over
-   run 2's white indices closes all three of the gaps that no re-analysis can:
-   the missing **per-band tails** on the white side (§4's absent zero point); the
-   **displaced-hit** bound of §5, now that `--hits-per-inj` records the
-   runners-up and the analysis takes the best candidate that is close enough;
-   and **`rseek_W`**, riptide on a PRESTO-whitened time series with its own
-   running median switched off, which turns §11's n = 1 check into a measurement.
-   Measured on eiger at 15 workers: **92.1 s a realisation** for
-   `rseek,rseekw,coherent`, and ~107 s with `accel` and `rseek_B` added so that
-   every cell of the band-matched white row is filled — **~12,100 a day, so ~24k
-   realisations (~145k injections) over two days.** Load costs 1.70x against the
-   54.3 s solo figure, and it is contention rather than throttling: the clock
-   *rises* 1572 → 1975 MHz under load. See `mc/README.md`.
+2. ~~Run 4~~ — **done 2026-09-16**, 22,368 white realisations (planned ~20–24k).
+   It closed **the white zero point** (§4's per-band white table, and the white
+   cell of the band-matched knee row) and gave `rseek_W` its white control
+   (§11). It did **not** close the red side of either of its other two goals,
+   because it ran on white indices only:
+3. **A red top-up, if either red gap matters for the paper:** run 3's indices
+   with `--arms rseek,rseekw` and `--hits-per-inj`. That would (a) replace §5's
+   red displaced-hit *bound* (up to 80% of `rseek_A`'s detections) with a
+   measurement, and (b) turn §11's n = 1 whitened-riptide check into one.
+   Both are statements about riptide, not about us, and per-band matching
+   already gives riptide a fair fast end. So this is optional.
+4. **`prepfold` at 100–200 Hz stays blank** unless realisations beyond run 2's
+   seeds (or a larger `--fap`) are run. That is a hole in the ceiling column,
+   not in any comparison.
 5. **Restrict `coherent_tier`'s curves to its own band in every figure.**
 6. **Decide the headline red-noise figure**: per knee, per band, or both panels
    side by side.

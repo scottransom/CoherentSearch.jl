@@ -169,6 +169,13 @@ def load(paths, with_profiles=False):
             continue
         base.setdefault("results", {}).update(pr.get("results", {}))
         base.setdefault("timing", {}).update(pr.get("timing", {}))
+        # The patched arms' timings come from the PATCH's host, not the parent's:
+        # run 4 re-ran four arms of run 2's (fitzroy) realisations on eiger, and
+        # attributing those to `base["host"]` put eiger timings -- all of
+        # `rseek_W`'s among them -- on the fitzroy cost line (2026-09-16).
+        if pr.get("host"):
+            base.setdefault("timing_host", {}).update(
+                {k: pr["host"] for k in pr.get("timing", {})})
     recs.sort(key=lambda r: r["index"])
     return recs
 
@@ -697,6 +704,21 @@ def sec_header(recs, rws, args, book=None):
           "  ".join(f"{m} {v}" for m, v in cov.items()))
 
 
+def timing_by_host(recs):
+    """`{host: {timing key: [seconds, ...]}}`, each timing under the host that
+    PRODUCED it -- a patched arm's under the patch's host, the rest under the
+    record's.  Counts are realisations contributing at least one timing."""
+    out, n = defaultdict(lambda: defaultdict(list)), defaultdict(set)
+    for r in recs:
+        th = r.get("timing_host") or {}
+        for k, v in (r.get("timing") or {}).items():
+            h = th.get(k, r.get("host"))
+            if h:
+                out[h][k].append(v)
+                n[h].add((r.get("run"), r.get("index")))
+    return out, {h: len(v) for h, v in n.items()}
+
+
 def sec_cost(recs, rws, thr, args):
     """Sensitivity and cost belong on one axis or either one can be gamed."""
     tk = defaultdict(list)
@@ -710,21 +732,15 @@ def sec_cost(recs, rws, thr, args):
     # Run 2 ran on fitzroy and run 3 on eiger, so the pooled median above is a
     # median over two MACHINES and its composition is just how far each run got.
     # Any ratio quoted from it would be part hardware.
-    hosts = sorted({r.get("host") for r in recs if r.get("host")})
+    byhost, nhost = timing_by_host(recs)
+    hosts = sorted(byhost)
     if len(hosts) > 1:
         print(f"  the run spans {', '.join(hosts)}, so that line mixes machines -- "
-              "per host:")
+              "per host (a patched arm's timing counts under the host that ran it):")
         for h in hosts:
-            th = defaultdict(list)
-            nh = 0
-            for r in recs:
-                if r.get("host") != h:
-                    continue
-                nh += 1
-                for k, v in r.get("timing", {}).items():
-                    th[k].append(v)
+            th = byhost[h]
             if th:
-                print(f"    {h} ({nh} realisations):  " +
+                print(f"    {h} ({nhost[h]} realisations):  " +
                       "  ".join(f"{k} {np.median(v):.1f}" for k, v in
                                 sorted(th.items(), key=lambda kv: -np.median(kv[1]))))
         print("    (a speed ratio has to come from ONE host; these columns are not "
@@ -1543,8 +1559,17 @@ class CutBook:
             raise SystemExit(f"--match {match}: choose from {MATCH}")
         self.recs, self.knee_by, self.default = recs, knee_by, default
         red = any(r.get("rednoise") for r in recs)
-        self.match = match if red else "pooled"
         self.labs = fa_band_labels(recs)
+        # White-only records: per-knee matching IS pooled matching (one bin), so
+        # `knee` falls back.  `knee,band` must NOT: it asks for a cut per f0
+        # band, which is a different thing from one pooled cut even on white
+        # noise.  The fallback used to apply to both, and when run 4 gave the
+        # white records per-band tails, `sec_knee` -- which builds one book per
+        # knee bin, so the white bin's book saw no red records -- printed the
+        # POOLED white detection fraction in the band-matched row, labelled as
+        # band-matched (2026-09-16).
+        self.match = match if (red or match == "knee,band") else "pooled"
+
         if self.match == "knee,band" and not self.labs:
             raise SystemExit("--match knee,band needs per-band false-alarm tails, "
                              "which these records do not carry")
@@ -2044,8 +2069,9 @@ def sec_knee(recs, args, rng):
         print("\n  (the band-matched row cuts at --fap IN EACH f0 band, so it allows up to\n"
               "   nbands x --fap over the whole candidate list.  It is the fairer statement\n"
               "   about a code whose noise is not stationary across its own output, and it\n"
-              "   is NOT comparable with the per-knee row above.  `white` is blank in it\n"
-              "   because run 2 stored no per-band tails.)")
+              "   is NOT comparable with the per-knee row above.  A blank `white` cell\n"
+              "   means those records stored no per-band tails -- run 2's did not; run 4's\n"
+              "   top-up added them for the arms it re-ran.)")
     print(f'\n{"realisations":>17} ' + " ".join(f"{len(s):>14d}" for _, s in groups))
     if warn:
         print("\n  the search's own sigma guard (analytic disagreeing with measured "

@@ -463,6 +463,30 @@ def test_match_modes():
         check("a white row is cut at the white bin, a red row at its knee bin",
               c.vec(wr).max() < c.vec(rr).min(),
               f"white {c.vec(wr)[:2]} vs red {c.vec(rr)[:2]}")
+    # White records WITH per-band tails, matched per band: the cut must be per
+    # band, not the pooled one.  Two bands with very different tails make the
+    # difference unmissable.  This is the run-4 regression: `sec_knee` builds a
+    # book per knee bin, and the white bin's book used to fall back to pooled.
+    def banded(i):
+        r = _rec(i, hits=hit)
+        f = r["results"]["coherent"]["false"]
+        f["bands"] = {"0-1": dict(top=[20.0 + 0.01 * i]), "1-5": dict(top=[6.1]),
+                      "5-20": dict(top=[6.0 + 0.01 * i]), "20-inf": dict(top=[])}
+        return r
+    wb = [banded(i) for i in range(40)]
+    bb = MA.CutBook(wb, "knee,band")
+    check("white records with band tails keep knee,band matching",
+          bb.match == "knee,band", bb.match)
+    c = bb.at(0.5).get("coherent")
+    if isinstance(c, MA.Cut):
+        lo = c.cuts.get(("white", "0-1"))
+        mid = c.cuts.get(("white", "5-20"))
+        check("and cut each band on its own tail, not one pooled value",
+              lo is not None and mid is not None and lo > 15.0 and mid < 7.0,
+              f"0-1: {lo}  5-20: {mid}")
+    else:
+        check("and cut each band on its own tail, not one pooled value", False,
+              f"got a plain {type(c).__name__}: {c}")
     check("knee_label puts a realisation in its bin, and white without red noise",
           MA.knee_label(dict(fknee=None)) == "white"
           and MA.knee_label(dict(fknee=0.3)) == "0.1-0.5"
@@ -591,6 +615,35 @@ def test_run4_arms_and_hits():
                                        MA.SNR1_LIKE)))
 
 
+def test_patch_timing_host():
+    """A patched arm's timing belongs to the host that ran the patch.
+
+    Run 4 re-ran four arms of run 2's fitzroy realisations on eiger, and the
+    cost section filed those timings -- all of `rseek_W`'s among them -- under
+    fitzroy, because it read the host off the parent record.
+    """
+    import json, tempfile
+    import mc_analyze as MA
+
+    with tempfile.TemporaryDirectory() as d:
+        base = dict(index=7, host="fitzroy", empty=False, injections=[],
+                    results={"coherent": {"ok": True}},
+                    timing={"coherent": 30.0, "generate": 7.0})
+        patch = dict(index=7, host="eiger", patch=True,
+                     results={"coherent": {"ok": True}, "rseek_W": {"ok": True}},
+                     timing={"coherent": 17.0, "rseek_W": 29.0})
+        with open(os.path.join(d, "a.jsonl"), "w") as fh:
+            fh.write(json.dumps(patch) + "\n" + json.dumps(base) + "\n")
+        recs = MA.load([d])
+    by, n = MA.timing_by_host(recs)
+    check("a patched arm's timing is filed under the patch's host",
+          by["eiger"].get("coherent") == [17.0] and by["eiger"].get("rseek_W") == [29.0],
+          str({h: dict(v) for h, v in by.items()}))
+    check("and the parent keeps only the timings it produced",
+          dict(by["fitzroy"]) == {"generate": [7.0]}, str(dict(by["fitzroy"])))
+    check("both hosts count the realisation", n == {"eiger": 1, "fitzroy": 1}, str(n))
+
+
 def test_rednoise():
     """The red-noise generator: the spectrum it claims, and the pairing it promises."""
     import mc_simulate as MS
@@ -696,6 +749,7 @@ if __name__ == "__main__":
     test_match_modes()
     test_missing_cut()
     test_run4_arms_and_hits()
+    test_patch_timing_host()
     test_silent_failures()
     test_rednoise()
     print()
