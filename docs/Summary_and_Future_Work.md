@@ -776,7 +776,7 @@ against an unstated assumption of multi-threaded deployment.
 #### Larger machines, and the current 20-core curve (2026-08-24 → 2026-09-16)
 
 The table above is historical. The 20-core curve after the AVX-512 scatter fix
-and the `:f32` default (2026-08-24, `docs/thread_scaling.csv`) is 11.58 s at
+and the `:f32` default (2026-08-24, `docs/thread_scaling_fitzroy.csv`) is 11.58 s at
 `-t 1` → 1.29 s at `-t 20`, **9.00x, Amdahl `s = 0.065`**. The same script on
 four more hosts (warm in-process, median per point; `bench/thread_scaling.jl`
 defaults, threshold 6.3; raw data in `docs/thread_scaling_<host>.csv`, plots

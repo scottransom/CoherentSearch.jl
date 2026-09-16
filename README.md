@@ -642,41 +642,45 @@ the obvious-looking choice — has us search 6× riptide's band and reports us a
 The threading axis is ours alone rather than a like-for-like win: riptide's C
 extension is built without OpenMP, so `rseek` cannot use more cores. Measured
 with `bench/thread_scaling.jl`, which times only the *warm in-process* search so
-that the fixed start-up cost does not contaminate the fit. On the 20-core
-workstation (2026-08-24):
+that the fixed start-up cost does not contaminate the fit. On 48 cores
+(`bla0`, 2× AMD EPYC 7413, 2026-09-15), searching
+`NGC6624_16L_DM87.40_red.fft` over 0.1–33.3 Hz (105.5M trial fundamentals):
 
-![Thread scaling on a 20-core Xeon Silver 4114](docs/thread_scaling.png)
+![Thread scaling on 48 cores, 2x AMD EPYC 7413](docs/thread_scaling_bla0.png)
 
-| threads | 1 | 2 | 4 | 8 | 16 | 20 |
-|---|---|---|---|---|---|---|
-| wall (s) | 11.58 | 6.51 | 3.44 | 1.93 | 1.42 | 1.29 |
-| speedup | 1.00× | 1.78× | 3.37× | 6.00× | 8.15× | **9.00×** |
+| threads | 1 | 2 | 4 | 8 | 16 | 32 | 48 |
+|---|---|---|---|---|---|---|---|
+| wall (s) | 77.73 | 40.12 | 21.65 | 10.98 | 5.31 | 3.15 | 2.90 |
+| speedup | 1.00× | 1.94× | 3.59× | 7.08× | 14.6× | 24.6× | **26.8×** |
 
-The Amdahl fit gives a serial fraction of 0.065 (ceiling 15.5×). The right-hand
-panel is the part worth reading: CPU-seconds for *identical* work inflate 62%
-across the sweep, which is memory-stall and clock-throttle time, not a code
-defect — and on a dual-socket box past 16 threads the marginal core is also
-paying for cross-socket traffic.
+The Amdahl fit gives a serial fraction of 0.017 (ceiling 58.6×), and efficiency
+stays at 88–97% through 16 threads. Past that the curve bends: 32 → 48
+threads adds only 9%, and the right-hand panel shows why. CPU-seconds for
+*identical* work rise at most 9% up to 16 threads, then inflate to +43% at 48.
+That is memory-stall time on a dual-socket box, not a code defect.
 
-On larger machines (2026-09-15/16), speedup at each thread count:
+The same measurement on other machines (2026-08-24 for fitzroy, 2026-09-15/16
+for the rest), speedup at each thread count:
 
 | host | physical cores | work | `-t 1` | 2 | 4 | 8 | 16 | 32 | 48 | best |
 |---|---|---|---|---|---|---|---|---|---|---|
 | `bla0`, 2× EPYC 7413 | 48 | NGC6624 | 77.7 s | 1.94× | 3.59× | 7.08× | 14.6× | 24.6× | **26.8×** | 26.8× @ 48 |
 | OzSTAR `dave41` | 32 (allocated) | NGC6624 | 75.9 s | 1.96× | 3.58× | 6.40× | 14.4× | **24.6×** | 21.6× | 24.6× @ 32 |
 | `talanah`, 2× Xeon Silver 4514Y | 32 | NGC6624 | 74.3 s | 1.98× | 3.51× | 7.18× | 11.2× | **16.3×** | 14.2× | 16.3× @ 32 |
+| `fitzroy`, 2× Xeon Silver 4114 | 20 | PM0063 | 11.58 s | 1.78× | 3.37× | 6.01× | 8.13× | — | — | 9.00× @ 20 |
 | `eiger`, Xeon w5-3433 | 16 | PM0063 | 5.49 s | 1.95× | 3.80× | 6.53× | **10.1×** | 4.70× | 5.03× | 10.1× @ 16 |
 
-"NGC6624" is `NGC6624_16L_DM87.40_red.fft` over 0.1–33.3 Hz (105.5M trial
-fundamentals, 42 candidates); "PM0063" is the configuration of the 20-core
-table above (3 candidates), where `eiger` is 2.1× faster single-threaded. Fit to
-the points up to the physical core count, Amdahl's serial fraction is 0.017 on
-`bla0` and 0.020 on `dave41`, against 0.065 on the 20-core Xeon. **Threads
-beyond the physical cores lost on all three hosts where that was measured**, and
-on `eiger` badly (CPU-seconds
+"NGC6624" is the configuration above (42 candidates at every thread count);
+"PM0063" is `PM0063_034C1_DM445.0_red.fft` at the riptide bench configuration
+(3 candidates). Fit to the points up to the physical core count, Amdahl's
+serial fraction is 0.017 on `bla0` and 0.020 on `dave41`, against 0.065 on
+fitzroy (whose CPU-seconds inflate 62% by 20 threads). So the ceiling is the
+machine's memory system, not the code. **Threads beyond the physical cores lost
+on all three hosts where that was measured**, and on `eiger` badly (CPU-seconds
 4.4× those at 16 threads), so use `-t` equal to the physical core count, not
-`-t auto`, which counts hyperthreads. `talanah` is the weakest of the four
-past 8 threads, with CPU-seconds up 69% at 32 threads.
+`-t auto`, which counts hyperthreads. `talanah` is the weakest of the NGC6624
+hosts past 8 threads, with CPU-seconds up 69% at 32 threads. The raw data are
+`docs/thread_scaling_<host>.csv`.
 
 Production searches are often run as one single-threaded process per DM, in
 which case the `-t 1` CPU-seconds column governs throughput rather than these

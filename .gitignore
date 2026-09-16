@@ -49,7 +49,7 @@ oracle.json
 *.cohout
 *_ACCEL_*
 # Per-run search output: candidate profile plots and the --metricstats tables.
-# (docs/thread_scaling.png is tracked, so there is deliberately no bare *.png.)
+# (docs/thread_scaling_bla0.png is tracked, so there is deliberately no bare *.png.)
 *_profiles_*.png
 *_metricstats.txt
 *_metricfap.txt

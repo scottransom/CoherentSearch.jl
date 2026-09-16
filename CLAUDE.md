@@ -623,9 +623,11 @@ re-deriving them.
   — the AVX-512 scatter fix plus `:f32` becoming the default. Scaling is
   unchanged (`s` 0.063 → 0.0646 against a serial baseline that is twice as fast),
   which is the good outcome: the win was to the parallel part as well as the
-  serial one. CPU-seconds still inflate 62% across the sweep. The plot lives at
-  `docs/thread_scaling.png` and is embedded in the README; regenerate both
-  together, since `bench/thread_scaling.png` is gitignored.
+  serial one. CPU-seconds still inflate 62% across the sweep. The data are in
+  `docs/thread_scaling_fitzroy.csv` (the fitzroy plot is no longer tracked).
+  **The README's figure is now `docs/thread_scaling_bla0.png`** (48 cores,
+  26.8x), with its numbers from `docs/thread_scaling_bla0.csv`; regenerate the
+  two together, since `bench/thread_scaling.png` is gitignored.
 
   **The laptop pass is worth 1.40x at `-t 1` here** (better than the ~1.24x it
   measured on the laptop) **and 1.26x at `-t 20`** — the win shrinks with thread
