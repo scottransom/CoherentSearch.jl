@@ -3401,14 +3401,19 @@ Device-only shares:
   Its ns/trial is usable. Do not quote its F.
 - **`eiger`'s CPU number is not usable.** Step 4 ran `-t 32` = all hardware
   threads on a 16-core w5-3433 and read 55.4 s (131 ns/trial), and
-  `eiger_16core_thread_scaling.csv`, taken 12 minutes later, shows the same
+  `docs/thread_scaling_eiger.csv`, taken 12 minutes later, shows the same
   collapse: 32 threads is **2.16x slower than 16** there, with 4.4x the
   CPU-seconds. (Given the load above, that run may be contaminated too. It needs
-  repeating on a quiet `eiger` before it is quoted as a property of the CPU.) The script uses `nproc`, which
-  counts hyperthreads. `talanah` is milder (its 64-thread point is 1.28x behind
-  its 32-thread best on the thread-scaling run), so the L40's 4.66x
-  over-states the card against a well-configured host by about that much.
-  **`paper_gpu_run.sh` step 4 should use the physical core count.**
+  repeating on a quiet `eiger` before it is quoted as a property of the CPU.)
+  The script used `nproc`, which counts hyperthreads. `talanah` is milder (its
+  64-thread point is 1.28x behind its 32-thread best on the thread-scaling run),
+  so the L40's 4.66x over-states the card against a well-configured host by
+  about that much. **Fixed after these runs:** step 4 (and step 2's CPU arm) now
+  use the physical cores in the process's cpuset, from `lscpu`, with
+  `CPU_THREADS=N` as an override. The same `nproc` also honoured
+  `OMP_NUM_THREADS=1` and **silently skipped the `-t 1` row** on fitzroy, eiger
+  and rocinante, which is why only `bla0` and `talanah` have one. `eiger` (and
+  probably `talanah`) will be re-run.
 - **Two sweeps are capped by the memory gate again**, not by the card: the 1080
   (524288 needs 3.31 GiB against 3.41 free after the desktop's share) and the A400
   (262144 "needs 2.3 GiB but only 2.45 GiB is free" — the 0.90 margin, the same

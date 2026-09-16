@@ -415,9 +415,12 @@ re-run.
 **§4.12's "near-linear across SM count" does NOT survive the L40**: 2.3x the
 A100's `SMs x clock`, the same device ns/trial. The bandwidth-per-SM hypothesis
 is unmeasured; `bench/gpu_probe.jl` on `talanah`/`eiger` would test it.
-**`paper_gpu_run.sh` step 4 uses `nproc` (hyperthreads)**. `eiger`'s thread
-scaling puts that ~2x slow there, so its CPU row is unusable, and `talanah`'s is
-~1.3x pessimistic.
+**The 2026-09-15/16 runs of `paper_gpu_run.sh` step 4 used `nproc`
+(hyperthreads)**. `eiger`'s thread scaling puts that ~2x slow there, so its CPU
+row is unusable, and `talanah`'s is ~1.3x pessimistic. **Fixed afterwards**: the
+script now uses the physical cores in its cpuset (`CPU_THREADS=N` overrides).
+The same `nproc` gate had honoured `OMP_NUM_THREADS=1` and silently skipped the
+`-t 1` row on fitzroy, eiger and rocinante. Re-runs pending.
 **Two headline verdicts have been retired by the A100 (§4.12) — do not quote
 them:** (a) *"above ~48 SMs the workload does not care what you buy"* was three
 cards that all had 48 SMs; at fixed SM count that still holds (the three 48-SM
@@ -626,8 +629,9 @@ re-deriving them.
     (w5-3433) 10.1x at 16. The first three ran NGC6624 at 0.1–33.3 Hz and
     `eiger` ran PM0063. **So fitzroy's `s = 0.065` is the machine, not the
     code.** Every host that went past its physical cores got SLOWER (`eiger`
-    10.1x → 4.7x at 32 threads), so `-t auto` is wrong on SMT boxes. The raw
-    CSVs/PNGs are in Scott's working tree, uncommitted.
+    10.1x → 4.7x at 32 threads), so `-t auto` is wrong on SMT boxes. The CSVs
+    are tracked as `docs/thread_scaling_<host>.csv`; the plots are deliberately
+    NOT tracked (regenerate them).
 - **Done (2026-07):** quickselect median in `_profile_snr` (was 41% of runtime →
   7.5%) and a type-stable `Workspace{S,B,D}` (killed hot-loop dynamic `mul!`
   dispatch) — together ~1.6× warm single-thread, results unchanged. See §2 of

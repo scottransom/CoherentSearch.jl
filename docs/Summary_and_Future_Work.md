@@ -779,7 +779,8 @@ The table above is historical. The 20-core curve after the AVX-512 scatter fix
 and the `:f32` default (2026-08-24, `docs/thread_scaling.csv`) is 11.58 s at
 `-t 1` → 1.29 s at `-t 20`, **9.00x, Amdahl `s = 0.065`**. The same script on
 four more hosts (warm in-process, median per point; `bench/thread_scaling.jl`
-defaults, threshold 6.3):
+defaults, threshold 6.3; raw data in `docs/thread_scaling_<host>.csv`, plots
+not tracked — regenerate them):
 
 | host | CPU | physical cores | file | `-t 1` | best | `s` (fit to ≤ physical) | CPU-s inflation at the physical count |
 |---|---|---|---|---|---|---|---|
@@ -801,8 +802,9 @@ candidates).
   measured it got slower: `dave41` 24.6x → 21.6x at 48, `talanah` 16.3x →
   14.2x → 12.7x at 48/64, `eiger` 10.1x → 4.7x at 32. So `-t auto` (logical
   CPUs) is the wrong production setting on SMT machines, and
-  `bench/paper_gpu_run.sh`'s CPU step, which uses `nproc`, under-states the CPU on
-  `eiger` and `talanah` (`docs/gpu_design.md` §4.16).
+  `bench/paper_gpu_run.sh`'s CPU step, which used `nproc` in the 2026-09-15/16
+  runs, under-states the CPU on `eiger` and `talanah` (`docs/gpu_design.md`
+  §4.16). The script now uses physical cores.
 - `eiger`'s collapse at 32 threads (CPU-seconds 4.4x) was measured minutes after a
   GPU report that saw load 5.4 on the same box. Repeat it quietly before quoting
   the size of the effect. The direction matches the other hosts.

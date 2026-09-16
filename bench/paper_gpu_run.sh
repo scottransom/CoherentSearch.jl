@@ -31,7 +31,8 @@
 #      half of the renormalisation that is new and untested.
 #   3. The search report in --paper mode: pinned wide band (0.1-133.3333 Hz),
 #      blocksize sweep, per-phase breakdown, and the fixed-cost fit.
-#   4. This host's own CPU on the same band, at 1 thread and at all threads.
+#   4. This host's own CPU on the same band, at 1 thread and at all PHYSICAL
+#      cores (hyperthreads make this search slower; see physical_cores below).
 #
 # Steps 1-3 run single-threaded (-t 1): every card in docs/gpu_design.md was
 # measured that way, `scan` is host-CPU work, and letting it vary with the
@@ -46,6 +47,28 @@ cd "$REPO" || exit 1
 [ -r "$FFT" ] || { echo "cannot read $FFT" >&2; exit 1; }
 
 JL="julia --project=$PROJ"
+
+# Physical cores this process may run on: the cpuset (batch allocations) mapped
+# through lscpu's CPU -> (socket, core) table.  NOT `nproc`, for two reasons
+# both measured on 2026-09-15/16: it counts hyperthreads, and past the physical
+# core count this search gets SLOWER (eiger, 16 cores: -t 32 was ~2x slower
+# than -t 16, so its step-4 row was unusable); and it honours OMP_NUM_THREADS,
+# which is 1 on several hosts and silently skipped the -t 1 run below.
+# Override with CPU_THREADS=N.
+physical_cores() {
+  local allowed
+  allowed=$(awk '/^Cpus_allowed_list/{print $2}' /proc/self/status 2>/dev/null)
+  lscpu -p=CPU,Core,Socket 2>/dev/null | awk -F, -v list="$allowed" '
+    BEGIN { n = split(list, r, ",")
+            for (i = 1; i <= n; i++) { m = split(r[i], ab, "-")
+              for (c = ab[1]; c <= (m > 1 ? ab[2] : ab[1]); c++) ok[c] = 1 } }
+    /^#/ { next }
+    (list == "" || ($1 in ok)) { seen[$3 "," $2] = 1 }
+    END { for (k in seen) np++; print np + 0 }'
+}
+NPHYS=${CPU_THREADS:-$(physical_cores)}
+[ "${NPHYS:-0}" -ge 1 ] 2>/dev/null ||
+  NPHYS=$(env -u OMP_NUM_THREADS -u OMP_THREAD_LIMIT nproc)
 CARD=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 |
        tr -c 'A-Za-z0-9' '_' | sed 's/__*/_/g; s/^_//; s/_$//')
 OUT="$REPO/paper_$(hostname -s)_${CARD:-nogpu}_$(date +%Y%m%d).txt"
@@ -68,7 +91,7 @@ echo    "uptime   :$(uptime)"
 echo    "cpu      : $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')"
 # `nproc` honours OMP_NUM_THREADS, which batch systems often set to 1 -- on
 # gina4 it printed "1" for a 64-core allocation.  Unset it to see the cpuset.
-echo    "cores    : node $(nproc --all), allocated $(env -u OMP_NUM_THREADS -u OMP_THREAD_LIMIT nproc), OMP_NUM_THREADS=${OMP_NUM_THREADS:-unset}"
+echo    "cores    : node $(nproc --all), allocated $(env -u OMP_NUM_THREADS -u OMP_THREAD_LIMIT nproc), physical $NPHYS (CPU runs use -t $NPHYS), OMP_NUM_THREADS=${OMP_NUM_THREADS:-unset}"
 echo    "repo     : $REPO"
 echo    "git      : $(git rev-parse --short HEAD)  $(git log -1 --format=%s)"
 echo    "dirty    : $(git status --porcelain | wc -l) modified path(s)"
@@ -102,10 +125,10 @@ run_pair() {   # $1=label $2=lofreq $3=hifreq
   echo "  -- $1 band: $2 - $3 Hz"
   for ARM in cpu gpu; do
     [ "$ARM" = gpu ] && FLAG=--gpu || FLAG=
-    # -t auto on the CPU arm only: the search is chunk-invariant, so the
-    # candidate file does not depend on the thread count, and this is the slow
-    # side of the pair.
-    $JL -t auto bin/coherent_search.jl $FLAG --threshold 6.0 \
+    # All physical cores on the CPU arm only: the search is chunk-invariant, so
+    # the candidate file does not depend on the thread count, and this is the
+    # slow side of the pair.
+    $JL -t "$NPHYS" bin/coherent_search.jl $FLAG --threshold 6.0 \
         --lofreq "$2" --hifreq "$3" -o "$TMP/$1.$ARM.txt" "$FFT" \
         > "$TMP/$1.$ARM.log" 2>&1 || echo "     ($ARM run FAILED; see log)"
   done
@@ -138,8 +161,9 @@ if [ "$SKIP_CPU" = 1 ]; then
   echo "# skipped (SKIP_CPU=1)"
 else
 echo "# Same file and same band as step 3, so the GPU speedup can be quoted"
-echo "# against THIS host rather than against fitzroy's Xeon."
-$JL -t auto -e '
+echo "# against THIS host rather than against fitzroy's Xeon.  Threads = PHYSICAL"
+echo "# cores ($NPHYS); set CPU_THREADS=N to override."
+$JL -t "$NPHYS" -e '
     using CoherentSearch, Printf
     const CS = CoherentSearch
     ft = FFTFile(ARGS[1])
@@ -153,7 +177,7 @@ $JL -t auto -e '
     @printf("  CPU -t %-3d  %8.3f s   %6.1f ns/trial   (%d trials)\n",
             Threads.nthreads(), t, t * 1e9 / ntr, ntr)' "$FFT" 2>&1
 
-if [ "$(nproc)" -gt 1 ]; then
+if [ "$NPHYS" -gt 1 ]; then
 $JL -t 1 -e '
     using CoherentSearch, Printf
     ft = FFTFile(ARGS[1])
