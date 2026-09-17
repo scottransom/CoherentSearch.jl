@@ -98,18 +98,45 @@ a rotation are the hardest case, and there the other two codes almost vanish: at
 a duty cycle of 0.5–1% we find 56%, `rseek_A` 5%, `accelsearch` 2%. For fat
 pulses (a sixth of a rotation or more) the gap narrows but does not close.
 
-**SMR was right to flag this: those numbers are `rseek_A` only, and `rseek_B` is
-what riptide's authors would point at a narrow pulse.** `rseek_B` folds six times
-deeper for ~6x our runtime, and a deeper fold is exactly what a narrow pulse
-needs. There is no `rseek_B` entry in that table because the per-duty detection
-table covers only the arms that ran on every realization and `rseek_B` ran on one
-in ten. The statistic that does exist for it is the logistic fit of injected S/N
-at 50% detection, and below 1% duty that reads **8.96 for `rseek_B` against our
-8.25** — about 0.7 in S/N, not a factor of ten in detection fraction.
-**So the paper must never quote 56 against 5 without naming `rseek_A` and saying
-what it is matched to.** A `rseek_B` per-duty row is obtainable — `mc_analyze.py
---no-common` includes the subset arms — but it is a 36-minute, 13 GB pass over
-the records on fitzroy, so it has not been run.
+**SMR was right to flag this: those numbers are `rseek_A` only, and at the
+narrowest duty cycles `rseek_B` beats us.** `rseek_B` folds six times deeper for
+~6x our runtime, and a deeper fold is exactly what a narrow pulse needs. It is
+absent from §1's table because the report's per-duty table covers only the arms
+that ran on every realization, and `rseek_B` ran on one in ten — **but the
+measurement exists already**, in the quick-look page. `mc_quicklook.py`'s `frac`
+counts each arm over only the injections it saw, which is exactly what
+`mc_analyze.py --no-common` would do, so no re-run is needed to answer this.
+
+Detection %, `ql_v4.png` panel "detection vs duty cycle" (all 160,976
+realizations, cut matched per knee cell). Values for the five arms that appear in
+both the plot and the report's table agree to ~1 point, which is what calibrates
+the two read off the plot:
+
+| FWHM duty | `coherent` | `rseek_B` | `rseek_A` | `accelsearch` | `coh+tier` | `prepfold_snr1` |
+|---|---|---|---|---|---|---|
+| 0.002–0.005 | 37.1 | **≈41** (plot) | 1.5 | 0.4 | 56.3 | 64.2 |
+| 0.005–0.01 | **56.4** | ≈50 (plot) | 5.4 | 1.8 | 63.9 | 74.3 |
+
+So the crossover sits inside "narrow": below 0.5% duty `rseek_B` is ahead of our
+default arm, and between 0.5% and 1% we are ahead of it. The logistic fit says
+the same thing more compactly — injected S/N at 50% detection below 1% duty is
+**8.96 for `rseek_B` against our 8.25**, about 0.7 in S/N rather than a factor of
+ten in detection fraction.
+
+**Two things the paper must do with this.** Never quote 56 against 5 without
+naming `rseek_A` and what it is matched to. And note that the table above is
+pooled over white *and* red realizations, which is the arrangement least
+flattering to `rseek_B`: per-knee matching is where riptide's uncalibrated tail
+hurts it most (§4), so its **white-only** narrow-duty figures are better than
+these. Exact white-only per-duty numbers have not been produced; that needs a
+`--no-common` report pass or a white-restricted quick-look, ~36 minutes and 13 GB
+on fitzroy.
+
+**`coherent_tier` is the honest answer to a narrow-pulse search, and it wins the
+narrowest bin outright** (61.6% at duty < 0.5%, against `rseek_B`'s ≈41 and our
+default arm's 37.1). It is the deep, slow-band configuration — 120 harmonics
+below 5 Hz — so the fair sentence is that a narrow pulse wants a deep fold, and
+both codes have one; ours costs 5.0 s per realization against `rseek_B`'s 121.8.
 
 **3. Most of our sensitivity benefit comes from a better-behaved noise
 tail, not from a better filter.** Our statistic's threshold can sit lower,
