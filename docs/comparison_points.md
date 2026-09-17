@@ -98,10 +98,13 @@ configurations matters everywhere below — see item 2.
 **2. Narrow pulses need a deep fold, and at equal depth we find more of them —
 but fast folding is not beaten here, it is out-priced.** A pulse covering less
 than 1% of a rotation is the hardest case for any search, and it is where fast
-folding earned its reputation: it folds the time series directly and keeps the
-pulse shape, where an FFT search that adds harmonic powers throws that shape
-away. Nothing here overturns that, and the comparison only means something once
-the fold depths are named.
+folding earned its reputation (cite cbc+17, mbs+20): it folds the time series
+directly and keeps the pulse shape, where a standard FFT search sums a fixed and
+limited number of harmonic *powers* — typically 16 or 32 — and so both discards
+the pulse shape and leaves some of the signal's power unused (cbc+17). `mbs+20`
+shows analytically that fast folding is the more sensitive of the two at every
+period and duty cycle. Nothing here overturns either result, and our comparison
+only means something once the fold depths are named.
 
 Run riptide in the configuration matched to our frequency coverage and search
 cost (`rseek_A`) and we find far more of these pulsars: 56% against 5% at duty
