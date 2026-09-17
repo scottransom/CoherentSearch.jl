@@ -95,9 +95,8 @@ frequency coverage and 71% in its deepest one, which costs about seven times our
 runtime, and PRESTO's `accelsearch` recovers 42%. Naming riptide's two
 configurations matters everywhere below — see item 2.
 
-**2. Narrow pulses need a deep fold, and at equal depth we find more of them —
-but fast folding is not beaten here, it is out-priced.** A pulse covering less
-than 1% of a rotation is the hardest case for any search, and it is where fast
+**2. Narrow pulses need a deep fold, and a Fourier-domain search can afford a
+deeper one.** A pulse covering less than 1% of a rotation is the hardest case for any search, and it is where fast
 folding earned its reputation (cite cbc+17, mbs+20): it folds the time series
 directly and keeps the pulse shape, where a standard FFT search sums a fixed and
 limited number of harmonic *powers* — typically 16 or 32 — and so both discards
@@ -114,12 +113,14 @@ the fold depth) and it beats our default setting at the very narrowest, 41%
 against 37%. Between 0.5% and 1% we are ahead again, 56% against 50%. For fat
 pulses (a sixth of a rotation or more) our margin narrows but does not close.
 
-**So the honest claim is about what a given amount of computing buys.** We have
-a deep configuration too: `coherent_tier` folds 120 harmonics below 5 Hz, finds
-62% of the narrowest pulses — more than either riptide setting — and costs 5.0
-seconds per simulated observation against `rseek_B`'s 121.8. That is the
-sentence for the paper. "We are better at narrow pulses" on its own invites the
-reader to think we have not understood why people adopted the FFA.
+**The claim worth making is about what a given amount of computing buys.** Depth
+is cheap for us: `coherent_tier` folds 120 harmonics below 5 Hz, finds 62% of the
+narrowest pulses — more than either riptide configuration — and costs 5.0 seconds
+per simulated observation against `rseek_B`'s 121.8. So the Fourier domain
+reaches the depth a narrow pulse needs at a cost that lets a survey actually use
+it. That is the paper's point, and it is a statement about the *domain*, not
+about riptide: "we are better at narrow pulses" on its own would invite the
+reader to think we had not understood why people adopted the FFA.
 
 **Where the `rseek_B` numbers come from.** It is absent from the report's
 per-duty table because that table covers only the arms that ran on every
