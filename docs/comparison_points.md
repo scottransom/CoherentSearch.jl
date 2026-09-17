@@ -46,12 +46,11 @@ false-alarm tail, per re-run arm, against run 2's record, with run 2's
   the accelsearch repair, and repaired and unrepaired records differ at the
   same rate. Plain `accelsearch` on the raw `.fft` is 100% reproducible, and so
   is `coherent`, which reads the very same `_red.fft`. **Cause unidentified.**
-  The obvious hypothesis, untested: `rednoise`'s output differs between hosts
-  at the floating-point level, `coherent` (S/N to 2 decimals, fixed trial grid)
-  does not see it, and something in `accelsearch`'s candidate pipeline
-  amplifies it. (Note from SMR: eiger's PRESTO was compiled with `-Dc_args=-march=native`
-  and the earlier run on fitroy was probably not. That might cause a small 
-  floating point inconsistency.)
+  The leading hypothesis, untested, is SMR's: eiger's PRESTO was built with
+  `-Dc_args=-march=native` and fitzroy's probably was not, which is enough for a
+  small floating-point inconsistency in `rednoise`'s output. `coherent` (S/N to
+  2 decimals, on a fixed trial grid) would not see a difference that small, and
+  something in `accelsearch`'s candidate pipeline amplifies it.
   Its white detection fraction is unchanged (38.5 in both reports), so no
   number here moves. But it is the one arm whose per-record output depends on
   where it ran. The merge applies fitzroy's repair patch last, so the analysis
@@ -93,13 +92,24 @@ science.**
 false-alarm rate.** On clean data it recovers 76% of the injected pulsars where
 riptide's fast-folding search recovers 50% and PRESTO's `accelsearch` 42%.
 
-**2. The advantage is biggest for narrow pulses.** Pulsars whose pulse covers
-less than 1% of a rotation are the hardest case, and there the other two codes
-almost vanish: we find 56% of them, riptide 5%, `accelsearch` 2%. For fat pulses
-(a sixth of a rotation or more) the gap narrows but does not close.
-(Note from SMR: we need to be careful how we say this. Because the above only applies,
-I think, to `rseek_A`, which matches our work/band, it's true. But the intended way
-of running riptide for narrow pulses is `rseek_B`, which does much better.)
+**2. The advantage is biggest for narrow pulses — against the riptide
+configuration matched to our band.** Pulsars whose pulse covers less than 1% of
+a rotation are the hardest case, and there the other two codes almost vanish: at
+a duty cycle of 0.5–1% we find 56%, `rseek_A` 5%, `accelsearch` 2%. For fat
+pulses (a sixth of a rotation or more) the gap narrows but does not close.
+
+**SMR was right to flag this: those numbers are `rseek_A` only, and `rseek_B` is
+what riptide's authors would point at a narrow pulse.** `rseek_B` folds six times
+deeper for ~6x our runtime, and a deeper fold is exactly what a narrow pulse
+needs. There is no `rseek_B` entry in that table because the per-duty detection
+table covers only the arms that ran on every realization and `rseek_B` ran on one
+in ten. The statistic that does exist for it is the logistic fit of injected S/N
+at 50% detection, and below 1% duty that reads **8.96 for `rseek_B` against our
+8.25** — about 0.7 in S/N, not a factor of ten in detection fraction.
+**So the paper must never quote 56 against 5 without naming `rseek_A` and saying
+what it is matched to.** A `rseek_B` per-duty row is obtainable — `mc_analyze.py
+--no-common` includes the subset arms — but it is a 36-minute, 13 GB pass over
+the records on fitzroy, so it has not been run.
 
 **3. Most of our sensitivity benefit comes from a better-behaved noise
 tail, not from a better filter.** Our statistic's threshold can sit lower,
@@ -125,8 +135,8 @@ its authors intend, and the paper must say so.**
 
 **5. Red noise costs us little, and only at low frequencies.** The pulsar
 brightness we need for a 50% detection rises by a factor of 1.00, 1.00,
-1.05, 1.12, 1.27 as the noise gets worse (SMR note: need knee freqs for
-those numbers). Above 100 Hz the loss is exactly zero at every noise
+1.05, 1.12, 1.27 as the knee frequency rises through the bins 0.1–0.5, 0.5–2,
+2–6, 6–15 and 15–50 Hz. Above 100 Hz the loss is exactly zero at every noise
 level. Published measurements of the same effect for a real survey quote a
 factor of 1.1–2, so we sit at or below the bottom of that range — as we
 should, because they include radio interference and we model only red
@@ -188,14 +198,21 @@ same noise.
 
 ## 3. The one rule that makes codes comparable
 
-A "S/N of 8" means four different things here: ours and riptide's are
-single-trial, `accelsearch`'s is already corrected for its trials,
-`prepfold`'s is a chi-squared test converted to equivalent gaussian
-significance. Comparing at a common nominal threshold is meaningless.
-(Note from SMR:  we need to confirm that we are actually using
-trials-corrected sigma from accelsearch. If we are getting the information
-from the python sifting code, then I think that converts the number back
-to single-trial.)
+A "S/N of 8" does not mean the same thing in any two of these codes.
+**SMR's suspicion was right and the sentence that used to stand here was wrong:
+we do not use `accelsearch`'s trials-corrected sigma.** `parse_accel` reads the
+`ACCEL_0` file through `presto.sifting.candlist_from_candfile`, which recomputes
+`candidate_sigma(opt_ipow, 1, 1)` from the optimized harmonic powers and hands
+back a **single-trial** sigma; the trials-corrected value printed in the file is
+never read. So three of the four statistics — ours, riptide's and
+`accelsearch`'s — are single-trial, and `prepfold`'s is a chi-squared test
+converted to an equivalent Gaussian significance. The code was always right here
+and only the prose was wrong.
+
+Even so, comparing at a common nominal threshold is meaningless. Three
+single-trial sigmas are not interchangeable when the codes search different
+numbers of trials, over differently-shaped noise, with statistics whose tails
+differ. That is what the empirical matching below exists to fix.
 
 **So: fix the empirical false-alarm rate, let each code pick whatever threshold
 delivers it, and count detections.** A code then wins on two separable things —
@@ -212,7 +229,33 @@ and (for `prepfold`) the fold period.
 
 ## 4. riptide under red noise: preprocessing, not the filter
 
-Matched cut at 0.1 false alarms per realization, per knee bin (Hz):
+**Everything in this section is binned on two axes, so define them once.**
+
+- **The knee frequency** is where the injected red noise crosses the white floor:
+  below it the red noise dominates, above it the spectrum is flat. A knee of
+  15–50 Hz is severe, 0.1–0.5 Hz mild, and `white` is a realization with no red
+  noise at all. The bins are 0.1–0.5, 0.5–2, 2–6, 6–15 and 15–50 Hz.
+- **The f0 band** is the *injected pulsar's own spin frequency*, in seven bins:
+  0–1, 1–5, 5–20, 20–100, 100–200, 200–400 and above 400 Hz. It is **not** a
+  range the measurement is averaged over, and it is **not** a restriction of the
+  search — every code always searches its whole band. It says only which
+  injections a cell counts, and which of a code's false alarms set that cell's
+  threshold.
+
+**Every threshold quoted below is chosen so that all codes make the same number
+of false alarms, not a threshold anyone would pick a priori.** Matching per knee
+gives one threshold per code per knee bin, from that code's false alarms in the
+realizations with that knee. Matching per (knee × f0 band) gives one threshold
+per cell: it comes from the false alarms whose *candidate* frequency fell in that
+band, and it is applied to the injections whose *f0* fell in the same band.
+
+**The two matchings are not on the same scale and must never be read against
+each other.** Band matching allows `--fap` false alarms in each of seven bands,
+so up to 7x the rate the per-knee matching allows.
+
+Matched cut at 0.1 false alarms per realization, per knee bin (Hz) — i.e. the
+S/N threshold each code has to be given for all of them to produce the same
+false-alarm rate:
 
 | | white | 0.1–0.5 | 0.5–2 | 2–6 | 6–15 | 15–50 |
 |---|---|---|---|---|---|---|
@@ -220,10 +263,6 @@ Matched cut at 0.1 false alarms per realization, per knee bin (Hz):
 | `accelsearch` | 7.20 | 7.20 | 7.20 | 7.20 | 7.20 | 7.20 |
 | `rseek_A` | 7.55 | 7.55 | 18.85 | 59.50 | 140.00 | **250.00** |
 | `rseek_B` | 7.65 | 7.75 | 14.55 | 35.50 | 91.50 | **200.00** |
-
-(Note from SMR: the first time we show numbers like this we need to very
-clearly state what it means. These are the S/N thresholds we need to give
-the various codes so that they all have the same false-positive rates.)
 
 Ours is flat because we search a PRESTO-whitened FFT; `accelsearch`'s is
 flat because of its own local power normalization. riptide's climbs by a
@@ -246,12 +285,6 @@ Detection fraction, per knee / per (knee × f0 band):
 | `coherent_tier` | 51.6 / 55.6 | 52.0 / 55.6 |
 | `rseek_W` | 49.0 / 71.3 | — | — | — | — | — | 49.8 / 54.1 | 44.6 / 49.1 | 36.7 / 40.6 | 22.5 / 26.5 |
 
-(Note from SMR: I have been confused by what f0 is. Is that the band over
-which the measurements are being made? e.g. 0.1-0.5 or 0.4 Hz, or 2-6 or 4
-Hz? Or is it just that a new threshold is computed for that particular
-freq band to give the same FAP? Please write a sentence or two explaining
-exactly what "knee × f0 band" actually means.)
-
 **Both columns belong in the paper.** Per knee is what a pipeline tuned to
 one observation applies, and it is where riptide goes to zero. Per (knee ×
 band) gives it back its clean fast folds and is the fairer statement about
@@ -259,10 +292,8 @@ its *search*. Publishing only the first invites "you are misusing
 riptide"; only the second hides the operational cost of an uncalibrated
 statistic.
 
-**The two columns are not on the same scale and must never be read against
-each other.** The band-matched column allows `--fap` false alarms *in each
-of seven bands*, so up to 7x the pooled rate. (Note from SMR:  maybe that
-previous sentence just needs moved to the beginning of this section.)
+(The reminder that these two columns are on different scales is now at the top
+of this section, where it is read before the numbers.)
 
 **The band-matched row now has a white zero point** (run 4; the white cell of
 the report printed before 2026-09-16 is wrong, see the provenance note). It
@@ -399,7 +430,7 @@ and the residual is 0.00% for every coherent arm.
 | 15–50 | 8.68 | **1.27x** | — | — | 1.34 | 1.12 |
 
 Lazarus et al. (2015) measure **1.1–2 at P = 0.1–2 s for PALFA at DM > 150**.
-Quote their high-DM figure: their DM dependence is likly confusion with RFI and we
+Quote their high-DM figure: their DM dependence is likely confusion with RFI and we
 model red noise only, so landing at or below the bottom of their range is the
 right side of it. A result above it would have needed explaining.
 
@@ -412,14 +443,35 @@ else.
 
 ## 7. The two sigma questions, answered
 
-**`coherent_rawmeas` — can I skip `rednoise`?** No. Measured sigma on the
-raw `.fft`, per knee: **77.3 → 32.4 → 8.5 → 3.0 → 1.0%**, against
-`coherent`'s 76.2 → 47.9. Its matched cut inflates 6.80 → 11.80 just to
-hold the false-alarm rate. A negative result about our own default path,
-worth stating plainly. (Note from SMR: for this point, do you mean that we
-had an un-normalized FFT, but we ran `coherent` with `--sigma measured`?
-Or just that we tried to run with an unnormalized FFT when we knew we
-shouldn't?)
+**`coherent_rawmeas` — can I skip `rednoise`?** No.
+
+**What the arm is** (answering SMR's question: it is the first of the two
+readings, and the `--sigma measured` is deliberate). It runs our own search on
+the raw `realfft` output, never passed through `rednoise`, with
+`--sigma measured`. There is no analytic-on-raw arm on purpose: `realfft` emits
+an un-normalized FFT — unit-variance noise gives mean Fourier power `N`, not 1 —
+so analytic sigma on a raw file is wrong by `sqrt(N)`. That is a usage error
+rather than a configuration worth measuring, and the search's own guard catches
+it, at ratios of 3.5e-5 to 3.7e-4 on all three smoke realizations. The measured
+MAD adapts to any overall scale, so `rawmeas` is the **well-posed** form of the
+question: it gives "skip `rednoise`" the best noise estimator we have, and it
+still collapses.
+
+Per knee: **77.3 → 32.4 → 8.5 → 3.0 → 1.0%**, against `coherent`'s 76.2 → 47.9.
+Its matched cut inflates 6.80 → 11.80 just to hold the false-alarm rate. A
+negative result about our own default path, worth stating plainly.
+
+**What fails is whitening, not scaling, and the paper has to say which.** The run
+does not separate the two, so this is a reading of the mechanism rather than a
+measurement: a single scale factor cannot fix a red spectrum, because a trial
+fundamental at `r` sums harmonics out to `60r` and one profile therefore mixes
+Fourier bins whose noise powers differ by orders of magnitude. No single sigma,
+measured or computed, is right for all of them, and the red bins dominate the
+profile and manufacture candidates. `rednoise` divides each bin by a running
+median of the *local* power, which makes the mean Fourier power 1 at every
+frequency — normalization and whitening in one step. So SMR's note on headline 6
+is right, and the requirement to state is that **the input FFT be locally
+normalized**; PRESTO's `rednoise` is one way to get there, not the only one.
 
 **`coherent_meas` — should I measure sigma or compute it?** It makes no
 difference: measured sigma on the whitened file tracks the analytic default to
