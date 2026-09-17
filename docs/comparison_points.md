@@ -170,7 +170,10 @@ our default `coherent` 7.64. Over all duty cycles: `coh+tier` **6.76**,
 `rseek_A` without saying what it is matched to. Say plainly that our *default*
 configuration loses to `rseek_B` below 1% duty, and that the comparison the
 thesis rests on is `coh+tier` against `rseek_B` — two configurations against one,
-at a fifth of the cost. And quote the white-only table, not the pooled one,
+at a fifth of the cost — while noting (item 11) that the default arm alone is
+the right tool for the ~87% of the population above 1% duty, so the two-pass
+plan is what you run when you want uniform sensitivity, not what you run always.
+And quote the white-only table, not the pooled one,
 whenever the subject is riptide's *search* rather than its de-reddening; the
 red-noise story is §4's and belongs there.
 
@@ -236,6 +239,37 @@ pulses.
 and so is a ceiling rather than a competitor, reaches 93% where we reach 72% on
 the same injections. About two thirds of that gap is the price of not knowing
 the period in advance — the threshold a blind search has to set.
+
+**11. What we would actually recommend running: skim the cream with the least
+work first.** The three searches escalate cleanly in cost, and each one is worth
+running only if the one before it found nothing.
+
+| step | white detection | cost per observation |
+|---|---|---|
+| `accelsearch` | 41.6% | 1.5 s |
+| add `coherent` | 76.3% | +17.0 s |
+| add the `tier` pass | 77.6% | +5.0 s |
+| (`rseek_B`, for comparison) | 71.4% | 121.8 s |
+
+**The default configuration alone is the right tool for most of the pulsar
+population.** Adding the deep `tier` pass is worth only 1.3 points overall,
+because the pulsars it helps are a small slice: on the duty-cycle distribution
+measured for real slow pulsars, 12.6% of the population falls below 1% duty and
+2.1% below 0.5%. Inside that slice the pass is transformative — 47% to 66% below
+0.5% duty — and outside it, it adds nothing.
+
+**Where the tiered plan matters is when you want uniform sensitivity across all
+duty cycles and spin periods.** Then run both, at 22.0 s per observation, and the
+result beats `rseek_B` at every duty cycle for a fifth of its 121.8 s. `rseek_B`
+is the honest comparison for that goal, because it is the configuration that also
+aims at uniform coverage.
+
+One statistical caveat to carry with the escalation: each extra search adds
+trials, so the threshold has to rise to hold the same false-alarm rate. That is
+visible in the numbers — under per-band matching `coh+tier` reads 83.9% against
+`coherent`'s 84.2%, i.e. the union is very slightly *worse* than its better half
+once the cut is set fairly. Running everything is not free even when the compute
+is.
 
 ---
 
