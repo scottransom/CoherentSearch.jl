@@ -106,56 +106,77 @@ period and duty cycle. Nothing here overturns either result, and our comparison
 only means something once the fold depths are named.
 
 Run riptide in the configuration matched to our frequency coverage and search
-cost (`rseek_A`) and we find far more of these pulsars: 56% against 5% at duty
-cycles of 0.5–1%, and 37% against 1.5% below that. Run it in the deep
+cost (`rseek_A`) and we find far more of these pulsars: 66% against 9% at duty
+cycles of 0.5–1%, and 47% against 2% below that. **But run it in the deep
 configuration its authors would choose for a narrow pulse (`rseek_B`, six times
-the fold depth) and it beats our default setting at the very narrowest, 41%
-against 37%. Between 0.5% and 1% we are ahead again, 56% against 50%. For fat
-pulses (a sixth of a rotation or more) our margin narrows but does not close.
+the fold depth) and it beats our default setting below 1% duty — 61% against our
+47% — and ties it between 0.5% and 1%.** Above 1% our default is ahead again at
+every width.
 
 **The claim worth making is about what a given amount of computing buys.** Depth
-is cheap for us: `coherent_tier` folds 120 harmonics below 5 Hz, finds 62% of the
-narrowest pulses — more than either riptide configuration — and costs 5.0 seconds
-per simulated observation against `rseek_B`'s 121.8. So the Fourier domain
-reaches the depth a narrow pulse needs at a cost that lets a survey actually use
-it. That is the paper's point, and it is a statement about the *domain*, not
-about riptide: "we are better at narrow pulses" on its own would invite the
-reader to think we had not understood why people adopted the FFA.
+is cheap for us, so we run two configurations rather than one: the default, plus
+`coherent_tier`, which folds 120 harmonics below 5 Hz. Their union (`coh+tier`)
+beats `rseek_B` at **every** duty cycle — 66% against 61% at the narrowest, 77%
+against 65% at the widest — and costs 22.0 seconds per simulated observation
+against `rseek_B`'s 121.8, on the same machine. `coherent_tier` on its own finds
+**71%** of the narrowest pulses, the best of any search arm here.
 
-**Where the `rseek_B` numbers come from.** It is absent from the report's
-per-duty table because that table covers only the arms that ran on every
-realization, and `rseek_B` ran on one in ten — but the measurement exists
-already, in the quick-look page. `mc_quicklook.py`'s `frac` counts each arm over
-only the injections it saw, which is exactly what `mc_analyze.py --no-common`
-would do, so no re-run is needed to answer this.
+So the Fourier domain reaches the depth a narrow pulse needs at a cost that lets
+a survey actually use it. That is the paper's point, and it is a statement about
+the *domain*, not about riptide: "we are better at narrow pulses" on its own
+would invite the reader to think we had not understood why people adopted the
+FFA. The result that matters is that a deep fast-folding search is matched and
+passed by a Fourier-domain search costing a fifth as much — riptide's deep
+configuration is doing exactly what it should.
 
-Detection %, `ql_v4.png` panel "detection vs duty cycle" (all 160,976
-realizations, cut matched per knee cell). Values for the five arms that appear in
-both the plot and the report's table agree to ~1 point, which is what calibrates
-the two read off the plot:
+**The white-only per-duty measurement, run 2026-09-16.**
+`mc_analyze.py /data1/mc/run2 --fap 0.1 --no-common --sections header,table,s50`
+on fitzroy, analysis code at `e49e34c`: 76,105 white realizations / 411,078
+injections, 408 s. `--no-common` is what puts `rseek_B` in the table — the
+standard report restricts to the arms that ran on every realization, and
+`rseek_B` ran on one in roughly seven (56,316 injections, hence its wider error
+bars). Detection %, each cut matched at 0.1 false alarms per realization:
 
-| FWHM duty | `coherent` | `rseek_B` | `rseek_A` | `accelsearch` | `coh+tier` | `prepfold_snr1` |
-|---|---|---|---|---|---|---|
-| 0.002–0.005 | 37.1 | **≈41** (plot) | 1.5 | 0.4 | 56.3 | 64.2 |
-| 0.005–0.01 | **56.4** | ≈50 (plot) | 5.4 | 1.8 | 63.9 | 74.3 |
+| FWHM duty | `coherent` | `coherent_tier` | `coh+tier` | `rseek_B` | `rseek_A` | `accelsearch` | `prepfold_snr1` |
+|---|---|---|---|---|---|---|---|
+| 0–0.5% | 46.7 | **71.3** | 66.2 | 61.1 ±1.5 | 2.2 | 0.6 | 92.9 |
+| 0.5–1% | 66.3 | **77.7** | 73.4 | 66.4 ±0.6 | 8.6 | 2.6 | 98.2 |
+| 1–2% | 73.6 | **79.1** | 76.1 | 69.2 | 22.0 | 12.8 | 99.3 |
+| 2–4% | 76.9 | **80.6** | 78.1 | 71.9 | 38.9 | 31.3 | 99.6 |
+| 4–8% | 78.5 | 67.0 | **79.3** | 75.5 | 58.4 | 44.6 | 99.7 |
+| 8–16% | 78.1 | 31.4 | **78.5** | 77.0 | 68.9 | 54.3 | 99.7 |
+| 16–50% | 76.9 | 10.1 | **77.0** | 65.5 | 62.4 | 61.8 | 99.4 |
 
-The logistic fit says the same thing more compactly: injected S/N at 50%
-detection below 1% duty is **8.96 for `rseek_B` against our 8.25**, about 0.7 in
-S/N rather than a factor of ten in detection fraction.
+Matched thresholds: `coherent` 6.75, `coherent_tier` 6.45, `coh+tier` 6.75,
+`rseek_A` 7.55, `rseek_B` 7.65, `accelsearch` 7.20.
 
-**Three things the paper must do with this.** Never quote 56 against 5 without
-naming `rseek_A` and what it is matched to. Say that the table above is pooled
-over white *and* red realizations, which is the arrangement least flattering to
-`rseek_B`: per-knee matching is where riptide's uncalibrated tail hurts it most
-(§4), so its **white-only** narrow-duty figures are better than these. And note
-that `coherent_tier` searches 0.1–5 Hz only — which costs it nothing in this
-comparison, because every injection below 0.5% duty in this population is slower
-than 5 Hz and so falls inside its band.
+**This supersedes the earlier reading off `ql_v4.png`, which had `rseek_B` at
+≈41% against our 37% in the narrowest bin.** That plot pools white *and* red
+realizations, which understates `rseek_B` badly; on white noise alone it is 61.1
+against 46.7. The plot was not misread — it is a different measurement, and the
+pooled one is the wrong one to quote at riptide.
 
-Exact white-only per-duty numbers have not been produced. That needs a
-`--no-common` report pass or a white-restricted quick-look, ~36 minutes and 13 GB
-on fitzroy. It would move `rseek_B` up and is worth having before the paper
-quotes the 41 against 37.
+`coherent_tier`'s collapse at wide duty (10.1% at 16–50%) is its **0.1–5 Hz
+band**, not its sensitivity: injections above 5 Hz are automatic misses for it.
+The narrow-duty rows lose nothing that way, because every injection below 0.5%
+duty in this population is slower than 5 Hz.
+
+The logistic fit agrees. Injected S/N at 50% detection, white noise, duty < 1%:
+`coherent_tier` **6.77**, `coh+tier` 7.08, `coherent_deep` 7.21, `rseek_B` 7.57,
+our default `coherent` 7.64. Over all duty cycles: `coh+tier` **6.76**,
+`coherent` 6.84, `rseek_B` 7.15, `rseek_A` 8.49, `accelsearch` 9.07.
+
+**Three things the paper must do with this.** Never quote a number against
+`rseek_A` without saying what it is matched to. Say plainly that our *default*
+configuration loses to `rseek_B` below 1% duty, and that the comparison the
+thesis rests on is `coh+tier` against `rseek_B` — two configurations against one,
+at a fifth of the cost. And quote the white-only table, not the pooled one,
+whenever the subject is riptide's *search* rather than its de-reddening; the
+red-noise story is §4's and belongs there.
+
+Still open, and probably not worth running: the red side of this table. Under red
+noise `rseek_B` is dominated by the de-reddening problem of §4, so a red per-duty
+table would measure that rather than fold depth.
 
 **3. Most of our sensitivity benefit comes from a better-behaved noise
 tail, not from a better filter.** Our statistic's threshold can sit lower,
