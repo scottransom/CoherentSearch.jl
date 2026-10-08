@@ -1,5 +1,7 @@
 # CoherentSearch.jl
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23236386.svg)](https://doi.org/10.5281/zenodo.23236386)
+
 A pure-Julia pulsar search that uses the **phase** of every harmonic, not just
 its power. Working from a PRESTO-style `.fft` file, it reconstructs the pulse
 profile at each trial spin frequency — Fourier-interpolating the complex
@@ -72,7 +74,9 @@ Start there if you want to understand the algorithm. See
 ## Citation
 
 If you use this code, please cite the paper (Ransom, in preparation, "A Coherent
-Harmonic Summing Pulsar Search Code") and the archived release of the software.
+Harmonic Summing Pulsar Search Code") and the software via its Zenodo DOI,
+[10.5281/zenodo.23236386](https://doi.org/10.5281/zenodo.23236386), which always
+resolves to the latest release. Say which version you used.
 `CITATION.cff` carries the metadata that GitHub's "Cite this repository" button
 and Zenodo read.
 
