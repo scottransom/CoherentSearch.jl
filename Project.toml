@@ -1,6 +1,6 @@
 name = "CoherentSearch"
 uuid = "b7e4a1c2-3d6f-4e8a-9c1b-2a5d8f3e6c40"
-version = "0.1.0"
+version = "1.0.0"
 authors = ["Scott Ransom <sransom@nrao.edu>"]
 
 [deps]

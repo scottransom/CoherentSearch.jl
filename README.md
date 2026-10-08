@@ -69,6 +69,13 @@ Start there if you want to understand the algorithm. See
 - riptide (the FFA we benchmark against):
   <https://github.com/v-morello/riptide>
 
+## Citation
+
+If you use this code, please cite the paper (Ransom, in preparation, "A Coherent
+Harmonic Summing Pulsar Search Code") and the archived release of the software.
+`CITATION.cff` carries the metadata that GitHub's "Cite this repository" button
+and Zenodo read.
+
 ## Layout
 
 ```

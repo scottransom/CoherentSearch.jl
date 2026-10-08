@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata below."
+title: "CoherentSearch.jl"
+abstract: >-
+  A pure-Julia coherent harmonic-summing pulsar search over PRESTO .fft files.
+  It reconstructs the pulse profile at every trial spin frequency by Fourier
+  interpolating the complex amplitudes of the harmonics, inverse transforming
+  them, and matched-filtering the profile against a bank of boxcar templates.
+  Multi-threaded on CPUs, with an optional CUDA GPU backend.
+type: software
+version: 1.0.0
+date-released: 2026-10-08
+license: MIT
+repository-code: "https://github.com/scottransom/CoherentSearch.jl"
+keywords:
+  - pulsars
+  - pulsar searching
+  - Fourier domain
+  - harmonic summing
+  - Julia
+authors:
+  - family-names: Ransom
+    given-names: Scott M.
+    orcid: "https://orcid.org/0000-0001-5799-9714"
+    affiliation: "National Radio Astronomy Observatory"
