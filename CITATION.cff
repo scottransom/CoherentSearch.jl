@@ -24,3 +24,17 @@ authors:
     given-names: Scott M.
     orcid: "https://orcid.org/0000-0001-5799-9714"
     affiliation: "National Radio Astronomy Observatory"
+preferred-citation:
+  type: article
+  title: "A Coherent Harmonic Summing Pulsar Search Code"
+  authors:
+    - family-names: Ransom
+      given-names: Scott M.
+      orcid: "https://orcid.org/0000-0001-5799-9714"
+      affiliation: "National Radio Astronomy Observatory"
+  year: 2026
+  url: "https://arxiv.org/abs/2610.11749"
+  identifiers:
+    - type: other
+      value: "arXiv:2610.11749"
+      description: "The arXiv preprint"
