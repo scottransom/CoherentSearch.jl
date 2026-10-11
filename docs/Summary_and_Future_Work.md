@@ -1337,72 +1337,88 @@ With `--noplot` each `FFTFile` becomes collectable as its iteration ends.
 That leaves (a) versus (b) as the real open question, and it is the same
 `-t 1`-versus-threaded axis that decides the `Float32` merge.
 
-- **Kadane's algorithm as a fast (approximate) boxcar metric — to investigate.**
-  The boxcar width×phase scan is now the single largest bucket (44.6%), and it is
-  an `O(nbins × nwidths)` search over a *fixed, a-priori* width bank (9 widths at
-  `nbins=120`, falling to 5 at `nbins=20` under decimation). The [`loki`
-  code](/home/sransom/git/loki) — a new Fast Folding Algorithm implementation
-  that has the same "score a huge batch of folded profiles with boxcars" problem
-  — replaces that scan with a **maximum-subarray (Kadane) sweep**, which finds the
-  best contiguous run of bins in a *single* `O(nbins)` pass with no prefix sum.
-  Worth understanding and probably worth trying. Its mechanics
-  (`lib/kadane.cpp`, `include/loki/detection/kadane.hpp`):
+- **Kadane's algorithm as a boxcar surrogate — CLOSED (2026-10-11): not worth
+  doing on the CPU, and at most one cheap experiment on the GPU.** This entry was
+  written in 2026-07 as "to investigate", after reading the `loki` code's
+  bias-subtracted Kadane sweep (`lib/kadane.cpp`). Its step (3), the
+  cross-profile SIMD batch on the *existing* exact scan, was done on 2026-08-09
+  (the `_boxcar_gate!` entry in §2) and took most of the benefit with no
+  approximation. What closed the rest is the preprint the `loki` authors sent
+  after seeing our arXiv paper: D. Gazith, P. Kumar & B. Zackay, *Kadane's
+  algorithm for fast boxcar pulse detection* (MNRAS, submitted, 2026). Their code
+  is at `github.com/DotanGazith/kadane_pulse_detection`.
 
-  - **Bias-subtracted Kadane.** Plain max-subarray always prefers longer runs,
-    because the `1/√w` normalisation is not inside the recurrence. Running Kadane
-    on `x_j − mean − b` instead makes the constant `b` a per-bin length penalty,
-    so the maximising window is a proxy for the best `w`. A small bank of biases
-    then spans a range of characteristic widths — loki ships **three**
-    (`1.42, 0.76, 0.41`, `lib/configs.cpp`), all updated in one pass over the
-    bins, versus our 5–9 widths.
-  - **Wrapped pulses come free from a simultaneous min-subarray.** The complement
-    of the minimum-sum window is the maximum-sum *circular* window, so tracking
-    both in the same sweep handles a pulse straddling phase 0 — which our scan
-    handles by phase-tiling the prefix sum instead.
-  - **Different normalisation.** loki scores
-    `sum · √(nbins / (w·(nbins−w)))` rather than our `sum/(σ·√w)`; that is the
-    right factor when the baseline is estimated from the *same* profile, and it
-    is worth adopting (or at least understanding) independently of Kadane.
-  - **Vectorised across profiles, not within one.** loki transposes a batch of
-    profiles and runs the sweep SIMD-wide over the batch. **This may matter more
-    than Kadane itself for us:** our scan vectorises along phase *within* one
-    profile, and under decimation `nbins` falls to 20, where the inner loops are
-    far too short to fill a vector. We already hold `Nprof = 2048` profiles in a
-    contiguous `(nbins, Nprof)` array, so the batch axis is right there.
+  **What the preprint does.** A bias `b` subtracted from every sample turns
+  Kadane's single linear pass into a width-penalised search, ranking intervals by
+  `S − b·w`, and a small calibrated bank of biases covers the whole width range.
+  The window each pass returns is then re-scored with its exact `S/√w`. That makes
+  the method a **one-sided surrogate**: it cannot raise the false-alarm rate over
+  the dense search, but it can miss. They choose the bias banks by dynamic
+  programming over an injection-recovery table `R(w, b)`, and derive the band of
+  widths one bias serves from a reflected random walk (CUSUM) on iid N(0,1)
+  samples. A circular variant (track the min-subarray too; the wrapped optimum is
+  the complement of the minimum window) handles folded profiles at ~2x the cost.
+  Their headline result is for FRB-like linear streams, `N = 4096`, widths
+  1–128: a two-bias bank recovers every injection at `η = 10`, `δ = 2`, and is
+  **7x faster than a power-of-two boxcar bank** on one EPYC 9654 core. The bank
+  with one bias on the full stream and one on a 4x-decimated copy is 1.4x the
+  decimated power-of-two scan's cost and recovers far more.
 
-  **The catch, and the reason this is an "approximation".** The window width
-  Kadane selects is *data-dependent*, whereas the entire justification for the
-  `:boxcar` metric (§2) is that its widths are fixed a priori, making each
-  (phase, width) trial exactly `N(0,1)` with an analytic, `nbins`-flat trials
-  factor. A data-selected width reintroduces precisely the selection bias that
-  made `:non`'s noise floor scale as `√nbins` — so a Kadane-scored metric would
-  need its own threshold calibration, and the flat-across-decimations property
-  that `:boxcar` was adopted for cannot be assumed to survive. Also, with a finite
-  bias bank the recovered window is not guaranteed optimal, so the score is a
-  *lower bound* on the true best-boxcar S/N.
+  **Why the 7x does not carry over to us.**
+  - **The gain scales with the number of widths, and ours is tiny.** Kadane
+    replaces an `O(N·N_w)` prefix-sum scan with `K` passes of `O(N)`. Their
+    comparison bank has 8 widths. Ours, after ladder pruning at the CLI defaults
+    (`--nharms 60 --maxdecim 6`), is `[1,2,3,4,6]` at `k=1` (120 bins) and
+    `[2,3,4,6]` at every `k = 2…6` (60 down to 20 bins): **4–5 widths
+    everywhere.** Two circular passes at ~2x each, plus the start-index
+    tracking re-scoring needs, are roughly the per-bin work of our prefix sum
+    and 4–5 subtract/compare/max steps. The asymptotic advantage is
+    `N_w/(2K) ≈ 1.2x`, before the extra blends. The preprint's own discussion
+    (its item iii) flags that short circular profiles "might warrant
+    significantly different optimization choices".
+  - **The ceiling was already small.** The width scan is about a third of the
+    metric phase, and the metric about 23% of `-t 1` runtime since analytic σ
+    (CLAUDE.md, the 2026-08-24 entries), so even an implausible 4x on the scan
+    is a few percent end to end. The transpose inside the gate is larger than
+    the scan.
+  - **Batching across profiles in `Float32` is the engineering they emphasise,
+    and we already ship it** (`_boxcar_gate!`, `_BC_BATCH = 128`).
 
-  **That lower-bound property is exactly what makes it attractive here, though,**
-  because `_profile_boxcar` already has a two-tier structure built for it: the
-  adaptive zero-baseline gate computes a cheap lower bound and only pays for the
-  exact version when the trial comes within `boxcar_medmargin` of threshold. A
-  Kadane sweep could slot in as (or ahead of) that cheap stage, with the exact
-  fixed-width scan run only on survivors — **which keeps the reported metric, its
-  calibration and every candidate exactly as they are today**, and confines
-  Kadane to deciding what not to bother scoring properly. That framing avoids the
-  calibration problem entirely and is how I would try it first; a
-  `--metric kadane` that reports the Kadane score directly is the more invasive
-  option and should wait on a `--metricstats` study of its noise distribution.
+  **Why it is the wrong trade even if it were faster.**
+  - **Our gate is exact; Kadane is not.** The `Float32` gate differs from the
+    `Float64` rescan by ≤7e-7 against a `boxcar_gatemargin = 0.01`, so it never
+    misses a trial that would clear threshold. The preprint's design point allows
+    `δ = 2` units of S/N loss at `η = 10`; their two-bias bank averages 0.996 of
+    the dense S/N and the decimated variant 0.982, with dips at particular widths.
+    At threshold in a blind pulsar search that is a direct sensitivity cost, in
+    exactly the regime where the §3.2 Monte Carlo measures our margin.
+  - **Their calibration does not transfer to a Fourier-domain fold.** The
+    noise-floor and dilution results assume iid unit-variance steps. Our
+    statistic is `S_w` over the exact band-limited variance
+    `2Σ|D_j|² + ½|D_{nbins/2}|²` (§3.6, 2026-08-28), and past the Nyquist knee the
+    profile bins are correlated, so the random-walk analysis fails exactly where
+    that renormalisation was needed. The bias banks would have to be recalibrated
+    by Monte Carlo in every `(nbins, H)` cell.
+  - **The preprint calibrates on boxcar signals.** Its item (ii) says so; our
+    width-bank choices were validated on Gaussian and scattered profiles, which
+    is what real pulsars look like.
 
-  Concretely, in order: (1) port the bias-subtracted sweep (plus min-subarray for
-  wrapping) and check on real data how often its score brackets the exact metric,
-  and how tight the bound is — the gate needs a *guaranteed* margin, as
-  `boxcar_medmargin` does; (2) microbenchmark it against `_profile_boxcar` at
-  `nbins ∈ {20, 30, 60, 120}`, both as-is and vectorised across profiles, since
-  the operation count only falls ~2–3× and the per-bin work is higher (several
-  compare/selects per bias versus one subtract-and-max), so the win is not
-  obvious on paper; (3) separately, try the cross-profile SIMD transpose on the
-  *existing* exact scan — it may capture much of the benefit with no
-  approximation and no calibration risk at all.
+  **The one place it could matter: the GPU boxcar.** `docs/gpu_design.md`
+  §4.12/§4.15 found that kernel issue-bound, so it gets faster only by doing less
+  work, and on the 40 MB-L2 cards it is about a third of device time. A two-bias
+  circular Kadane is the only idea so far that removes work rather than
+  reshaping access. The arithmetic above still caps it near 1.2–1.3x on that
+  phase, ~1.07–1.1x on device time, paid for in recall. If it is ever tried, do
+  it in `bench/gpu_boxcar_bench.jl` beside the shipped kernel and score both
+  device time and the fraction of exact-scan maxima within 0.01 of threshold
+  that the Kadane windows fail to return. It ranks below the per-file overlap
+  and the C2C transform probe in §4.15.
+
+  **One result worth citing in the paper.** The preprint's Table 2 measures
+  riptide's geometric bank (`fsp = 1.5`, which is also ours) at a mean S/N ratio
+  of 0.963 of the dense search on boxcar injections, against 0.946 for
+  power-of-two. That is a clean external number for the width-quantisation loss
+  of our bank.
 
 - **Start-up latency: persist FFTW wisdom (implemented, 2026-07-21).** A short
   search spent several seconds *before* the hot loop planning every distinct
