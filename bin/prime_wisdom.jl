@@ -11,9 +11,12 @@
 #   julia --project=. bin/prime_wisdom.jl [--maxdecim K] [--nharms N]
 #         [--blocksize B] [--rigor patient|measure] [--wisdomfile PATH]
 #
-# Run once per host, and again after changing --nharms/--maxdecim/--blocksize
-# (those change the transform lengths); other configs are still learned
-# incrementally by ordinary searches.
+# With neither --nharms nor --maxdecim it primes BOTH configurations the search
+# CLI runs by default -- the default search (nharms 60, maxdecim 6) and the
+# --deep pass (nharms 120, maxdecim 12) -- as PRESTO's `makewisdom` does.  Give
+# either option to prime one configuration instead (the other defaults to the
+# default search's value).  Run once per host, and again after changing
+# --blocksize; other configs are still learned incrementally by ordinary searches.
 
 using CoherentSearch
 using ArgParse
@@ -24,11 +27,11 @@ function parse_cmdline(argv)
         "Prime the FFTW plan-wisdom cache (one-time PATIENT planning) for faster search start-up.")
     @add_arg_table! s begin
         "--maxdecim"
-            help = "Max harmonic-decimation factor (matches the intended search)"
+            help = "Max harmonic-decimation factor (0 = prime both the default search's 6 and --deep's 12, unless --nharms is given)"
             arg_type = Int
-            default = 6
+            default = 0
         "--nharms"
-            help = "Number of harmonics (0 = auto: 60 when decimating, else 32)"
+            help = "Number of harmonics (0 = prime both the default search's 60 and --deep's 120, unless --maxdecim is given)"
             arg_type = Int
             default = 0
         "--blocksize"
@@ -49,15 +52,21 @@ end
 
 function main(argv)
     a = parse_cmdline(argv)
-    maxdecim = a["maxdecim"]
-    nharms = a["nharms"] >= 1 ? a["nharms"] : (maxdecim > 1 ? 60 : 32)
-    params = SearchParams(nharms = nharms, decimations = decimation_set(nharms, maxdecim))
+    nh, md = a["nharms"], a["maxdecim"]
+    configs = if nh <= 0 && md <= 0
+        [production_params(), production_params(deep = true)]
+    else
+        md = md >= 1 ? md : 6
+        [production_params(nharms = nh >= 1 ? nh : 60, maxdecim = md)]
+    end
     rigor = lowercase(a["rigor"]) == "measure" ? FFTW.MEASURE : FFTW.PATIENT
     path = isempty(a["wisdomfile"]) ? wisdom_path() : a["wisdomfile"]
 
-    @info "Priming FFTW wisdom" nharms decimations=params.decimations blocksize=a["blocksize"] rigor=a["rigor"] path
-    t = @elapsed prime_wisdom(params; blocksize = a["blocksize"], rigor = rigor, path = path)
-    @info "Wisdom written" path bytes=filesize(path) seconds=round(t; digits=1)
+    for params in configs
+        @info "Priming FFTW wisdom" nharms=params.nharms decimations=params.decimations blocksize=a["blocksize"] rigor=a["rigor"] path
+        t = @elapsed prime_wisdom(params; blocksize = a["blocksize"], rigor = rigor, path = path)
+        @info "Wisdom written" path bytes=filesize(path) seconds=round(t; digits=1)
+    end
 end
 
 main(ARGS)

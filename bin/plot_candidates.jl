@@ -48,33 +48,10 @@ function parse_cmdline(argv)
     return parse_args(argv, s)
 end
 
-"""
-    read_candidates(path, T) -> Vector{Candidate}
-
-Parse a candidate file (the `# 'S/N' Frequency Period #Harm` table) back into
-`Candidate`s, recovering the fundamental Fourier frequency as `r = freq * T`.
-Comment (`#`) and blank lines are skipped; columns are whitespace-delimited:
-index, S/N, frequency (Hz), period (ms), harmonic count.
-"""
-function read_candidates(path::AbstractString, T::Real)
-    cands = Candidate[]
-    for line in eachline(path)
-        s = strip(line)
-        (isempty(s) || startswith(s, "#")) && continue
-        cols = split(s)
-        length(cols) >= 5 || continue
-        metric = parse(Float64, cols[2])
-        freq = parse(Float64, cols[3])
-        nharm = parse(Int, cols[5])
-        push!(cands, Candidate(freq, metric, freq * T, nharm))
-    end
-    return cands
-end
-
 function main(argv)
     a = parse_cmdline(argv)
     ft = FFTFile(a["fftfile"])
-    cands = read_candidates(a["candfile"], ft.T)
+    cands = read_cohout(a["candfile"], ft.T)
     if length(cands) > a["ncands"]
         cands = cands[1:a["ncands"]]
     end

@@ -37,7 +37,7 @@ include("backendtypes.jl")
 # --- Search ---
 export SearchParams, Candidate, search, search_block, block_metrics, coherent_profiles,
        reference_profiles, snr_metrics, chunk_ngoodbins, remove_duplicates,
-       remove_harmonics, chunk_metrics,
+       remove_harmonics, remove_harmonics_of, check_normalisation, chunk_metrics,
        decimation_set, boxcar_widths, ladder_boxcar_widths, boxcar_best_width, BlockMetricStats, MetricHistogram, MetricStats,
        SearchCache,
        metricstats_summary, metricstats_windows, hist_quantile,
@@ -63,7 +63,8 @@ export wisdom_path, import_wisdom!, export_wisdom!, prime_wisdom,
 include("wisdom.jl")
 
 # --- Per-candidate profile reconstruction (for plotting) ---
-export candidate_profile, rotate_to_peak, measure_ducy
+export candidate_profile, candidate_harmonics, rotate_to_peak, measure_ducy,
+       remove_periodic, read_cohout
 include("candidate.jl")
 
 # --- Command-line front-end (`bin/coherent_search.jl` is a shim onto this) ---

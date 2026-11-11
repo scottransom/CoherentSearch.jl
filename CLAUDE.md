@@ -91,11 +91,22 @@ repeatedly — now with a known mechanism (see the AVX-512 entry below).
   `bench/toy_vs_production.jl` A/Bs the two and scans the σ comparison across
   the band; `test/test_toy.jl` pins the toy against the reference path.
 - `bin/sift_candidates.py` — cross-observation/cross-DM candidate sifter (a
-  PRESTO `ACCEL_sift` analogue; pure stdlib, no numpy). Reads the `.cohout`/`.txt`
-  candidate files, parses DM from the filename, and learns everything else from
-  the inputs. Three stages: per-obs collapse across DM → link across obs by
-  *fractional* frequency (T-independent) → harmonic collapse + pulsar-likeness
-  score. Text report plus a self-contained HTML/SVG summary (`--html`).
+  PRESTO `ACCEL_sift` analogue; pure stdlib, no numpy). Reads the `.cohout`
+  candidate files (incl. `_deep.cohout`, and PRESTO's Known-PSR column), parses
+  DM from the filename, and learns everything else from the inputs. Three
+  stages: per-obs collapse across DM → link across obs by *fractional*
+  frequency (T-independent) → harmonic collapse + pulsar-likeness score. Text
+  report plus a self-contained HTML/SVG summary (`--html`). **It is a copy of
+  PRESTO's `bin/coherent_sift.py`** (only the docstring/help naming differs) —
+  change it there too, or re-copy.
+- **The C port in PRESTO** (`coherentsearch`, PRESTO ≥ 6.2.0, `~/src/presto`,
+  `src/cs_*.c`) is pinned to this code and reads/writes the same `.cohout`. Four
+  things it gained were backported here in 2026-11: the comb filter
+  (`remove_periodic`, `--noperiodic`), the file-based `check_normalisation`, the
+  `--deep` pass (`nharms 120 / maxdecim 12 / hifreq 5`, `_deep.cohout`), and
+  the deep pass's sift against the default `.cohout` (`remove_harmonics_of`).
+  The C program does not label known pulsars in Julia's output on its own:
+  `coherentsearch -rewrite` adds the column to Julia-written files.
 - `src/cli.jl` — the ArgParse driver, `CoherentSearch.main`. **In the package,
   not in `bin/`, on purpose**: as a top-level script, inferring and codegen'ing
   `main` cost ~4.7 s on every run. `bin/coherent_search.jl` is a shim.
@@ -1054,12 +1065,15 @@ re-deriving them.
     against 1.0064 / 1.0032 / 1.0016 predicted. Constant, and smaller than the
     error it replaced, so it is left uncorrected.
   - **Its one assumption fails SILENTLY and in the dangerous direction**, which
-    is why `_sigma_sanity_check` exists: measured σ̂ tracks whatever the
+    is why the search checks it: measured σ̂ tracks whatever the
     amplitudes are, while analytic keeps insisting on unit variance, so a
     normalisation error *inflates* every S/N and fills the candidate list with
-    noise. `search` scores three chunks both ways and warns above 10%
-    disagreement (~0.1% of runtime). On the un-normalised `harmonics_hi.fft` it
-    fires at a factor of ~1000. **It warns rather than switching** — silently
+    noise. **Since 2026-11 the check is `check_normalisation`**, backported from
+    PRESTO's C port: `√(median power / ln 2)` over bins 10000–19999 straight
+    from the file, warn above 10%. The `_sigma_sanity_check` recorded here (three
+    chunks scored both ways) sampled the lowest chunk and took the worst of ~18
+    comparisons, so it **warned falsely on well-normalised Ter5 data and on white
+    noise** — do not bring it back. **It warns rather than switching** — silently
     changing estimator would be a surprise.
   - **`--sigma measured` is still the right answer when the noise level varies
     with Fourier frequency** (residual red noise, an RFI comb, a `rednoise` pass

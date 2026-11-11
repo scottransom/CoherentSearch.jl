@@ -103,7 +103,7 @@ bin/
   parallel_search.py  fill a machine: partition a file list over cores or GPUs
   plotting.jl         CairoMakie candidate-profile plotting (loaded on demand)
   plot_candidates.jl  standalone: re-plot profiles from a saved candidate file
-  sift_candidates.py  cross-observation candidate sifter (.cohout / .txt)
+  sift_candidates.py  cross-observation candidate sifter (.cohout)
 test/                 unit tests (golden values, analytic signals, indexing)
 crossval/             Python-as-oracle accuracy + speed cross-validation
 compare/              head-to-head benchmark against riptide's rseek
@@ -181,7 +181,7 @@ Nearly every non-obvious choice below follows from one of them.
   frequency (residual red noise, an RFI comb, a `rednoise` pass that did not
   take). And because the analytic assumption fails *silently* and in the
   dangerous direction — a normalization error inflates every S/N — the search
-  scores a few chunks both ways and warns when they disagree by more than 10%.
+  checks the file's normalization first and warns if it is off by more than 10%.
 - Skipping the de-reddening step is not an option, and we measured that on our
   own default path: detection falls 76% → 1% across the knee range.
 
@@ -316,8 +316,12 @@ Output naming follows from this:
 | many files | `--outdir D` | `D/<base>.cohout` |
 | many files | `-o NAME` | rejected — it would have each file overwrite the last |
 
-`bin/sift_candidates.py` reads `.cohout` (and `.txt`) files, so a whole DM sweep
-can be sifted with `sift_candidates.py <dir>`.
+`bin/sift_candidates.py` reads `.cohout` files (a directory is searched for
+`*.cohout`; other names can be given explicitly), so a whole DM sweep can be
+sifted with `sift_candidates.py <dir>`. It is the same script PRESTO ships as
+`coherent_sift.py`, so it also reads the known-pulsar labels that PRESTO's
+`coherentsearch -rewrite` adds to a `.cohout` (`--no-known` drops them), and
+with a single observation it ranks on S/N and DM behaviour alone.
 
 **Plotting is off by default, and deferred when enabled.** With `--plot`, all
 searches finish first and CairoMakie is loaded *once* to plot every file's
@@ -461,14 +465,21 @@ error (~1%) against an unmodelled bias, and on a badly-behaved observation the
 bias wins.
 
 Because that failure is silent and inflates S/N (a candidate list full of noise
-rather than an empty one), `search` **checks it**: three chunks spread across the
-band are scored both ways, and a disagreement over 10% produces a warning naming
-both numbers. It costs ~0.1% of the runtime. On an un-normalized input the check
-fires immediately — the raw test fixture is out by a factor of ~1000.
+rather than an empty one), `search` **checks it** (`check_normalisation`):
+normalized powers are exponential with mean 1, so `√(median power / ln 2)` over
+Fourier bins 10000–19999 (the top half of a shorter FFT) is the ratio of the real
+noise scale to the assumed one, and an error over 10% produces a warning. The
+median ignores a pulsar or RFI in the block, and 10000 bins pin the scale to
+~0.7%. On an un-normalized input it fires immediately — the raw test fixture is
+out by a factor of ~1000. (This replaced a check that compared the analytic and
+measured scales on three chunks of the search; it sampled the lowest chunk, a
+handful of Fourier bins at 0.1 Hz, and took the worst of ~18 comparisons, so it
+warned falsely on well-normalized data. PRESTO's `coherentsearch` found that and
+uses the same file-based check.)
 
 ### Candidate de-duplication
 
-Two collapses run on the candidate list, both on by default:
+Three filters run on the candidate list, all on by default:
 
 - **Near-identical** (`remove_duplicates`, `--noremove`, `--drtol`): the run of
   adjacent trial fundamentals a single signal lights up, grouped by Fourier
@@ -479,6 +490,35 @@ Two collapses run on the candidate list, both on by default:
   ratio `n/m` of small integers (up to `--numharm`) are collapsed to the
   strongest member. Decimation makes this family especially prominent, so the
   two work together.
+- **Periodic combs** (`remove_periodic`, `--noperiodic`): a strong sinusoid — a
+  bright pulsar's fundamental or one of its harmonics, or RFI — lands on one
+  high harmonic of many slow trials, each of which folds into a profile of
+  identical peaks. A candidate is dropped when its strongest harmonic is the 7th
+  or higher and has more than 8x the power of each of harmonics 1–4 (taken as a
+  maximum, so one low harmonic zapped by RFI excision cannot trigger it).
+
+### The deep pass
+
+`--deep` searches for slow pulsars with very narrow pulses (duty cycles below
+~1%), which the default 120-bin profiles do not resolve: fundamentals up to 5 Hz,
+folded with 120 harmonics (240-bin profiles) and decimation factors up to 12. It
+costs roughly a third of the default search. Any of `--nharms`, `--maxdecim` or
+`--hifreq` given explicitly overrides the deep value. Its candidates go to
+`<fftfile without .fft>_deep.cohout`, so it runs beside a default search of the
+same file, and the two lists together are the paper's "default plus deep pass"
+search. If the default search's `.cohout` exists (beside the input, or in
+`--outdir`), deep candidates harmonically related to a stronger candidate in it
+are dropped — for example the subharmonics of a bright pulsar whose own frequency
+is above the deep band (`--noharmremove` keeps them). So run `--deep` after the
+default search:
+
+```sh
+julia --project=. -t auto bin/coherent_search.jl --outdir cands *_red.fft
+julia --project=. -t auto bin/coherent_search.jl --outdir cands --deep *_red.fft
+```
+
+`bin/sift_candidates.py` reads the `_deep.cohout` files too and flags their
+signals `deep` (`--no-deep` ignores them).
 
 ### Candidate output format
 

@@ -33,6 +33,9 @@ function parse_cmdline(argv)
         Near-identical candidates are collapsed by default (--noremove disables it),
         as are harmonically-related ones -- the f/2, 2f, 3f/2, ... family of a real
         signal (--noharmremove disables it, --numharm sets the max harmonic).
+        Then a candidate whose refolded profile is a comb dominated by one high
+        harmonic (a strong signal landing on a high harmonic of a slow trial) is
+        dropped (--noperiodic keeps it).
         HARMONIC DECIMATION (--maxdecim, default 6) also folds each fundamental at
         2..k times its frequency almost for free, re-using the interpolated
         harmonics and summing nharms/k of them; the reported harmonic count
@@ -84,10 +87,13 @@ function parse_cmdline(argv)
             help = "Write per-file <basename>.cohout candidate files into this directory (created if needed).  Implies .cohout naming even for a single input file; default is beside each input .fft"
             arg_type = String
             default = ""
+        "--deep"
+            help = "Deep pass for slow pulsars with very narrow pulses (duty cycles below ~1%), which the default 120-bin profiles do not resolve: --nharms 120 --maxdecim 12 --hifreq 5 unless those are given.  Costs roughly a third of the default search.  Candidates go to <fftfile without .fft>_deep.cohout, so it can run beside a default search of the same file; if that search's <fftfile>.cohout exists, deep candidates harmonically related to a stronger candidate in it are dropped (unless --noharmremove).  So run --deep after a default search"
+            action = :store_true
         "--nharms", "-n"
-            help = "Number of harmonics to sum. 60 is composite, so it decimates evenly by 2,3,4,5,6"
+            help = "Number of harmonics to sum (default 60, or 120 with --deep). 60 is composite, so it decimates evenly by 2,3,4,5,6"
             arg_type = Int
-            default = 60
+            default = 0
         "--ncands"
             help = "Maximum number of candidates to return"
             arg_type = Int
@@ -101,9 +107,9 @@ function parse_cmdline(argv)
             arg_type = Float64
             default = 0.1
         "--hifreq"
-            help = "Highest FUNDAMENTAL frequency (in Hz) to search. Decimation carries coverage the rest of the way, to --hifreq * --maxdecim; the default 125 x 6 = 750 Hz clears the fastest known pulsar (716 Hz) with headroom"
+            help = "Highest FUNDAMENTAL frequency (in Hz) to search (default 125, or 5 with --deep). Decimation carries coverage the rest of the way, to --hifreq * --maxdecim; the default 125 x 6 = 750 Hz clears the fastest known pulsar (716 Hz) with headroom"
             arg_type = Float64
-            default = 125.0
+            default = NaN
         "--hidr"
             help = "Fourier bin resolution at highest harmonic"
             arg_type = Float64
@@ -128,9 +134,9 @@ function parse_cmdline(argv)
             arg_type = Int
             default = 0
         "--maxdecim"
-            help = "Max harmonic-decimation factor k: also search 2..k times each fundamental, folding nharms/k harmonics. 1 disables it"
+            help = "Max harmonic-decimation factor k (default 6, or 12 with --deep): also search 2..k times each fundamental, folding nharms/k harmonics. 1 disables it"
             arg_type = Int
-            default = 6
+            default = 0
         "--drtol"
             help = "Fourier-bin tolerance for collapsing near-identical candidates"
             arg_type = Float64
@@ -143,7 +149,10 @@ function parse_cmdline(argv)
             help = "Do not collapse near-identical (duplicate) candidates"
             action = :store_true
         "--noharmremove"
-            help = "Do not collapse harmonically-related candidates (f/2, 2f, 3f/2, ...)"
+            help = "Do not collapse harmonically-related candidates (f/2, 2f, 3f/2, ...), nor (with --deep) drop those related to stronger candidates of the default search"
+            action = :store_true
+        "--noperiodic"
+            help = "Keep candidates whose profile is dominated by one high harmonic (harmonic 7 or above, with over 8x the power of each of harmonics 1-4).  Such a comb of identical peaks is almost always a strong signal landing on a high harmonic of a slow trial"
             action = :store_true
         "--progressbar"
             help = "Show a progress bar instead of the default text percentage meter"
@@ -189,7 +198,15 @@ function parse_cmdline(argv)
             arg_type = Int
             default = 5
     end
-    return parse_args(argv, s)
+    a = parse_args(argv, s)
+    # The --deep pass's defaults; explicit options still win.  The table's
+    # defaults are sentinels (0 / NaN) so that "given" is distinguishable from
+    # "defaulted" -- including a value given equal to the plain default.
+    deep = a["deep"]
+    a["nharms"] == 0 && (a["nharms"] = deep ? DEEP_NHARMS : 60)
+    a["maxdecim"] == 0 && (a["maxdecim"] = deep ? DEEP_MAXDECIM : 6)
+    isnan(a["hifreq"]) && (a["hifreq"] = deep ? DEEP_HIFREQ : 125.0)
+    return a
 end
 
 """
@@ -222,6 +239,7 @@ function main(argv)
 
     outdir = a["outdir"]
     isempty(outdir) || mkpath(outdir)
+    deep = a["deep"]
 
     maxdecim = a["maxdecim"]
     nharms = a["nharms"]
@@ -313,8 +331,8 @@ function main(argv)
     for (i, path) in enumerate(fftfiles)
         nfiles > 1 && @info "File $i of $nfiles" file=path
         ft = FFTFile(path)
-        outfile = output_path(path, a["outputfilenm"], outdir, nfiles)
-        cands = search_one(ft, params, a, cache, backend)
+        outfile = output_path(path, a["outputfilenm"], outdir, nfiles; deep = deep)
+        cands = search_one(ft, params, a, cache, backend; outfile = outfile)
         write_candidates(cands, outfile, a["threshold"])
         if a["plot"] && !isempty(cands)
             push!(toplot, (ft, cands, plot_stem(a["plotstem"], outfile, path)))
@@ -344,14 +362,25 @@ Resolve where one file's candidates go.  A lone input file with neither `-o` nor
 empty string).  Otherwise the name is `<fftfile stripped of .fft>.cohout`, beside
 the input or in `outdir`.
 """
-function output_path(fftfile, outputfilenm, outdir, nfiles)
+function output_path(fftfile, outputfilenm, outdir, nfiles; deep::Bool = false)
     if nfiles == 1 && isempty(outdir)
         return outputfilenm          # "" ⇒ stdout, as before
     end
+    return cohout_path(fftfile, outdir; deep = deep)
+end
+
+"""
+    cohout_path(fftfile, outdir; deep=false) -> String
+
+`<fftfile stripped of .fft>.cohout` (or `_deep.cohout`), beside the input or in
+`outdir` if that is non-empty.
+"""
+function cohout_path(fftfile, outdir; deep::Bool = false)
     stem = first(splitext(fftfile))  # keeps the directory of the input
     isempty(outdir) || (stem = joinpath(outdir, basename(stem)))
-    return string(stem, ".cohout")
+    return string(stem, deep ? "_deep.cohout" : ".cohout")
 end
+
 
 """
     search_one(ft, params, a, cache) -> Vector{Candidate}
@@ -360,7 +389,7 @@ Search one FFT file with the parsed options `a`, reusing `cache`'s plans and
 workspaces, and return its top `--ncands` candidates best-metric first.
 """
 function search_one(ft::FFTFile, params::SearchParams, a, cache::SearchCache,
-                    backend::SearchBackend = CPUBackend())
+                    backend::SearchBackend = CPUBackend(); outfile::AbstractString = "")
     @info "Searching" file=ft.path T=ft.T nharms=params.nharms decimations=params.decimations threads=nthreads() backend=nameof(typeof(backend))
 
     progress = a["noprogress"] ? :none : (a["progressbar"] ? :bar : :text)
@@ -375,12 +404,29 @@ function search_one(ft::FFTFile, params::SearchParams, a, cache::SearchCache,
                    blocksize = a["blocksize"], threshold = a["threshold"],
                    remove = !a["noremove"], dr_tol = a["drtol"],
                    harm_remove = !a["noharmremove"], numharm = a["numharm"],
+                   periodic_remove = !a["noperiodic"],
                    progress = progress, metricstats = mstats,
                    normalize = a["normalize"], verbose = a["verbose"],
                    wisdom = !a["nowisdom"],
                    wisdom_file = isempty(a["wisdomfile"]) ? nothing : a["wisdomfile"],
                    cache = cache, backend = backend)
     cands = backend isa CPUBackend ? _dosearch() : Base.invokelatest(_dosearch)
+
+    # A deep pass drops what the default search of the same file already found
+    # more strongly (e.g. a bright pulsar's subharmonics, whose fundamental is
+    # above the deep band).  That search's candidates are wherever it would
+    # have written them by default.
+    if a["deep"] && !a["noharmremove"]
+        refnm = cohout_path(ft.path, a["outdir"])
+        if abspath(refnm) != abspath(outfile) && isfile(refnm)
+            n0 = length(cands)
+            cands = remove_harmonics_of(cands, read_cohout(refnm, ft.T);
+                                        numharm = a["numharm"], tol = 1.0)
+            @info "Removed harmonics of stronger candidates in the default search" removed=(n0 - length(cands)) remaining=length(cands) file=refnm
+        else
+            @info "No default search ($refnm) to remove harmonics of; run one before --deep"
+        end
+    end
 
     if mstats !== nothing
         # Per-file stem, so a multi-file run does not overwrite one file's tables

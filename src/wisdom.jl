@@ -104,14 +104,24 @@ function prime_wisdom(params::SearchParams = production_params();
     return path
 end
 
-"""
-    production_params(; nharms=60, maxdecim=6) -> SearchParams
+# The --deep pass's defaults (PRESTO's `CS_DEEP_*`, include/cs_fftplan.h; the
+# paper's `coherent_tier`).
+const DEEP_NHARMS = 120
+const DEEP_MAXDECIM = 12
+const DEEP_HIFREQ = 5.0
 
-The configuration `bin/coherent_search.jl` searches with by default, which is
-*not* `SearchParams()`.  Used as `prime_wisdom`'s default so that priming covers
-the plans a default run actually builds.
 """
-production_params(; nharms::Integer = 60, maxdecim::Integer = 6) =
+    production_params(; deep=false, nharms, maxdecim) -> SearchParams
+
+The configuration `bin/coherent_search.jl` searches with by default (`nharms =
+60`, `maxdecim = 6`), or with `--deep` (`120`, `12`) if `deep` — neither of which
+is `SearchParams()`.  Used as `prime_wisdom`'s default so that priming covers
+the plans a default run actually builds; `bin/prime_wisdom.jl` primes both, as
+PRESTO's `makewisdom` does.
+"""
+production_params(; deep::Bool = false,
+                  nharms::Integer = deep ? DEEP_NHARMS : 60,
+                  maxdecim::Integer = deep ? DEEP_MAXDECIM : 6) =
     SearchParams(nharms = nharms, decimations = decimation_set(nharms, maxdecim))
 
 # `Base.@kwdef` gives no copy-with-override constructor.  Rebuild by reflection so

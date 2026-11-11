@@ -35,6 +35,25 @@ harmonics are used.  The returned profile is **not** rotated (see
 [`rotate_to_peak`](@ref)).
 """
 function candidate_profile(ft::FFTFile, r::Real, nharm::Integer; m::Integer=64)
+    amps = candidate_harmonics(ft, r, nharm; m=m)
+    H = length(amps)
+    H >= 1 || return zeros(Float64, 2)                   # nothing usable (degenerate)
+    stack = zeros(ComplexF64, H + 1)                     # index 1 is DC, left at 0
+    @views stack[2:end] .= amps
+    return irfft(stack, 2H)
+end
+
+"""
+    candidate_harmonics(ft, r, nharm; m=64) -> Vector{ComplexF64}
+
+The exactly interpolated complex amplitudes of harmonics `1, 2, …` of the
+Fourier frequency `r` (bins), each from an `m`-bin [`fourier_interp`](@ref),
+stopping (not zero-padding) at the first harmonic whose kernel would cross
+Nyquist or run past the available amplitudes, or at `nharm`.  Element `h` is
+harmonic `h`.  The stack [`candidate_profile`](@ref) inverse-transforms, and the
+one [`remove_periodic`](@ref) inspects.
+"""
+function candidate_harmonics(ft::FFTFile, r::Real, nharm::Integer; m::Integer=64)
     nharm >= 1 || throw(ArgumentError("nharm must be >= 1"))
     iseven(m) || throw(ArgumentError("m must be even"))
 
@@ -52,12 +71,79 @@ function candidate_profile(ft::FFTFile, r::Real, nharm::Integer; m::Integer=64)
         (rint - m2 >= 0 && rint + m2 <= namps && rh < Nhalf) || break
         push!(amps, fourier_interp(rh, ft.amps, m))
     end
+    return amps
+end
 
-    H = length(amps)
-    H >= 1 || return zeros(Float64, 2)                   # nothing usable (degenerate)
-    stack = zeros(ComplexF64, H + 1)                     # index 1 is DC, left at 0
-    @views stack[2:end] .= amps
-    return irfft(stack, 2H)
+# The comb filter's defaults (PRESTO's `CS_PERIODIC_*`, include/coherentsearch.h).
+const PERIODIC_NLOW = 4
+const PERIODIC_MINHARM = 7
+const PERIODIC_RATIO = 8.0
+
+"""
+    remove_periodic(ft, cands; nlow=4, minharm=7, ratio=8.0) -> Vector{Candidate}
+
+Drop candidates whose refolded profile is dominated by one high harmonic: the
+strongest of its harmonics (from [`candidate_harmonics`](@ref) at the
+candidate's own `r` and `nharm`) is number `minharm` or above, and has more than
+`ratio` times the power of the strongest of harmonics `1:nlow` — so of each of
+them, which means one low harmonic zapped by RFI excision cannot trigger it.
+
+Such a profile is a comb of identical peaks.  It is almost always a strong
+sinusoid — a bright pulsar's fundamental or one of its harmonics, or RFI —
+landing on a high harmonic of a slow trial, and it lights up many slow trials
+at once, which harmonic collapse does not catch because the trials are not
+harmonically related to each other in the `numharm` sense.  Candidates with
+`nharm < minharm` cannot qualify and are kept.  Keeps the input order.
+
+The C port's `cs_remove_periodic()` (PRESTO, `src/cs_search.c`), same rule and
+same defaults.
+"""
+function remove_periodic(ft::FFTFile, cands::AbstractVector{Candidate};
+                         nlow::Integer=PERIODIC_NLOW, minharm::Integer=PERIODIC_MINHARM,
+                         ratio::Real=PERIODIC_RATIO)
+    keep = trues(length(cands))
+    for (i, c) in enumerate(cands)
+        (c.nharm >= minharm && c.r > 0) || continue
+        amps = candidate_harmonics(ft, c.r, c.nharm)
+        lowmax, topmax, toph = 0.0, 0.0, 0
+        for (h, a) in enumerate(amps)
+            pw = abs2(a)
+            h <= nlow && pw > lowmax && (lowmax = pw)
+            pw > topmax && ((topmax, toph) = (pw, h))
+        end
+        keep[i] = !(toph >= minharm && topmax > ratio * lowmax)
+    end
+    return cands[keep]
+end
+
+"""
+    read_cohout(path, T) -> Vector{Candidate}
+
+Read a candidate file written by [`main`](@ref) (or by PRESTO's
+`coherentsearch`, whose `.cohout` files are the same) back into `Candidate`s,
+recovering the fundamental Fourier frequency as `r = freq * T`.  Comment (`#`)
+and blank lines are skipped.  Columns are whitespace-delimited: rank, S/N,
+frequency (Hz), period (ms), harmonic count, then optionally the duty cycle in
+percent (`-` if unmeasured) and a known-pulsar label, which is ignored.
+"""
+function read_cohout(path::AbstractString, T::Real)
+    cands = Candidate[]
+    for line in eachline(path)
+        s = strip(line)
+        (isempty(s) || startswith(s, "#")) && continue
+        cols = split(s)
+        length(cols) >= 5 || continue
+        metric = parse(Float64, cols[2])
+        freq = parse(Float64, cols[3])
+        nharm = parse(Int, cols[5])
+        ducy = NaN
+        if length(cols) >= 6
+            d = tryparse(Float64, cols[6])
+            d === nothing || (ducy = d / 100)
+        end
+        push!(cands, Candidate(freq, metric, freq * T, nharm, ducy))
+    end
+    return cands
 end
 
 """

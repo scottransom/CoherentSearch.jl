@@ -3,6 +3,7 @@ using FFTW: FFTW
 using CoherentSearch
 using CoherentSearch: output_path, plot_stem, main, _plans!, Workspace, parse_cmdline
 using Logging: with_logger, NullLogger
+using Random: Random
 
 # ---------------------------------------------------------------------------
 # A small synthetic observation on disk, so the CLI tests need no external data.
@@ -253,5 +254,157 @@ end
             main(vcat(base, ["--outdir", od]))
         end
         @test isfile(joinpath(od, "solo.cohout"))
+    end
+end
+
+# ---------------------------------------------------------------------------
+# Backported from PRESTO's coherentsearch (November 2026): the normalisation
+# check, the comb filter, the --deep pass and its sift against the default
+# search's .cohout.
+# ---------------------------------------------------------------------------
+
+# Exponential powers of mean `scale^2` (Re, Im each of variance scale^2/2), plus
+# optionally a pure sinusoid at integer bin `sinbin`.
+function write_noise_fft(dir, name; N = 1 << 16, dt = 1.0e-3, scale = 1.0,
+                         sinbin = 0, sinamp = 0.0, seed = 1)
+    rng = Random.MersenneTwister(seed)
+    nfreq = N ÷ 2
+    amps = ComplexF32[scale * ComplexF32(randn(rng), randn(rng)) / sqrt(2f0)
+                      for _ in 1:nfreq]
+    sinbin > 0 && (amps[sinbin + 1] = ComplexF32(sinamp, 0))
+    fftpath = joinpath(dir, name * ".fft")
+    write(fftpath, amps)
+    write(joinpath(dir, name * ".inf"),
+          " Object being observed                      =  NOISE\n" *
+          " Epoch of observation (MJD)                 =  50000.0\n" *
+          " Number of bins in the time series          =  $N\n" *
+          " Width of each time series bin (sec)        =  $dt\n" *
+          " Dispersion measure (cm-3 pc)               =  0.0\n")
+    return fftpath, N * dt
+end
+
+@testset "check_normalisation reads the noise scale from the file" begin
+    mktempdir() do dir
+        good, _ = write_noise_fft(dir, "good")
+        @test (@test_logs check_normalisation(FFTFile(good)))      # silent
+        # 5% off in the noise scale is inside the 10% tolerance...
+        near, _ = write_noise_fft(dir, "near"; scale = 1.05)
+        @test (@test_logs check_normalisation(FFTFile(near)))
+        # ...20% is not, and nor (by a factor) is an un-normalised file.
+        for (nm, sc) in (("hi", 1.2), ("raw", 1000.0))
+            p, _ = write_noise_fft(dir, nm; scale = sc)
+            @test !(@test_logs (:warn, r"do not look normalised") check_normalisation(FFTFile(p)))
+        end
+        # A short FFT falls back to its top half.
+        short, _ = write_noise_fft(dir, "short"; N = 4096)
+        @test (@test_logs check_normalisation(FFTFile(short)))
+    end
+end
+
+@testset "remove_periodic drops a comb, keeps the fundamental" begin
+    mktempdir() do dir
+        B = 4000                                   # the sinusoid's Fourier bin
+        p, T = write_noise_fft(dir, "comb"; sinbin = B, sinamp = 200.0)
+        ft = FFTFile(p)
+        mk(r, nh) = Candidate(r / T, 10.0, Float64(r), nh)
+        # The sinusoid is harmonic 8 of r = B/8: a profile of eight identical peaks.
+        comb = mk(B / 8, 16)
+        fund = mk(B, 16)                           # the sinusoid itself, harmonic 1
+        lownh = mk(B / 4, 6)                       # nharm below minharm: never judged
+        h4 = mk(B / 4, 16)                         # strongest is harmonic 4 (< minharm)
+        noise = mk(1234.5, 16)
+        kept = remove_periodic(ft, [comb, fund, lownh, h4, noise])
+        @test kept == [fund, lownh, h4, noise]     # order preserved
+        @test remove_periodic(ft, [comb]; minharm = 9) == [comb]
+        @test isempty(remove_periodic(ft, Candidate[]))
+    end
+end
+
+@testset "remove_harmonics_of: only STRONGER related reference candidates" begin
+    c(r, s) = Candidate(r / 100, s, r, 8)
+    ref = [c(1000.0, 20.0), c(3333.3, 5.0)]
+    deep = [c(500.0, 8.0),       # f/2 of a stronger ref: dropped
+            c(1000.4, 9.0),      # identical (within tol) to a stronger ref: dropped
+            c(1666.65, 9.0),     # f/2 of a WEAKER ref: kept
+            c(777.7, 9.0),       # unrelated: kept
+            c(250.0, 30.0)]      # related, but stronger than the ref: kept
+    # numharm = 4 keeps the "unrelated" ones unrelated: at the default 16, 1666.65
+    # is 5/3 of 1000 and 777.7 is ~9/7 of it, both within a bin.
+    @test remove_harmonics_of(deep, ref; numharm = 4) == deep[3:5]
+    @test remove_harmonics_of(deep, Candidate[]) == deep
+end
+
+@testset "read_cohout round-trips write_candidates, and reads PRESTO labels" begin
+    mktempdir() do dir
+        T = 1000.0
+        cands = [Candidate(7.5, 12.34, 7500.0, 10, 0.065),
+                 Candidate(0.26, 7.32, 260.0, 60)]
+        f = joinpath(dir, "x.cohout")
+        with_logger(NullLogger()) do
+            CoherentSearch.write_candidates(cands, f, 6.0)
+        end
+        back = read_cohout(f, T)
+        @test length(back) == 2
+        @test [b.metric for b in back] ≈ [12.34, 7.32]
+        @test [b.r for b in back] ≈ [7500.0, 260.0]
+        @test [b.nharm for b in back] == [10, 60]
+        @test back[1].ducy ≈ 0.065 && isnan(back[2].ducy)
+        # A row PRESTO's coherentsearch labelled with a known pulsar.
+        open(f, "a") do io
+            println(io, "3        9.00      1.000000000000   1000.000000000000    16     5.00  J1234+5678(2)")
+        end
+        @test read_cohout(f, T)[3].freq == 1.0
+    end
+end
+
+@testset "--deep: defaults, explicit overrides, naming and the default-search sift" begin
+    a = parse_cmdline(["x.fft"])
+    @test (a["nharms"], a["maxdecim"], a["hifreq"]) == (60, 6, 125.0)
+    a = parse_cmdline(["x.fft", "--deep"])
+    @test (a["nharms"], a["maxdecim"], a["hifreq"]) == (120, 12, 5.0)
+    # Explicit options win, including one equal to the plain default.
+    a = parse_cmdline(["x.fft", "--deep", "--nharms", "60", "--hifreq", "2"])
+    @test (a["nharms"], a["maxdecim"], a["hifreq"]) == (60, 12, 2.0)
+    # bin/prime_wisdom.jl primes the --deep plans too: they must be the ones a
+    # --deep run builds (cf. the prime_wisdom-default bug pinned above).
+    a = parse_cmdline(["x.fft", "--deep"])
+    pd = production_params(deep = true)
+    @test pd.nharms == a["nharms"]
+    @test pd.decimations == decimation_set(a["nharms"], a["maxdecim"])
+    @test output_path("/d/obs.fft", "", "", 2; deep = true) == "/d/obs_deep.cohout"
+    @test output_path("/d/obs.fft", "", "/o", 1; deep = true) == "/o/obs_deep.cohout"
+
+    mktempdir() do dir
+        p, T = write_synthetic_fft(dir, "obs")
+        common = ["--noprogress", "--nowisdom", "--blocksize", "64",
+                  "--threshold", "0.0", "--outdir", dir, "--maxdecim", "1"]
+        # Deep pass over the bright series' f/2 region with nothing to sift
+        # against: its candidates survive.
+        deepargs = vcat([p, "--deep", "--nharms", "8", "--ncands", "50",
+                         "--lofreq", string(100 / T), "--hifreq", string(110 / T)], common)
+        with_logger(NullLogger()) do
+            main(deepargs)
+        end
+        deepout = joinpath(dir, "obs_deep.cohout")
+        @test isfile(deepout) && !isfile(joinpath(dir, "obs.cohout"))
+        before = read_cohout(deepout, T)
+        @test any(c -> isapprox(c.r, 105; atol = 1), before)   # f/2 of bin 210
+        # Now a default search finds the series at bin 210, far more strongly...
+        with_logger(NullLogger()) do
+            main(vcat([p, "--nharms", "8", "--ncands", "50",
+                       "--lofreq", string(200 / T), "--hifreq", string(240 / T)], common))
+        end
+        @test isfile(joinpath(dir, "obs.cohout"))
+        # ...and a re-run deep pass drops its subharmonic, unless --noharmremove.
+        with_logger(NullLogger()) do
+            main(deepargs)
+        end
+        after = read_cohout(deepout, T)
+        @test !any(c -> isapprox(c.r, 105; atol = 1), after)
+        @test length(after) < length(before)
+        with_logger(NullLogger()) do
+            main(vcat(deepargs, ["--noharmremove"]))
+        end
+        @test any(c -> isapprox(c.r, 105; atol = 1), read_cohout(deepout, T))
     end
 end

@@ -2231,97 +2231,66 @@ function _plans!(cache::Union{Nothing,SearchCache}, params::SearchParams,
     return ws
 end
 
-# Chunks sampled by `_sigma_sanity_check`, and the relative disagreement it
-# tolerates before warning.  Three chunks is ~0.1% of a real search; 10% is far
-# outside anything the interpolation truncation (0.64% at m=16) or the
-# estimator's own subsampling error (~1-3%) can produce, and far inside the
-# orders of magnitude an un-normalised input gives.
-const _SIGMA_CHECK_CHUNKS = 3
-const _SIGMA_CHECK_TOL = 0.10
+# The normalisation check's block of bins (0-based, as PRESTO numbers them) and
+# the error in the noise scale it tolerates (PRESTO's `CS_NORM_CHECK_*`).
+const _NORM_CHECK_LO = 10000
+const _NORM_CHECK_N = 10000
+const _NORM_CHECK_TOL = 0.10
 
 """
-    _sigma_sanity_check(ft, params, ws, dplans, r_lo, lodr, total, Nprof) -> Bool
+    check_normalisation(ft) -> Bool
 
-Guard for `sigma = :analytic`: on a few chunks spread across the band, compare
-the closed-form noise scale against the measured one, and warn if they disagree
-by more than `_SIGMA_CHECK_TOL`.  Returns whether the check passed.
+Guard for `sigma = :analytic`: check that the input `.fft` is normalised
+(Fourier powers of mean 1), which is the closed-form noise scale's one
+assumption, and warn if the noise scale it implies is off by more than 10%.
+Returns whether the check passed.
 
-The analytic scale has exactly one assumption — that the input `.fft` is
-normalised, with Fourier powers of mean 1 — and when that assumption fails it
-fails *silently and in the dangerous direction*: the measured scale tracks
-whatever the amplitudes actually are, while the analytic one keeps insisting on
-unit variance, so every reported S/N is inflated by the normalisation error and
-the candidate list fills with noise.  On an un-normalised file that is orders of
-magnitude (a factor of ~1000 on the raw test fixture).  Milder versions —
-residual red noise, an RFI comb, a `rednoise` pass that did not take — inflate it
-by a few tens of percent, which is worse because the output still looks
-plausible.
+When that assumption fails it fails *silently and in the dangerous direction*:
+every reported S/N is inflated by the normalisation error and the candidate
+list fills with noise.  On an un-normalised file that is orders of magnitude (a
+factor of ~1000 on the raw test fixture).
 
-This costs three chunks out of thousands and turns that silent failure into a
-message naming both numbers, so it is always on.  It only *warns*: switching
-estimator behind the user's back would be a surprise, and `--sigma measured` is
-the documented answer (it also adapts to a noise level that varies with Fourier
-frequency, which is the case this check is most likely to be detecting).
+Normalised powers are exponential with mean 1, so their median is `ln 2` and
+`√(median / ln 2)` is the ratio of the actual noise scale to the assumed one.
+It is taken over bins 10000–19999 (the top half of a shorter FFT), straight
+from the file: away from the lowest frequencies, where leftover red noise would
+raise false alarms, and with the median shrugging off a pulsar or RFI in the
+block.  10000 bins give a scatter of ~0.7% in the noise scale.
+
+This replaced a check that compared the analytic scale against a measured one
+on three chunks of the search.  That one sampled the lowest chunk (about 17
+fundamental bins at 0.1 Hz) and took the worst of ~18 comparisons, so it warned
+falsely on well-normalised data, and on white noise where only a few harmonics
+fit.  PRESTO's `cs_check_normalisation()` is the same check.
+
+It only *warns*: switching estimator behind the user's back would be a
+surprise, and `--sigma measured` is the documented answer (it also adapts to a
+noise level that varies with Fourier frequency).
 """
-function _sigma_sanity_check(ft::FFTFile, params::SearchParams, ws::Workspace,
-                             dplans::AbstractVector, r_lo::Real, lodr::Real,
-                             total::Integer, Nprof::Integer)
-    nchunks = cld(total, Nprof)
-    nsample = min(_SIGMA_CHECK_CHUNKS, nchunks)
-    worst, worst_k, worst_f, meas_w, ana_w = 0.0, 1, 0.0, 0.0, 0.0
-    for i in 1:nsample
-        c = nsample == 1 ? 1 : 1 + ((i - 1) * (nchunks - 1)) ÷ (nsample - 1)
-        i0 = (c - 1) * Nprof
-        n = min(Nprof, total - i0)
-        # The MEASURED side is the noisy one, and a trailing stub chunk cannot
-        # measure anything.  A chunk spans `n * lodr` Fourier bins at the
-        # fundamental, so the last chunk of a narrow band -- 57 trials over
-        # 0.1-5 Hz at `nharms = 120`, i.e. 0.24 of one bin -- hands every rung
-        # the same few Fourier amplitudes over and over.  Measured on white
-        # noise there, the deepest rungs' MAD scatters +-7% against the true
-        # sd while every FULL chunk agrees to 3%, so the guard fired on ~40% of
-        # a clean Monte Carlo run and the warning meant nothing.  Take full
-        # chunks only, and fall back to the longest available if none is full
-        # (a search shorter than one chunk still gets checked).
-        if n < Nprof && total >= Nprof
-            continue                            # a full chunk will be checked
-        end
-        n >= 8 || continue                      # too short for a meaningful MAD
-        rstart = r_lo + i0 * lodr
-        fill_chunk_profiles!(ws, dplans, ft, params, rstart, lodr, n; t0 = i0)
-        for (k, prof) in vcat([(1, ws.profs)],
-                              [(db.k, (mul!(db.dprofs, db.brfftplan, db.src); db.dprofs))
-                               for db in ws.decims])
-            Hk = fld(params.nharms, k)
-            nbins = 2Hk
-            meas = Float64(_block_sigma(prof, nbins, n, ws.bcsig))
-            ana = _analytic_sigma(ws.filled, k, Hk)
-            (meas > 0 && ana > 0) || continue
-            dev = abs(ana / meas - 1)
-            if dev > worst
-                worst, worst_k, worst_f = dev, k, rstart / ft.T
-                meas_w, ana_w = meas, ana
-            end
-        end
+function check_normalisation(ft::FFTFile)
+    namps = length(ft.amps)
+    lo, n = _NORM_CHECK_LO, _NORM_CHECK_N
+    if namps < lo + n                       # short FFT: the top half, at most n bins
+        lo = namps ÷ 2
+        n = min(namps - lo, n)
     end
-    if worst > _SIGMA_CHECK_TOL
-        # Quote the RATIO, not the percentage: a badly un-normalised file is out
-        # by orders of magnitude, and `abs(ratio - 1)` saturates near 100% there,
-        # making a 1000x error read like a 99.9% one.
-        ratio = ana_w / meas_w
-        howmuch = (ratio > 2 || ratio < 0.5) ?
-            "a factor of $(round(max(ratio, 1 / ratio); sigdigits = 3))" :
-            "$(round(100 * worst; digits = 1))%"
-        @warn """The analytic noise scale disagrees with the measured one by \
-                 $howmuch — every reported S/N is scaled by that.  This normally \
-                 means the input FFT is not normalised (Fourier powers with mean \
-                 1); run PRESTO's `rednoise` on it, or pass `--sigma measured` to \
-                 estimate the scale from the data instead.""" file = basename(ft.path)
-        @printf(stderr, "         worst at k=%d, %.4f Hz: measured %.5g vs analytic %.5g (ratio %.4g)\n",
-                worst_k, worst_f, meas_w, ana_w, ratio)
-        return false
-    end
-    return true
+    n < 100 && return true
+    pow = Float64[abs2(ft.amps[lo + i]) for i in 1:n]   # 0-based bins lo .. lo+n-1
+    sort!(pow)
+    med = isodd(n) ? pow[n ÷ 2 + 1] : 0.5 * (pow[n ÷ 2] + pow[n ÷ 2 + 1])
+    ratio = sqrt(med / log(2))              # (actual / assumed) noise scale
+    abs(ratio - 1) <= _NORM_CHECK_TOL && return true
+    # Quote a ratio, not a percentage, when it is far off: a 1000x error would
+    # otherwise read like a 99.9% one.
+    howmuch = (ratio > 2 || ratio < 0.5) ?
+        "off by a factor of $(round(max(ratio, 1 / ratio); sigdigits = 3))" :
+        "$(round(100 * abs(ratio - 1); digits = 1))% too $(ratio > 1 ? "high" : "low")"
+    @warn """The Fourier powers do not look normalised: the noise scale is \
+             $howmuch, and every reported S/N is off by that factor.  Normalised \
+             powers have mean 1 (median ln 2 = 0.693); bins $lo-$(lo + n - 1) have \
+             median $(round(med; sigdigits = 4)).  Run PRESTO's `rednoise` on the \
+             FFT, or pass `--sigma measured`.""" file = basename(ft.path)
+    return false
 end
 
 """
@@ -2342,7 +2311,9 @@ The `lofreq`/`lobin` precedence matches the Python CLI: `lofreq` is used unless
 
 Candidate post-processing: near-identical clusters are collapsed by
 [`remove_duplicates`](@ref) (`remove`, `dr_tol`), then harmonically-related
-candidates by [`remove_harmonics`](@ref) (`harm_remove`, `numharm`, `harm_tol`).
+candidates by [`remove_harmonics`](@ref) (`harm_remove`, `numharm`, `harm_tol`),
+then those whose profile is a comb dominated by one high harmonic by
+[`remove_periodic`](@ref) (`periodic_remove`).
 `progress` (`:none`, `:text`, or `:bar`) prints a chunk-completion meter to
 `stderr`.
 
@@ -2373,6 +2344,7 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
                 blocksize::Integer=0, threshold::Real=params.threshold,
                 remove::Bool=true, dr_tol::Real=1.0,
                 harm_remove::Bool=true, numharm::Integer=16, harm_tol::Real=1.0,
+                periodic_remove::Bool=true,
                 progress::Symbol=:none,
                 metricstats::Union{Nothing,MetricStats}=nothing,
                 normalize::Bool=false, verbose::Bool=false,
@@ -2419,33 +2391,27 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
     # in any band where a harmonic crosses Nyquist (docs/gpu_design.md §4.14).
     cstarts = chunk_starts(dplans, ft, params, total, Nprof)
     nchunks = length(cstarts)
-    # A GPU backend runs the whole band on the device, so it needs exactly one
-    # host workspace -- and it needs that one, because `_sigma_sanity_check` is a
-    # CPU computation and must stay so: its whole job is to check the analytic
-    # scale against a MEASURED one.
     nt = backend isa CPUBackend ? max(1, min(nthreads(), nchunks)) : 1
-    # The GPU wants a chunk of ~10^5 trials; the CPU host workspace exists only
-    # for `_sigma_sanity_check`, which is a property of the DATA and needs no such
-    # thing.  Sizing it to the GPU's `Nprof` allocated hundreds of MB, planned
-    # FFTW transforms for it, and then ran three CPU chunks of that size --
-    # measured at ~0.68 s against 0.70 s of actual GPU work, i.e. it doubled the
-    # search.  Cap it.
-    ws_Nprof = backend isa CPUBackend ? Nprof : min(Nprof, 2048)
     # `PATIENT` is worth ~9% of the decimated transforms and costs ~1 s of
     # planning, which the wisdom file amortises to nothing.  With no wisdom file
     # there is nothing to amortise into, so fall back to `MEASURE` (see
     # `_PLAN_RIGOR`).  Only the *first* workspace pays: FFTW's wisdom is
     # process-global, so the other `nt-1` are lookups.
-    workspaces = with_plan_rigor(wisdom ? FFTW.PATIENT : FFTW.MEASURE) do
-        _plans!(cache, params, ws_Nprof, nt)
-    end
+    #
+    # A GPU backend runs the whole band on the device and its `_region!` never
+    # reads `workspaces`, so it gets none.  It used to get one host workspace
+    # (capped at 2048 trials: sized to the GPU's `Nprof` it once doubled the
+    # search) for the old chunk-based sigma check, which now reads the file.
+    workspaces = backend isa CPUBackend ?
+        with_plan_rigor(wisdom ? FFTW.PATIENT : FFTW.MEASURE) do
+            _plans!(cache, params, Nprof, nt)
+        end : Workspace[]
 
-    wisdom && export_wisdom!(wpath)
+    wisdom && backend isa CPUBackend && export_wisdom!(wpath)
 
-    # The analytic scale's one assumption is checkable in ~0.1% of the runtime,
+    # The analytic scale's one assumption is checkable straight from the file,
     # and its failure is silent, so check it.
-    params.sigma === :analytic &&
-        _sigma_sanity_check(ft, params, workspaces[1], dplans, r_lo, lodr, total, ws_Nprof)
+    params.sigma === :analytic && check_normalisation(ft)
 
     if verbose
         @printf(stderr, "Search: %d trials in %d chunks of %d over r = %.1f … %.1f bins (%.4f … %.4f Hz), %d thread(s)\n",
@@ -2506,6 +2472,11 @@ function search(ft::FFTFile, params::SearchParams=SearchParams();
         n1 = length(cands)
         cands = remove_harmonics(cands; numharm=numharm, tol=harm_tol)
         @info "Collapsed harmonically-related candidates" removed=(n1 - length(cands)) remaining=length(cands)
+    end
+    if periodic_remove
+        n2 = length(cands)
+        cands = remove_periodic(ft, cands)
+        @info "Removed periodic (comb) candidates" removed=(n2 - length(cands)) remaining=length(cands)
     end
     return cands
 end
@@ -2611,4 +2582,23 @@ function remove_harmonics(cands::AbstractVector{Candidate}; numharm::Integer=16,
     end
     sort!(kept; by=c -> c.freq)
     return kept
+end
+
+"""
+    remove_harmonics_of(cands, ref; numharm=16, tol=1.0) -> Vector{Candidate}
+
+Drop the candidates of `cands` that are [`_harmonically_related`](@ref) (an
+identical frequency included) to a *stronger* candidate of `ref`.  `ref` is
+typically the default search's `.cohout` (see [`read_cohout`](@ref)) when
+`cands` is a `--deep` pass's: it removes, for example, the subharmonics of a
+bright pulsar whose own frequency lies above the deep band, which the deep
+pass's own [`remove_harmonics`](@ref) cannot see.  Keeps the input order.
+PRESTO's `cs_remove_harmonics_of()`.
+"""
+function remove_harmonics_of(cands::AbstractVector{Candidate}, ref::AbstractVector{Candidate};
+                             numharm::Integer=16, tol::Real=1.0)
+    return filter(c -> !any(k -> k.metric > c.metric &&
+                                 _harmonically_related(c.r, k.r; numharm=numharm, tol=tol),
+                            ref),
+                  cands)
 end
